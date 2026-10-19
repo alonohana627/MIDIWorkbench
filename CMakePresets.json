@@ -1,0 +1,169 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 28,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_CXX_FLAGS": "-stdlib=libc++",
+        "CMAKE_EXE_LINKER_FLAGS": "-fuse-ld=lld -stdlib=libc++",
+        "CMAKE_SHARED_LINKER_FLAGS": "-fuse-ld=lld -stdlib=libc++",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      },
+      "environment": {
+        "MWB_TOOLCHAIN_ROOT": "$penv{MWB_TOOLCHAIN_ROOT}"
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug (libc++ debug hardening)",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_FLAGS": "-stdlib=libc++ -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release with debug info, warnings as errors",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "MWB_WERROR": "ON"
+      }
+    },
+    {
+      "name": "sanitize",
+      "displayName": "AddressSanitizer + UndefinedBehaviorSanitizer",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MWB_WERROR": "ON",
+        "CMAKE_C_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer",
+        "CMAKE_CXX_FLAGS": "-stdlib=libc++ -fsanitize=address,undefined -fno-omit-frame-pointer",
+        "CMAKE_EXE_LINKER_FLAGS": "-fuse-ld=lld -stdlib=libc++ -fsanitize=address,undefined"
+      }
+    },
+    {
+      "name": "fuzz",
+      "displayName": "libFuzzer targets (coverage instrumentation + ASan)",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MWB_BUILD_FUZZERS": "ON",
+        "MWB_BUILD_GUI": "OFF",
+        "CMAKE_C_FLAGS": "-fsanitize=address -fsanitize-coverage=inline-8bit-counters,pc-table,trace-cmp",
+        "CMAKE_CXX_FLAGS": "-stdlib=libc++ -fsanitize=address -fsanitize-coverage=inline-8bit-counters,pc-table,trace-cmp",
+        "CMAKE_EXE_LINKER_FLAGS": "-fuse-ld=lld -stdlib=libc++ -fsanitize=address"
+      }
+    },
+    {
+      "name": "coverage",
+      "displayName": "LLVM source-based coverage",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_FLAGS": "-stdlib=libc++ -fprofile-instr-generate -fcoverage-mapping",
+        "CMAKE_EXE_LINKER_FLAGS": "-fuse-ld=lld -stdlib=libc++ -fprofile-instr-generate"
+      }
+    },
+    {
+      "name": "ci",
+      "displayName": "CI release (GUI required)",
+      "inherits": "release",
+      "cacheVariables": {
+        "MWB_REQUIRE_GUI": "ON"
+      }
+    },
+    {
+      "name": "ci-sanitize",
+      "displayName": "CI sanitize (GUI required)",
+      "inherits": "sanitize",
+      "cacheVariables": {
+        "MWB_REQUIRE_GUI": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "sanitize",
+      "configurePreset": "sanitize"
+    },
+    {
+      "name": "fuzz",
+      "configurePreset": "fuzz"
+    },
+    {
+      "name": "coverage",
+      "configurePreset": "coverage"
+    },
+    {
+      "name": "ci",
+      "configurePreset": "ci"
+    },
+    {
+      "name": "ci-sanitize",
+      "configurePreset": "ci-sanitize"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "test-base",
+      "hidden": true,
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "timeout": 600
+      }
+    },
+    {
+      "name": "debug",
+      "inherits": "test-base",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "release",
+      "inherits": "test-base",
+      "configurePreset": "release"
+    },
+    {
+      "name": "sanitize",
+      "inherits": "test-base",
+      "configurePreset": "sanitize"
+    },
+    {
+      "name": "coverage",
+      "inherits": "test-base",
+      "configurePreset": "coverage"
+    },
+    {
+      "name": "ci",
+      "inherits": "test-base",
+      "configurePreset": "ci"
+    },
+    {
+      "name": "ci-sanitize",
+      "inherits": "test-base",
+      "configurePreset": "ci-sanitize"
+    }
+  ]
+}

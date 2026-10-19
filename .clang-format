@@ -1,0 +1,14 @@
+# Pinned to the CLANG64 clang-format matching the toolchain (CI prints the version).
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 120
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+BreakBeforeBraces: Attach
+DerivePointerAlignment: false
+PointerAlignment: Left
+IncludeBlocks: Preserve
+NamespaceIndentation: None
+SortIncludes: CaseSensitive

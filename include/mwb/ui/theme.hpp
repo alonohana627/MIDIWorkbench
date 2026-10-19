@@ -1,0 +1,68 @@
+#pragma once
+
+#include <QColor>
+#include <QFont>
+#include <QPalette>
+#include <QString>
+
+class QApplication;
+
+namespace mwb::ui {
+
+/// Application themes (section 29.3: dark, light and high contrast). `system` follows Windows.
+enum class Theme { system, dark, light, high_contrast };
+
+[[nodiscard]] QString theme_name(Theme theme);
+[[nodiscard]] Theme theme_from_name(const QString& name);
+
+/// Sets the base font once at startup: Segoe UI family list and one point larger than the
+/// platform default, so every widget inherits the same slightly larger size.
+void apply_base_font(QApplication& application);
+
+/// Applies Fusion, the theme palette and the small shared stylesheet; remembers the theme so
+/// custom-painted widgets can read roll_colors(). `system` resolves to dark or light and follows
+/// later Windows color-scheme changes.
+void apply_theme(Theme theme);
+[[nodiscard]] Theme current_theme();
+/// The concrete theme in effect (never `system`).
+[[nodiscard]] Theme resolved_theme();
+
+[[nodiscard]] QPalette make_palette(Theme theme);
+[[nodiscard]] QString base_stylesheet();
+/// Monospace font for position and cursor readouts.
+[[nodiscard]] QFont mono_font();
+/// Color for destructive or warning accents (record, errors, clipping).
+[[nodiscard]] QColor danger_color();
+
+/// Every color the piano roll, keyboard gutter, ruler and lanes paint with, for the active theme.
+struct RollColors {
+    QColor white_row;
+    QColor black_row;
+    QColor c_line;
+    QColor snap;
+    QColor beat;
+    QColor bar;
+    QColor bar_strong;
+    QColor root_tint;
+    QColor member_tint;
+    QColor loop;
+    QColor cursor;
+    QColor playhead;
+    QColor key_white;
+    QColor key_black;
+    QColor key_label;
+    QColor ruler_background;
+    QColor ruler_text;
+    QColor hint_text;
+    QColor selected_outline;
+    QColor selected_inner;
+    bool dark = true;
+    bool high_contrast = false;
+};
+
+[[nodiscard]] RollColors roll_colors();
+
+/// Note fill from a hue source color and a velocity (velocity drives lightness).
+[[nodiscard]] QColor note_fill(const QColor& base, int velocity);
+
+} // namespace mwb::ui

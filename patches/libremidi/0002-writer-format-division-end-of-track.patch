@@ -1,0 +1,62 @@
+diff --git a/include/libremidi/writer.cpp b/include/libremidi/writer.cpp
+index 1d65b78..46af904 100644
+--- a/include/libremidi/writer.cpp
++++ b/include/libremidi/writer.cpp
+@@ -142,9 +142,10 @@ void writer::write(std::ostream& out) const
+   // MIDI File Header
+   out.write("MThd", 4);
+   util::write_be<uint32_t>(out, 6);
+-  util::write_be<uint16_t>(out, (tracks.size() == 1) ? 0 : 1);
++  const int written_format = format >= 0 ? format : ((tracks.size() == 1) ? 0 : 1);
++  util::write_be<uint16_t>(out, static_cast<uint16_t>(written_format));
+   util::write_be<uint16_t>(out, static_cast<uint16_t>(tracks.size()));
+-  util::write_be<uint16_t>(out, ticksPerQuarterNote);
++  util::write_be<uint16_t>(out, rawDivision != 0 ? rawDivision : ticksPerQuarterNote);
+ 
+   std::vector<uint8_t> track_raw_data;
+   for (const auto& event_list : tracks)
+@@ -153,6 +154,9 @@ void writer::write(std::ostream& out) const
+     // Rough estimation of the memory to allocate
+     track_raw_data.reserve(event_list.size() * 3);
+ 
++    // MIDI Workbench: the delta of an explicit end-of-track event is kept, so a track can
++    // end after its last event.
++    uint32_t end_of_track_delta = 0;
+     for (const auto& event : event_list)
+     {
+       const auto& msg = event.m;
+@@ -162,7 +166,10 @@ void writer::write(std::ostream& out) const
+       // Suppress end-of-track meta messages (one will be added
+       // automatically after all track data has been written).
+       if (msg.get_meta_event_type() == meta_event_type::END_OF_TRACK)
++      {
++        end_of_track_delta += static_cast<uint32_t>(event.tick);
+         continue;
++      }
+ 
+       util::write_variable_length(static_cast<uint32_t>(event.tick), track_raw_data);
+ 
+@@ -196,7 +203,7 @@ void writer::write(std::ostream& out) const
+ 
+     if ((size < 3) || !((track_raw_data[size - 3] == 0xFF) && (track_raw_data[size - 2] == 0x2F)))
+     {
+-      track_raw_data.emplace_back(0x0); // tick
++      util::write_variable_length(end_of_track_delta, track_raw_data); // tick
+       track_raw_data.emplace_back(eot[0]);
+       track_raw_data.emplace_back(eot[1]);
+       track_raw_data.emplace_back(eot[2]);
+diff --git a/include/libremidi/writer.hpp b/include/libremidi/writer.hpp
+index 348ce86..fb17352 100644
+--- a/include/libremidi/writer.hpp
++++ b/include/libremidi/writer.hpp
+@@ -38,6 +38,10 @@ public:
+   uint16_t ticksPerQuarterNote{120};
+   std::vector<midi_track> tracks;
+ 
++  // MIDI Workbench: explicit header control.
++  int format{-1};             //! SMF format 0, 1 or 2; -1 chooses 0 for one track, else 1
++  uint16_t rawDivision{};     //! When nonzero, written verbatim as the division (SMPTE)
++
+   void add_event(int tick, int track, const message& m);
+   void add_event(int track, const track_event& m);
+ 

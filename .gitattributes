@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.mid binary
+*.rmi binary
+*.mwb binary
+# Vendored sources must stay byte-exact (their SHA-256 digests are pinned in deps/manifest.json).
+deps/** -text
+patches/** -text

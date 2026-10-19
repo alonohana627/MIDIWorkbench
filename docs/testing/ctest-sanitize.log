@@ -1,0 +1,117 @@
+Test project C:/Users/user/MIDIWorkbench/build/sanitize
+      Start  1: core.time
+ 1/56 Test  #1: core.time ........................   Passed    0.04 sec
+      Start  2: core.notes
+ 2/56 Test  #2: core.notes .......................   Passed    0.03 sec
+      Start  3: core.changes
+ 3/56 Test  #3: core.changes .....................   Passed    0.30 sec
+      Start  4: core.core
+ 4/56 Test  #4: core.core ........................   Passed    0.01 sec
+      Start  5: core.unnamed
+ 5/56 Test  #5: core.unnamed .....................   Passed    0.01 sec
+      Start  6: midi.import
+ 6/56 Test  #6: midi.import ......................   Passed    0.09 sec
+      Start  7: midi.export
+ 7/56 Test  #7: midi.export ......................   Passed    0.04 sec
+      Start  8: midi.unnamed
+ 8/56 Test  #8: midi.unnamed .....................   Passed    0.01 sec
+      Start  9: music.scales
+ 9/56 Test  #9: music.scales .....................   Passed    0.06 sec
+      Start 10: music.chords
+10/56 Test #10: music.chords .....................   Passed    0.04 sec
+      Start 11: music.progression
+11/56 Test #11: music.progression ................   Passed    0.02 sec
+      Start 12: music.transform
+12/56 Test #12: music.transform ..................   Passed    0.14 sec
+      Start 13: music.analysis
+13/56 Test #13: music.analysis ...................   Passed    0.02 sec
+      Start 14: music.fingerprint
+14/56 Test #14: music.fingerprint ................   Passed    0.02 sec
+      Start 15: music.voice
+15/56 Test #15: music.voice ......................   Passed    0.02 sec
+      Start 16: music.unnamed
+16/56 Test #16: music.unnamed ....................   Passed    0.01 sec
+      Start 17: document.native
+17/56 Test #17: document.native ..................   Passed    8.43 sec
+      Start 18: document.history
+18/56 Test #18: document.history .................   Passed    0.25 sec
+      Start 19: document.recovery
+19/56 Test #19: document.recovery ................   Passed    7.02 sec
+      Start 20: document.unnamed
+20/56 Test #20: document.unnamed .................   Passed    0.01 sec
+      Start 21: search.query
+21/56 Test #21: search.query .....................   Passed    0.08 sec
+      Start 22: search.motif
+22/56 Test #22: search.motif .....................   Passed    0.10 sec
+      Start 23: search.unnamed
+23/56 Test #23: search.unnamed ...................   Passed    0.01 sec
+      Start 24: library.catalog
+24/56 Test #24: library.catalog ..................   Passed    2.25 sec
+      Start 25: library.import
+25/56 Test #25: library.import ...................   Passed    0.68 sec
+      Start 26: library.revisions
+26/56 Test #26: library.revisions ................   Passed    0.41 sec
+      Start 27: library.backup
+27/56 Test #27: library.backup ...................   Passed    0.71 sec
+      Start 28: library.plans
+28/56 Test #28: library.plans ....................   Passed    9.97 sec
+      Start 29: library.unnamed
+29/56 Test #29: library.unnamed ..................   Passed    0.02 sec
+      Start 30: playback.playback
+30/56 Test #30: playback.playback ................   Passed    0.05 sec
+      Start 31: playback.scheduler
+31/56 Test #31: playback.scheduler ...............   Passed    4.38 sec
+      Start 32: playback.transport
+32/56 Test #32: playback.transport ...............   Passed    0.02 sec
+      Start 33: playback.unnamed
+33/56 Test #33: playback.unnamed .................   Passed    0.01 sec
+      Start 34: audio.audio
+34/56 Test #34: audio.audio ......................   Passed    0.10 sec
+      Start 35: audio.render
+35/56 Test #35: audio.render .....................   Passed    2.14 sec
+      Start 36: audio.unnamed
+36/56 Test #36: audio.unnamed ....................   Passed    0.01 sec
+      Start 37: platform.platform
+37/56 Test #37: platform.platform ................   Passed    1.27 sec
+      Start 38: platform.unnamed
+38/56 Test #38: platform.unnamed .................   Passed    0.01 sec
+      Start 39: jobs.jobs
+39/56 Test #39: jobs.jobs ........................   Passed    0.10 sec
+      Start 40: jobs.unnamed
+40/56 Test #40: jobs.unnamed .....................   Passed    0.01 sec
+      Start 41: worker.ipc
+41/56 Test #41: worker.ipc .......................   Passed    0.08 sec
+      Start 42: worker.worker
+42/56 Test #42: worker.worker ....................   Passed    0.20 sec
+      Start 43: worker.unnamed
+43/56 Test #43: worker.unnamed ...................   Passed    0.01 sec
+      Start 44: app.recording
+44/56 Test #44: app.recording ....................   Passed    0.09 sec
+      Start 45: app.step_recording
+45/56 Test #45: app.step_recording ...............   Passed    0.02 sec
+      Start 46: app.app
+46/56 Test #46: app.app ..........................   Passed    0.16 sec
+      Start 47: app.unnamed
+47/56 Test #47: app.unnamed ......................   Passed    0.01 sec
+      Start 48: cli.cli
+48/56 Test #48: cli.cli ..........................   Passed    1.14 sec
+      Start 49: cli.unnamed
+49/56 Test #49: cli.unnamed ......................   Passed    0.02 sec
+      Start 50: ui.editor_math
+50/56 Test #50: ui.editor_math ...................   Passed    0.06 sec
+      Start 51: ui.controller
+51/56 Test #51: ui.controller ....................   Passed    0.04 sec
+      Start 52: ui.piano_roll
+52/56 Test #52: ui.piano_roll ....................   Passed    0.04 sec
+      Start 53: ui.keyboard
+53/56 Test #53: ui.keyboard ......................   Passed    0.04 sec
+      Start 54: ui.clipboard
+54/56 Test #54: ui.clipboard .....................   Passed    0.04 sec
+      Start 55: ui.unnamed
+55/56 Test #55: ui.unnamed .......................   Passed    0.02 sec
+      Start 56: include-graph
+56/56 Test #56: include-graph ....................   Passed    0.10 sec
+
+100% tests passed out of 56
+
+Total Test time (real) =  41.27 sec

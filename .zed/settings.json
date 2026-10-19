@@ -1,0 +1,8 @@
+{
+  "lsp": {
+    "clangd": {
+      "binary": { "path": "C:/msys64/clang64/bin/clangd.exe", "arguments": ["--compile-commands-dir=build/debug", "--header-insertion=never"] }
+    }
+  },
+  "languages": { "C++": { "tab_size": 4, "format_on_save": "off" } }
+}

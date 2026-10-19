@@ -4,8 +4,8 @@ Specification: `MIDI_Workbench_Full_Specification.md` v1.1. This file records wh
 was verified (with the commands that ran), deviations, exceptions and what is left. Each claim
 cites a run or says "not verified".
 
-Last update: 2026-10-19. Work is committed to a local git repository (branch `main`) with the
-owner's OK; it has not been pushed anywhere.
+Last update: 2026-10-20. Work is committed on branch `main` and pushed to
+https://github.com/alonohana627/MIDIWorkbench (public).
 
 ## Environment of the verified runs
 

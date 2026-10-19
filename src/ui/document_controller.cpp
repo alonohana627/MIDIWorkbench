@@ -67,7 +67,7 @@ TaskThread& recovery_thread() {
 }
 } // namespace
 
-void stop_recovery_thread() { recovery_thread().stop(); }
+void drain_recovery_thread() { recovery_thread().wait_idle(); }
 
 void DocumentController::flush_recovery_async() {
     if (!journal_ || recovery_flush_running_)

@@ -77,7 +77,8 @@ multi-sequence file.
 | Ctrl+A | Select all |
 | Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste at the edit cursor |
 | Ctrl+D | Duplicate the selection right after itself |
-| ← / → | Move selection by one grid step |
+| ← / → | Move the selected notes by one grid step; with nothing selected, move the play position |
+| Ctrl+← / Ctrl+→ | Move the play position (red line) one grid step; Space then plays from there |
 | ↑ / ↓, Shift+↑ / Shift+↓ | Transpose by a semitone / an octave |
 | Ctrl+↑ / Ctrl+↓ | Move by one degree of the scale |
 | Q / Ctrl+Q | Apply last quantize / open the quantize tool |

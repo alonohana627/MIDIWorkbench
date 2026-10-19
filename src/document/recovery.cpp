@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <future>
 #include <thread>
 #include <memory>
@@ -118,15 +119,14 @@ std::string kind_label(CommandKind kind) {
 
 constexpr auto generation_limit = static_cast<Generation>(std::numeric_limits<std::int64_t>::max());
 
-/// One background thread that computes semantic hashes for every journal in order, so recording
-/// an edit never waits for an O(document) hash and never starts a thread per edit. Queued work
-/// runs before the thread exits (a future must never be abandoned).
-class HashExecutor {
+/// One background thread running queued work in order. Queued work runs before the thread exits,
+/// so a future handed out is never abandoned; a journal never waits on it in a destructor.
+class BackgroundExecutor {
 public:
-    HashExecutor()
+    BackgroundExecutor()
         : thread_([this](std::stop_token stop) {
               while (true) {
-                  std::packaged_task<Sha256Digest()> task;
+                  std::function<void()> task;
                   {
                       std::unique_lock lock(mutex_);
                       wake_.wait(lock, stop, [this] { return !tasks_.empty(); });
@@ -135,34 +135,51 @@ public:
                       task = std::move(tasks_.front());
                       tasks_.pop_front();
                   }
-                  task();
+                  task(); // packaged tasks store exceptions in their futures
               }
           }) {}
-    ~HashExecutor() {
+    ~BackgroundExecutor() {
         thread_.request_stop();
         wake_.notify_all();
     }
-    std::shared_future<Sha256Digest> submit(std::shared_ptr<const DocumentData> snapshot) {
-        std::packaged_task<Sha256Digest()> task([snapshot = std::move(snapshot)] { return semantic_hash(*snapshot); });
-        auto future = task.get_future().share();
+    template <class Result>
+    std::shared_future<Result> submit(std::function<Result()> work) {
+        auto task = std::make_shared<std::packaged_task<Result()>>(std::move(work));
+        auto future = task->get_future().share();
         {
             std::lock_guard lock(mutex_);
-            tasks_.push_back(std::move(task));
+            tasks_.push_back([task] { (*task)(); });
         }
         wake_.notify_all();
         return future;
+    }
+    /// Work waiting to start (not counting the task that is running).
+    [[nodiscard]] std::size_t queued() {
+        std::lock_guard lock(mutex_);
+        return tasks_.size();
     }
 
 private:
     std::mutex mutex_;
     std::condition_variable_any wake_;
-    std::deque<std::packaged_task<Sha256Digest()>> tasks_;
+    std::deque<std::function<void()>> tasks_;
     std::jthread thread_;
 };
 
-HashExecutor& hash_executor() {
-    static HashExecutor executor;
+BackgroundExecutor& hash_executor() {
+    static BackgroundExecutor executor;
     return executor;
+}
+
+BackgroundExecutor& checkpoint_executor() {
+    static BackgroundExecutor executor;
+    return executor;
+}
+
+std::shared_future<Sha256Digest> ready_digest(const Sha256Digest& digest) {
+    std::promise<Sha256Digest> promise;
+    promise.set_value(digest);
+    return promise.get_future().share();
 }
 
 } // namespace
@@ -278,8 +295,6 @@ Status RecoveryJournal::record(CommandKind kind, const ChangeSet& applied, Gener
     last_generation_ = result_generation;
     // Hashing and checkpoint serialization are O(document) (about 40 ms and 1.4 s at 100k events):
     // both run on background threads from one immutable copy (a few ms), never on the GUI thread.
-    auto snapshot = std::make_shared<const DocumentData>(result_document);
-    last_hash_ = hash_executor().submit(snapshot);
     commands_since_checkpoint_ += 1;
     bytes_since_checkpoint_ += payload_size;
 
@@ -287,8 +302,18 @@ Status RecoveryJournal::record(CommandKind kind, const ChangeSet& applied, Gener
     const bool due = commands_since_checkpoint_ >= policy_.checkpoint_command_count ||
                      bytes_since_checkpoint_ >= policy_.checkpoint_journal_bytes ||
                      now - last_checkpoint_ms_ >= policy_.checkpoint_interval.count();
-    if (due && !checkpoint_job_.valid() && !pending_checkpoint_) {
-        checkpoint_job_ = std::async(std::launch::async,
+    const bool checkpoint_now = due && !checkpoint_job_.valid() && !pending_checkpoint_;
+    // The next command's base hash is computed when the hashing thread keeps up. Under a burst of
+    // edits (auto-repeat on a large document) hashes are skipped instead of queueing a document
+    // copy per edit: such commands carry a zero base hash, and replay checks the others.
+    const bool hash_now = hash_executor().queued() == 0;
+    std::shared_ptr<const DocumentData> snapshot;
+    if (hash_now || checkpoint_now)
+        snapshot = std::make_shared<const DocumentData>(result_document);
+    last_hash_ = hash_now ? hash_executor().submit<Sha256Digest>([snapshot] { return semantic_hash(*snapshot); })
+                          : ready_digest(Sha256Digest{});
+    if (checkpoint_now) {
+        checkpoint_job_ = checkpoint_executor().submit<Result<PendingCheckpoint>>(
                                      [snapshot, command_no = last_command_no_, result_generation, now]() -> Result<PendingCheckpoint> {
                                          auto bytes = native_to_bytes(*snapshot);
                                          if (!bytes)
@@ -313,19 +338,26 @@ Status RecoveryJournal::flush(bool wait_for_checkpoint) {
     std::lock_guard database_lock(database_mutex_);
     // Take the buffered work under the state lock; write it without holding that lock, so the
     // document's thread keeps recording while SQLite commits.
-    std::future<Result<PendingCheckpoint>> job;
+    std::shared_future<Result<PendingCheckpoint>> job;
     {
         std::lock_guard state_lock(state_mutex_);
         if (checkpoint_job_.valid() &&
-            (wait_for_checkpoint || checkpoint_job_.wait_for(std::chrono::seconds(0)) == std::future_status::ready))
-            job = std::move(checkpoint_job_);
+            (wait_for_checkpoint || checkpoint_job_.wait_for(std::chrono::seconds(0)) == std::future_status::ready)) {
+            job = checkpoint_job_;
+            checkpoint_job_ = {};
+        }
     }
     std::optional<PendingCheckpoint> checkpoint;
     if (job.valid()) {
-        auto finished = job.get();
-        if (!finished)
-            return std::unexpected(std::move(finished).error());
-        checkpoint = std::move(*finished);
+        const auto& finished = job.get();
+        if (finished) {
+            checkpoint = *finished;
+        } else {
+            // The commands are still written; the checkpoint is retried on the next edit.
+            std::lock_guard state_lock(state_mutex_);
+            last_error_ = finished.error();
+            commands_since_checkpoint_ = policy_.checkpoint_command_count;
+        }
     }
     std::vector<PendingCommand> batch;
     SourceReference source;
@@ -629,7 +661,8 @@ Result<RecoveredDocument> recover_session(const std::filesystem::path& directory
                 stop(entry + "generation columns disagree with the envelope");
             } else if (envelope->base_generation != document.generation) {
                 stop(entry + "base generation does not follow the recovered state");
-            } else if (envelope->base_semantic_hash != semantic_hash(document)) {
+            } else if (envelope->base_semantic_hash != Sha256Digest{} && // zero: not recorded (edit burst)
+                       envelope->base_semantic_hash != semantic_hash(document)) {
                 stop(entry + "base semantic hash does not match the recovered state");
             } else if (auto applied = apply_change_set(document, envelope->changes); !applied) {
                 stop(entry + "cannot be applied: " + applied.error().message);

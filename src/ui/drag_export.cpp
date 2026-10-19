@@ -32,8 +32,13 @@ std::string safe_file_stem(const std::string& title) {
         stem.pop_back();
     if (stem.empty())
         stem = "MIDI";
-    if (stem.size() > 80)
-        stem.resize(80);
+    if (stem.size() > 80) {
+        std::size_t length = 80;
+        // Never cut inside a UTF-8 sequence (a split character makes an invalid path).
+        while (length > 0 && (static_cast<unsigned char>(stem[length]) & 0xC0) == 0x80)
+            --length;
+        stem.resize(length);
+    }
     return stem;
 }
 

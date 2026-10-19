@@ -187,6 +187,7 @@ MainWindow::MainWindow(StartupOptions options, app::DataDirectories directories,
     cursor_label_->setFont(mono_font());
     cursor_label_->setMinimumWidth(190);
     cursor_label_->setToolTip(tr("Position and pitch under the mouse"));
+    cursor_label_->setText(tr("Pointer: —"));
     bool first_readout = true;
     for (auto* label : {cursor_label_, selection_label_, snap_label_, recovery_label_, device_label_}) {
         if (!first_readout) {
@@ -268,7 +269,7 @@ MainWindow::~MainWindow() {
     recovery_timer_.stop();
     playback_->panic(false);
     io_thread_.reset(); // joins a pending open or export
-    stop_recovery_thread(); // queued clean closes land before the process ends
+    drain_recovery_thread(); // queued clean closes land before the process ends
 }
 
 EditorTab* MainWindow::current_tab() const { return qobject_cast<EditorTab*>(tabs_->currentWidget()); }
@@ -351,6 +352,12 @@ void MainWindow::build_actions() {
                 [this] { move_selection_by_grid(-1); });
     add_command("edit.move_right", tr("Move Notes or Play Position Right"), QKeySequence(Qt::Key_Right),
                 [this] { move_selection_by_grid(1); });
+    // Ctrl+Left/Right always move the play position one grid cell (Space then plays from there),
+    // whether or not notes are selected.
+    add_command("transport.position_left", tr("Play Position Left"), QKeySequence(Qt::CTRL | Qt::Key_Left),
+                [this] { move_play_position(-1); });
+    add_command("transport.position_right", tr("Play Position Right"), QKeySequence(Qt::CTRL | Qt::Key_Right),
+                [this] { move_play_position(1); });
     add_command("edit.quantize_last", tr("Apply Last &Quantize"), QKeySequence(Qt::Key_Q), [this] { inspector_->apply_last_quantize(); });
     add_command("edit.quantize_panel", tr("Quantize Panel…"), QKeySequence(Qt::CTRL | Qt::Key_Q), [this] {
         inspector_dock_->show();
@@ -582,6 +589,7 @@ void MainWindow::build_menus() {
         return nullptr;
     };
     const auto add = [&](QMenu* menu, std::initializer_list<const char*> ids) {
+        menu->setToolTipsVisible(true); // disabled commands explain why
         for (const auto* id : ids) {
             if (id == nullptr)
                 menu->addSeparator();
@@ -648,7 +656,8 @@ void MainWindow::build_menus() {
     view->addAction(inspector_dock_->toggleViewAction());
     view->addAction(events_dock_->toggleViewAction());
     add(menuBar()->addMenu(tr("T&ransport")), {"transport.play_pause", "transport.play_selection", "transport.stop",
-                                                "transport.go_to_start", nullptr, "transport.loop", "transport.metronome",
+                                                "transport.go_to_start", "transport.position_left", "transport.position_right",
+                                                nullptr, "transport.loop", "transport.metronome",
                                                 nullptr, "transport.record", "transport.count_in_0", "transport.count_in_1",
                                                 "transport.count_in_2", "transport.midi_input", nullptr,
                                                 "transport.step_record", "transport.step_rest", "transport.step_tie",
@@ -828,8 +837,14 @@ void MainWindow::build_toolbar() {
     command_search_->setPlaceholderText(tr("Search commands  (Ctrl+Shift+P)"));
     command_search_->setAccessibleName(tr("Search commands"));
     command_search_->setFixedWidth(230);
+    command_search_->setFixedHeight(std::max(22, menuBar()->sizeHint().height() - 4));
     command_search_->setClearButtonEnabled(false);
-    menuBar()->setCornerWidget(command_search_, Qt::TopRightCorner); // keeps the toolbar uncrowded
+    // In the menu bar corner (keeps the toolbar uncrowded), inside margins so it is never clipped.
+    auto* corner = new QWidget(this);
+    auto* corner_layout = new QHBoxLayout(corner);
+    corner_layout->setContentsMargins(0, 2, 8, 2);
+    corner_layout->addWidget(command_search_);
+    menuBar()->setCornerWidget(corner, Qt::TopRightCorner);
     // Typing or clicking here opens the command palette (the palette does the searching).
     connect(command_search_, &QLineEdit::textEdited, this, [this] {
         command_search_->clear();
@@ -872,7 +887,7 @@ void MainWindow::set_theme(const QString& name) {
 // --- Documents -----------------------------------------------------------------------------------
 
 void MainWindow::open_document(DocumentData document, std::optional<std::filesystem::path> path, bool recovered,
-                               std::shared_ptr<document::RecoveryJournal> prepared_journal) {
+                               std::shared_ptr<document::RecoveryJournal> prepared_journal, bool journal_prepared) {
     const auto origin = recovered ? document::SessionOrigin::recovered
                         : path   ? document::SessionOrigin::opened_file
                                  : document::SessionOrigin::new_document;
@@ -887,10 +902,15 @@ void MainWindow::open_document(DocumentData document, std::optional<std::filesys
     }
     // A journal prepared on the I/O thread (its first checkpoint serializes the whole document)
     // is used as is; small new documents create theirs here.
-    auto journal = prepared_journal ? Result<std::unique_ptr<document::RecoveryJournal>>(nullptr)
-                                    : document::RecoveryJournal::create(directories_.recovery, controller->document(), source);
+    // Documents prepared on the I/O thread never create their journal here, even when that failed:
+    // the GUI thread would serialize the whole document.
+    auto journal = prepared_journal || journal_prepared
+                       ? Result<std::unique_ptr<document::RecoveryJournal>>(nullptr)
+                       : document::RecoveryJournal::create(directories_.recovery, controller->document(), source);
     if (prepared_journal)
         controller->attach_recovery(std::move(prepared_journal));
+    else if (journal_prepared)
+        statusBar()->showMessage(tr("Recovery is unavailable for this document (the recovery folder could not be written)"), 10000);
     else if (journal)
         controller->attach_recovery(std::shared_ptr<document::RecoveryJournal>(std::move(*journal)));
     else
@@ -974,7 +994,7 @@ void MainWindow::finish_open(const std::filesystem::path& path, Result<app::Open
     for (const auto& diagnostic : opened->diagnostics)
         if (diagnostic.severity != Severity::info)
             warnings << QString::fromStdString(diagnostic.message);
-    open_document(std::move(opened->document), native ? std::optional(path) : std::nullopt, false, std::move(journal));
+    open_document(std::move(opened->document), native ? std::optional(path) : std::nullopt, false, std::move(journal), true);
     if (!warnings.isEmpty())
         statusBar()->showMessage(tr("Opened with %n warning(s): %1", nullptr, static_cast<int>(warnings.size())).arg(warnings.front()), 10000);
     else
@@ -1014,6 +1034,7 @@ void MainWindow::connect_tab(EditorTab* tab) {
             [this](const QString& message) { statusBar()->showMessage(message, 8000); });
     connect(&view, &PianoRollView::status_message, this, [this](const QString& text) { statusBar()->showMessage(text, 4000); });
     connect(&view, &PianoRollView::tool_changed, this, &MainWindow::update_command_state);
+    connect(tab, &EditorTab::status_message, this, [this](const QString& text) { statusBar()->showMessage(text, 6000); });
     connect(&view, &PianoRollView::hover_changed, this, [this, tab](Tick tick, int pitch) {
         cursor_label_->setText(QString("%1  %2 (%3)")
                                    .arg(QString::fromStdString(tab->controller().meter_map().format(std::max<Tick>(0, tick))))
@@ -1286,7 +1307,7 @@ void MainWindow::open_prepared(DocumentData document, bool recovered, std::funct
                 if (!guard)
                     return;
                 --guard->pending_opens_;
-                guard->open_document(std::move(*shared), std::nullopt, recovered, journal);
+                guard->open_document(std::move(*shared), std::nullopt, recovered, journal, true);
                 if (opened)
                     if (auto* tab = guard->current_tab())
                         opened(tab);
@@ -1397,7 +1418,7 @@ void MainWindow::present_recovery(std::vector<document::RecoverableSession> sess
                             return;
                         }
                         const auto report = (*recovered)->report;
-                        guard->open_document(std::move((*recovered)->document), std::nullopt, true, journal);
+                        guard->open_document(std::move((*recovered)->document), std::nullopt, true, journal, true);
                         guard->statusBar()->showMessage(
                             tr("Recovered %1 edit(s)%2")
                                 .arg(report.applied_commands)
@@ -1406,8 +1427,8 @@ void MainWindow::present_recovery(std::vector<document::RecoverableSession> sess
                             10000);
                     },
                     Qt::QueuedConnection);
-                if (!*recovered)
-                    continue; // keep the evidence of a session that could not be recovered
+                if (!*recovered || !journal)
+                    continue; // keep the old evidence until the recovered document is protected again
             }
             std::ignore = document::discard_recovery_session(recovery_directory, session_id); // evidence no longer needed
         }
@@ -1463,21 +1484,29 @@ void MainWindow::transpose_selection_by_degree(int degrees) {
     controller.apply(preview->changes);
 }
 
+void MainWindow::move_play_position(int direction) {
+    auto* tab = current_tab();
+    if (!tab)
+        return;
+    auto& controller = tab->controller();
+    const auto grid = tab->piano_roll().grid();
+    const auto display = playback_->display();
+    const bool rolling = !transport_display_is_stopped(display) && transport_owner_ == &controller;
+    const Tick from = rolling ? display.position : controller.edit_cursor();
+    const Tick to = direction < 0 ? std::max<Tick>(0, grid.floor(from > 0 ? from - 1 : 0)) : grid.next(from);
+    if (rolling)
+        playback_->seek(to); // the playhead jumps; playback continues from there
+    controller.set_edit_cursor(to);
+    tab->piano_roll().scroll_to_tick(to);
+}
+
 void MainWindow::move_selection_by_grid(int direction) {
     auto* tab = current_tab();
     if (!tab)
         return;
     auto& controller = tab->controller();
     if (controller.selection().empty()) {
-        const auto grid = tab->piano_roll().grid();
-        const auto display = playback_->display();
-        const bool rolling = !transport_display_is_stopped(display) && transport_owner_ == &controller;
-        const Tick from = rolling ? display.position : controller.edit_cursor();
-        const Tick to = direction < 0 ? std::max<Tick>(0, grid.floor(from > 0 ? from - 1 : 0)) : grid.next(from);
-        if (rolling)
-            playback_->seek(to); // the playhead jumps; playback continues from there
-        controller.set_edit_cursor(to);
-        tab->piano_roll().scroll_to_tick(to);
+        move_play_position(direction);
         return;
     }
     music::TargetSelection selection{controller.active_sequence().id, {controller.active_track()},
@@ -1596,6 +1625,19 @@ void MainWindow::stop_transport() {
 
 void MainWindow::update_status_from_transport() {
     const auto display = playback_->display();
+    // The Play button shows what pressing it does: Pause while the transport runs.
+    const bool rolling = display.state == TransportDisplay::State::playing ||
+                         display.state == TransportDisplay::State::recording ||
+                         display.state == TransportDisplay::State::counting_in;
+    if (rolling != showing_pause_) {
+        showing_pause_ = rolling;
+        if (auto* play = command("transport.play_pause")) {
+            const IconId icon = rolling ? IconId::pause : IconId::play;
+            play->setIcon(make_icon(icon));
+            play->setProperty("mwb_icon", static_cast<int>(icon));
+            play->setIconText(rolling ? tr("Pause") : tr("Play"));
+        }
+    }
     QString state;
     switch (display.state) {
     case TransportDisplay::State::stopped: state = tr("Stop"); break;
@@ -1663,7 +1705,7 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
         const bool plain_key = modifiers == Qt::NoModifier &&
                                (code == Qt::Key_Space || code == Qt::Key_Up || code == Qt::Key_Down || code == Qt::Key_Left ||
                                 code == Qt::Key_Right || code == Qt::Key_Home || code == Qt::Key_End ||
-                                code == Qt::Key_PageUp || code == Qt::Key_PageDown || code == Qt::Key_Delete ||
+                                code == Qt::Key_PageUp || code == Qt::Key_PageDown || // not Delete: it deletes notes everywhere
                                 (code >= Qt::Key_0 && code <= Qt::Key_9) || (code >= Qt::Key_A && code <= Qt::Key_Z));
         const bool control = focus && (qobject_cast<QAbstractButton*>(focus) || qobject_cast<QComboBox*>(focus) ||
                                        qobject_cast<QAbstractItemView*>(focus) || qobject_cast<QAbstractSpinBox*>(focus) ||

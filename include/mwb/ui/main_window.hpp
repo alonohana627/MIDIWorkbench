@@ -68,7 +68,7 @@ public:
     void new_from_template(const QString& name);
     /// Imports or reopens a document already in memory (used by recovery and the library).
     void open_document(DocumentData document, std::optional<std::filesystem::path> path, bool recovered,
-                       std::shared_ptr<document::RecoveryJournal> journal = nullptr);
+                       std::shared_ptr<document::RecoveryJournal> journal = nullptr, bool journal_prepared = false);
     [[nodiscard]] EditorTab* current_tab() const;
     /// Offers recoverable sessions left by a crash (section 5.5).
     void offer_recovery();
@@ -116,6 +116,7 @@ private:
     void show_diagnostics();
     void transpose_selection(int semitones);
     void move_selection_by_grid(int direction);
+    void move_play_position(int direction);
     void transpose_selection_by_degree(int degrees);
     void delete_selection();
     void duplicate_selection();
@@ -148,6 +149,7 @@ private:
     QAction* keyboard_action_ = nullptr;
     QLineEdit* command_search_ = nullptr;
     bool updating_toolbar_ = false;
+    bool showing_pause_ = false;
     QDoubleSpinBox* tempo_multiplier_ = nullptr;
     QAction* loop_action_ = nullptr;
     QAction* metronome_action_ = nullptr;

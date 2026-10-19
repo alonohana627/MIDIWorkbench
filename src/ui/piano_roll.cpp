@@ -611,7 +611,7 @@ void PianoRollView::paint_keyboard(QPainter& painter) {
             color = palette().color(QPalette::Highlight);
         painter.fillRect(key, color);
         painter.setPen(colors.c_line);
-        painter.drawLine(key.bottomLeft(), key.bottomRight());
+        painter.drawLine(QPointF(key.left(), key.bottom() - 0.5), QPointF(key.right(), key.bottom() - 0.5)); // inside this key
         if (sequence.settings.highlight_scale && in_scale(pitch)) {
             // Shape marker in addition to color: filled square for the root, dot for members.
             painter.setBrush(palette().color(QPalette::Highlight));
@@ -1198,7 +1198,7 @@ void PianoRollView::keyPressEvent(QKeyEvent* event) {
         return;
     }
     if ((event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter || event->key() == Qt::Key_Insert) &&
-        controller_.active_track_index()) {
+        controller_.active_track_index() && controller_.selection().empty()) { // step entry only without a selection
         const Tick start = controller_.edit_cursor();
         const NewNote created{controller_.active_track(), start, start + default_note_length(),
                               static_cast<std::uint8_t>(cursor_pitch_), default_velocity(), default_channel(), 0};
@@ -1207,7 +1207,7 @@ void PianoRollView::keyPressEvent(QKeyEvent* event) {
                 controller_.set_edit_cursor(start + default_note_length()); // step entry: advance the cursor
         }
         emit audition_note_on(cursor_pitch_, default_velocity());
-        emit audition_note_off(cursor_pitch_);
+        QTimer::singleShot(150, this, [this, pitch = cursor_pitch_] { emit audition_note_off(pitch); }); // audible
         event->accept();
         return;
     }

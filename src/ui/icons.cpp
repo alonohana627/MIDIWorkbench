@@ -211,6 +211,13 @@ void paint_icon(QPainter& painter, IconId id, const QColor& ink) {
         painter.drawRoundedRect(QRectF(4, 8, 11, 12), 1.5, 1.5);
         painter.drawRoundedRect(QRectF(9, 4, 11, 12), 1.5, 1.5);
         break;
+    case IconId::pause: {
+        QPainterPath bars;
+        bars.addRoundedRect(QRectF(6, 5, 4, 14), 1, 1);
+        bars.addRoundedRect(QRectF(14, 5, 4, 14), 1, 1);
+        fill(bars, ink);
+        break;
+    }
     case IconId::close:
         pen.setWidthF(1.8);
         painter.setPen(pen);

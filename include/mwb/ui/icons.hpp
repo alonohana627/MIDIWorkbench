@@ -30,6 +30,7 @@ enum class IconId {
     up,
     down,
     close,
+    pause,
 };
 
 /// Paints the icon at 16, 20, 24 and 32 px for the current palette; rebuild after a theme change.

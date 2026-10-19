@@ -269,6 +269,20 @@ Result<std::unique_ptr<WorkerClient>> WorkerClient::start(const std::filesystem:
 
 Result<ParsedFile> WorkerClient::parse_midi(std::span<const std::uint8_t> bytes, const std::string& name,
                                             const midi::ParseLimits& limits, std::stop_token stop) {
+    // The worker's replies are untrusted: a malformed field fails this item and stops the worker
+    // (it restarts on the next request); it never throws into the application.
+    try {
+        return parse_midi_checked(bytes, name, limits, std::move(stop));
+    } catch (const std::exception& error) {
+        stop_process_after_protocol_error();
+        return make_error(ErrorCode::invalid_data, std::string("the parser worker sent a malformed reply: ") + error.what());
+    }
+}
+
+void WorkerClient::stop_process_after_protocol_error() { stop(); }
+
+Result<ParsedFile> WorkerClient::parse_midi_checked(std::span<const std::uint8_t> bytes, const std::string& name,
+                                                    const midi::ParseLimits& limits, std::stop_token stop) {
     if (!is_alive())
         return make_error(ErrorCode::internal, "the worker is not running");
     if (bytes.size() > limits.max_bytes)

@@ -5,6 +5,7 @@
 #include "mwb/library/library.hpp"
 #include "mwb/midi/codec.hpp"
 #include "mwb/search/sql.hpp"
+#include "mwb/ui/task_thread.hpp"
 
 #include <QAbstractTableModel>
 #include <QTimer>
@@ -135,6 +136,8 @@ private:
     QTableView* table_ = nullptr;
     QLabel* status_ = nullptr;
     QPushButton* import_button_ = nullptr;
+    QPushButton* cancel_import_button_ = nullptr;
+    std::shared_ptr<std::stop_source> import_stop_;
     QTimer debounce_;
     /// Latest search generation; shared with queued tasks so obsolete searches are skipped.
     std::shared_ptr<std::atomic<std::uint64_t>> generation_ = std::make_shared<std::atomic<std::uint64_t>>(0);
@@ -147,6 +150,13 @@ private:
     std::optional<search::PageCursor> next_page_;
     std::string current_query_;
     bool fetching_more_ = false;
+    /// Owned background threads: searches; opens, revisions and drag files; user writes (drained on
+    /// close); imports (so a save never waits behind a whole import).
+    std::unique_ptr<TaskThread> read_thread_ = std::make_unique<TaskThread>();
+    std::unique_ptr<TaskThread> browse_thread_ = std::make_unique<TaskThread>();
+    std::unique_ptr<TaskThread> write_thread_ = std::make_unique<TaskThread>(true);
+    std::unique_ptr<TaskThread> import_thread_ = std::make_unique<TaskThread>();
+    std::shared_ptr<std::atomic<std::uint64_t>> drag_latest_ = std::make_shared<std::atomic<std::uint64_t>>(0);
 };
 
 } // namespace mwb::ui

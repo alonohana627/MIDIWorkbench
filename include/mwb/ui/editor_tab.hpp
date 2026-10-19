@@ -63,6 +63,10 @@ public:
     void remove_last_lane();
     void remove_lane(ControllerLane* lane);
 
+signals:
+    /// Messages from the drum grid and the lanes, for the status bar.
+    void status_message(const QString& text);
+
 private:
     void sync_lanes();
 

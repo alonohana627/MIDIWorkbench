@@ -66,6 +66,9 @@ public:
 private:
     struct Process;
     WorkerClient(std::unique_ptr<Process> process, WorkerLimits limits);
+    [[nodiscard]] Result<ParsedFile> parse_midi_checked(std::span<const std::uint8_t> bytes, const std::string& name,
+                                                        const midi::ParseLimits& limits, std::stop_token stop);
+    void stop_process_after_protocol_error();
 
     std::unique_ptr<Process> process_;
     WorkerLimits limits_;

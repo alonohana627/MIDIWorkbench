@@ -769,6 +769,7 @@ Result<ImportReport> Library::import_paths(const std::vector<std::filesystem::pa
                                            const ImportOptions& options, std::stop_token stop) {
     ImportReport report;
     auto& state = *state_;
+    std::size_t expected_files = 0;
     const auto add_item = [&](std::string path, ImportOutcome outcome, std::optional<std::int64_t> asset,
                               std::string reason) {
         switch (outcome) {
@@ -795,6 +796,8 @@ Result<ImportReport> Library::import_paths(const std::vector<std::filesystem::pa
             break;
         }
         report.items.push_back(ImportItem{std::move(path), outcome, asset, std::move(reason)});
+        if (options.progress)
+            options.progress(report.items.size(), expected_files);
     };
 
     for (const auto& source : sources) {
@@ -831,6 +834,7 @@ Result<ImportReport> Library::import_paths(const std::vector<std::filesystem::pa
         if (!root_id)
             return std::unexpected(std::move(root_id).error());
 
+        expected_files += files.size();
         for (const auto& file : files) {
             ++report.counts.discovered;
             const auto relative = path_utf8(file.lexically_relative(root));

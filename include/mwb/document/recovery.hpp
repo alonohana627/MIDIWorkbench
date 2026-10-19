@@ -181,7 +181,7 @@ private:
     std::shared_future<Sha256Digest> last_hash_;
     bool discard_if_unused_ = false;
     /// Checkpoint snapshot being serialized on a background thread.
-    std::future<Result<PendingCheckpoint>> checkpoint_job_;
+    std::shared_future<Result<PendingCheckpoint>> checkpoint_job_;
     std::size_t commands_since_checkpoint_ = 0;
     std::size_t bytes_since_checkpoint_ = 0;
     std::int64_t last_checkpoint_ms_ = 0;

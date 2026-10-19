@@ -1,10 +1,13 @@
 #include "mwb/ui/drum_grid.hpp"
 
+#include "mwb/ui/theme.hpp"
+
 #include "mwb/core/note_edit.hpp"
 #include "mwb/core/pitch.hpp"
 #include "mwb/ui/document_controller.hpp"
 #include "mwb/ui/editor_math.hpp"
 
+#include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QWheelEvent>
@@ -144,14 +147,39 @@ void DrumGridView::paintEvent(QPaintEvent*) {
             }
         }
     }
+    // Edit cursor (where playback starts) and the keyboard cell cursor.
+    const Tick cursor = controller_.edit_cursor();
+    if (cursor >= origin_ && step > 0) {
+        const double x = name_width + static_cast<double>(cursor - origin_) / static_cast<double>(step) * cell_width;
+        painter.setPen(QPen(roll_colors().playhead, 2));
+        painter.drawLine(QPointF(x, row_height), QPointF(x, height()));
+    }
+    if (hasFocus() && !row_list.empty()) {
+        const int row = std::clamp(cursor_row_, 0, static_cast<int>(row_list.size()) - 1);
+        const QRect focus(name_width + static_cast<int>(cursor_column_) * cell_width, row_height * (row + 1), cell_width,
+                          row_height);
+        painter.setPen(QPen(palette().color(QPalette::Highlight), 2));
+        painter.setBrush(Qt::NoBrush);
+        painter.drawRect(focus.adjusted(1, 1, -1, -1));
+    }
 }
 
 void DrumGridView::mousePressEvent(QMouseEvent* event) {
     const auto cell = cell_at(event->position());
-    const auto active = controller_.active_track_index();
-    if (!cell || !active || event->button() != Qt::LeftButton)
+    if (!cell || event->button() != Qt::LeftButton)
         return;
-    const auto [pitch, column] = *cell;
+    const auto row_list = rows();
+    const auto found = std::find(row_list.begin(), row_list.end(), cell->first);
+    if (found != row_list.end())
+        cursor_row_ = static_cast<int>(found - row_list.begin());
+    cursor_column_ = cell->second;
+    toggle_cell(cell->first, cell->second, (event->modifiers() & Qt::ShiftModifier) != 0);
+}
+
+void DrumGridView::toggle_cell(int pitch, std::int64_t column, bool accent) {
+    const auto active = controller_.active_track_index();
+    if (!active)
+        return;
     const Tick step = step_ticks();
     const Tick start = origin_ + column * step;
     std::vector<EventId> existing;
@@ -170,13 +198,65 @@ void DrumGridView::mousePressEvent(QMouseEvent* event) {
             controller_.apply(*changes);
         return;
     }
-    const int velocity = (event->modifiers() & Qt::ShiftModifier) ? accent_velocity_ : normal_velocity_;
+    const int velocity = accent ? accent_velocity_ : normal_velocity_;
     const NewNote note{sequence.tracks[*active].id, start, start + std::max<Tick>(1, step / 2),
                        static_cast<std::uint8_t>(pitch), static_cast<std::uint8_t>(velocity),
                        sequence.tracks[*active].is_drum ? std::uint8_t{9} : std::uint8_t{0}, 0};
     auto changes = insert_notes(controller_.document(), std::span(&note, 1), "Set drum step");
     if (changes)
         controller_.apply(*changes);
+}
+
+bool DrumGridView::event(QEvent* event) {
+    // Arrow keys, Space and Return operate the grid while it has focus (not the window's commands).
+    if (event->type() == QEvent::ShortcutOverride) {
+        const auto* key = static_cast<QKeyEvent*>(event);
+        switch (key->key()) {
+        case Qt::Key_Left:
+        case Qt::Key_Right:
+        case Qt::Key_Up:
+        case Qt::Key_Down:
+        case Qt::Key_Space:
+        case Qt::Key_Return:
+        case Qt::Key_Enter:
+            event->accept();
+            return true;
+        default: break;
+        }
+    }
+    return QWidget::event(event);
+}
+
+void DrumGridView::keyPressEvent(QKeyEvent* event) {
+    const auto row_list = rows();
+    const int steps_visible = std::max(1, (width() - name_width) / cell_width);
+    switch (event->key()) {
+    case Qt::Key_Up: cursor_row_ = std::max(0, cursor_row_ - 1); break;
+    case Qt::Key_Down: cursor_row_ = std::min(static_cast<int>(row_list.size()) - 1, cursor_row_ + 1); break;
+    case Qt::Key_Left:
+        if (cursor_column_ > 0)
+            --cursor_column_;
+        else if (origin_ > 0)
+            set_origin(std::max<Tick>(0, origin_ - step_ticks())); // scroll left at the edge
+        break;
+    case Qt::Key_Right:
+        if (cursor_column_ + 1 < steps_visible)
+            ++cursor_column_;
+        else
+            set_origin(origin_ + step_ticks()); // scroll right at the edge
+        break;
+    case Qt::Key_Space:
+    case Qt::Key_Return:
+    case Qt::Key_Enter:
+        if (cursor_row_ >= 0 && static_cast<std::size_t>(cursor_row_) < row_list.size())
+            toggle_cell(row_list[static_cast<std::size_t>(cursor_row_)], cursor_column_,
+                        (event->modifiers() & Qt::ShiftModifier) != 0); // Shift: accent
+        break;
+    default: QWidget::keyPressEvent(event); return;
+    }
+    controller_.set_edit_cursor(origin_ + cursor_column_ * step_ticks());
+    update();
+    event->accept();
 }
 
 void DrumGridView::mouseDoubleClickEvent(QMouseEvent* event) {

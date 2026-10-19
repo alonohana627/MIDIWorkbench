@@ -147,8 +147,11 @@ void ShortcutEditor::mark_conflicts() {
 
 void ShortcutEditor::apply() {
     for (int row = 0; row < table_->rowCount(); ++row)
-        if (auto* editor = qobject_cast<QKeySequenceEdit*>(table_->cellWidget(row, column_shortcut)))
-            commands_[static_cast<std::size_t>(row)]->setShortcut(editor->keySequence());
+        if (auto* editor = qobject_cast<QKeySequenceEdit*>(table_->cellWidget(row, column_shortcut))) {
+            auto* action = commands_[static_cast<std::size_t>(row)];
+            if (editor->keySequence() != action->shortcut()) // unchanged rows keep extra bindings
+                action->setShortcut(editor->keySequence());
+        }
 }
 
 void ShortcutEditor::export_profile() {

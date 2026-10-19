@@ -18,6 +18,8 @@
 #include <QHBoxLayout>
 #include <QScrollBar>
 #include <QStackedWidget>
+
+#include <chrono>
 #include <QInputDialog>
 #include <QHeaderView>
 #include <QKeyEvent>
@@ -42,28 +44,6 @@ namespace mwb::ui {
 namespace {
 
 enum LibraryColumn { column_title = 0, column_tags, column_rating, column_tempo, column_key, column_length, column_status, library_column_count };
-
-using LibraryTaskThread = TaskThread;
-
-/// Mutations (open/create, import and analysis, saves, metadata) run in user order here.
-LibraryTaskThread& write_thread() {
-    static LibraryTaskThread thread;
-    return thread;
-}
-
-/// Searches use the library's read-only connection pool on their own thread, so they never wait
-/// behind an import; a newer search cancels the running one.
-LibraryTaskThread& read_thread() {
-    static LibraryTaskThread thread;
-    return thread;
-}
-
-/// Opening items, revision lists and drag files read on a second thread, so they never wait
-/// behind a slow similar-phrase search.
-LibraryTaskThread& browse_thread() {
-    static LibraryTaskThread thread;
-    return thread;
-}
 
 LibraryRow make_row(const search::BrowseRow& browse, const std::string& title);
 
@@ -227,6 +207,9 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
     import_button_ = new QPushButton(tr("Add Folder…"), this);
     import_button_->setToolTip(tr("Import a folder; browsing continues while it imports"));
     import_button_->setEnabled(false);
+    cancel_import_button_ = new QPushButton(tr("Cancel Import"), this);
+    cancel_import_button_->setToolTip(tr("Stop the running import; files already imported stay"));
+    cancel_import_button_->hide();
     search_ = new QLineEdit(this);
     search_->setPlaceholderText(tr("Search: tag:bass bpm:120..130 key:\"A minor\" text:\"lead\""));
     search_->setClearButtonEnabled(true);
@@ -252,6 +235,7 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
     auto* buttons = new QHBoxLayout;
     buttons->addWidget(open_button);
     buttons->addWidget(import_button_);
+    buttons->addWidget(cancel_import_button_);
     // Page 1: the open library. Page 0: what a library is and how to start one.
     auto* browse = new QWidget(this);
     auto* layout = new QVBoxLayout(browse);
@@ -299,10 +283,19 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
     connect(search_, &QLineEdit::textChanged, this, [this] { debounce_.start(); });
     connect(open_button, &QPushButton::clicked, this, &LibraryPanel::choose_library);
     connect(import_button_, &QPushButton::clicked, this, &LibraryPanel::import_folder);
+    connect(cancel_import_button_, &QPushButton::clicked, this, [this] {
+        if (import_stop_)
+            import_stop_->request_stop();
+        status_->setText(tr("Cancelling the import…"));
+    });
     connect(table_->selectionModel(), &QItemSelectionModel::currentRowChanged, this, [this] { prepare_drag_file(); });
     // Single click selects silently; double-click or Enter opens (section 6.2).
     connect(table_, &QTableView::activated, this, [this] { open_selected(); });
     connect(table_, &QTableView::customContextMenuRequested, this, [this](const QPoint& point) {
+        const QModelIndex clicked = table_->indexAt(point);
+        if (!clicked.isValid())
+            return; // no item under the pointer: nothing to act on
+        table_->setCurrentIndex(clicked);
         QMenu menu(this);
         menu.addAction(tr("Open"), this, &LibraryPanel::open_selected);
         menu.addAction(tr("Revisions…"), this, &LibraryPanel::show_revisions);
@@ -360,13 +353,16 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
 }
 
 LibraryPanel::~LibraryPanel() {
-    // Background work ends with the panel: a running import sees its stop token, queued work is
-    // dropped, and nothing outlives the window or touches Qt after the application ends.
+    // Background work ends with the panel. Searches and the import see their stop tokens; queued
+    // user writes (saves, tags, ratings, restores) still run before the write thread ends.
     if (search_stop_)
         search_stop_->request_stop();
-    read_thread().stop();
-    browse_thread().stop();
-    write_thread().stop();
+    if (import_stop_)
+        import_stop_->request_stop();
+    import_thread_.reset();
+    read_thread_.reset();
+    browse_thread_.reset();
+    write_thread_.reset(); // drains
 }
 
 void LibraryPanel::focus_search() {
@@ -387,7 +383,7 @@ void LibraryPanel::choose_library() {
 void LibraryPanel::open_library(const std::filesystem::path& root, bool create) {
     status_->setText(tr("Opening library…"));
     QPointer<LibraryPanel> guard(this);
-    write_thread().post([guard, root, create](std::stop_token) {
+    write_thread_->post([guard, root, create](std::stop_token) {
         auto opened = create ? library::Library::create(root) : library::Library::open(root);
         QMetaObject::invokeMethod(
             qApp, // context outlives the task; the lambda checks the guard
@@ -401,9 +397,9 @@ void LibraryPanel::open_library(const std::filesystem::path& root, bool create) 
                     guard->empty_status_->setText(message);
                     return;
                 }
-                guard->pages_->setCurrentIndex(1);
-                emit guard->opened();
                 guard->library_ = std::shared_ptr<library::Library>(std::move(**opened));
+                guard->pages_->setCurrentIndex(1);
+                emit guard->opened(); // after library_ is set, so listeners see the new library
                 QSettings().setValue("library/last", QString::fromStdWString(root.wstring()));
                 guard->import_button_->setEnabled(true);
                 guard->run_search();
@@ -422,9 +418,30 @@ void LibraryPanel::import_folder() {
     QPointer<LibraryPanel> guard(this);
     auto library = library_;
     const std::filesystem::path source(directory.toStdWString());
-    write_thread().post([guard, library, source, parser = import_parser_ ? import_parser_ : parser_](std::stop_token stop) {
+    import_stop_ = std::make_shared<std::stop_source>();
+    import_button_->setEnabled(false);
+    cancel_import_button_->show();
+    import_thread_->post([guard, library, source, parser = import_parser_ ? import_parser_ : parser_,
+                         cancel = import_stop_](std::stop_token thread_stop) {
+        // Cancel button or panel shutdown, whichever comes first.
+        std::stop_callback forward(thread_stop, [cancel] { cancel->request_stop(); });
+        const auto stop = cancel->get_token();
         library::ImportOptions options;
         options.parser = parser; // parsing runs in the isolated worker process (section 28.2)
+        auto last_report = std::make_shared<std::chrono::steady_clock::time_point>();
+        options.progress = [guard, last_report](std::size_t done, std::size_t found) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - *last_report < std::chrono::milliseconds(200) && done != found)
+                return; // at most five updates a second
+            *last_report = now;
+            QMetaObject::invokeMethod(
+                qApp,
+                [guard, done, found] {
+                    if (guard)
+                        guard->status_->setText(tr("Importing: %1 of %2 files… (browsing stays available)").arg(done).arg(found));
+                },
+                Qt::QueuedConnection);
+        };
         auto report = library->import_paths({source}, options, stop);
         // Analysis and motif indexing follow automatically in the desktop app (section 26.6).
         std::optional<library::AnalyzeReport> analysis;
@@ -452,6 +469,8 @@ void LibraryPanel::import_folder() {
             [guard, text] {
                 if (!guard)
                     return;
+                guard->import_button_->setEnabled(true);
+                guard->cancel_import_button_->hide();
                 guard->status_->setText(text);
                 emit guard->status_message(text);
                 guard->run_search();
@@ -477,7 +496,7 @@ void LibraryPanel::run_search() {
     current_query_ = search_->text().trimmed().toStdString();
     next_page_.reset();
     fetching_more_ = false;
-    read_thread().post([guard, library, query = current_query_, generation, latest = generation_, stop](std::stop_token) {
+    read_thread_->post([guard, library, query = current_query_, generation, latest = generation_, stop](std::stop_token) {
         if (generation != latest->load() || stop.stop_requested())
             return; // a newer search was typed while this one waited in the queue
         auto page = std::make_shared<PageResult>(load_page(*library, query, std::nullopt, stop));
@@ -499,7 +518,7 @@ void LibraryPanel::fetch_more() {
     const auto stop = search_stop_ ? search_stop_->get_token() : std::stop_token{};
     QPointer<LibraryPanel> guard(this);
     auto library = library_;
-    read_thread().post([guard, library, query = current_query_, after = *next_page_, generation, latest = generation_,
+    read_thread_->post([guard, library, query = current_query_, after = *next_page_, generation, latest = generation_,
                         stop](std::stop_token) {
         if (generation != latest->load() || stop.stop_requested())
             return;
@@ -535,7 +554,7 @@ void LibraryPanel::search_melody(std::vector<std::pair<Tick, std::uint8_t>> onse
     status_->setText(similar ? tr("Searching similar phrases (approximate search)") : tr("Searching the melody"));
     QPointer<LibraryPanel> guard(this);
     auto library = library_;
-    read_thread().post([guard, library, notes = std::move(notes), similar, generation, latest = generation_,
+    read_thread_->post([guard, library, notes = std::move(notes), similar, generation, latest = generation_,
                         stop = search_stop](std::stop_token) {
         if (generation != latest->load() || stop.stop_requested())
             return;
@@ -615,7 +634,7 @@ void LibraryPanel::save_document(std::shared_ptr<const DocumentData> document, s
     QPointer<LibraryPanel> guard(this);
     auto library = library_;
     QPointer<QObject> origin_guard(origin);
-    write_thread().post([guard, library, document = std::move(document), asset_id, expected_head, title, phrase,
+    write_thread_->post([guard, library, document = std::move(document), asset_id, expected_head, title, phrase,
                         origin_guard](std::stop_token) {
         Result<std::int64_t> revision = make_error(ErrorCode::internal, "not saved");
         std::int64_t asset = asset_id.value_or(0);
@@ -669,7 +688,7 @@ void LibraryPanel::show_revisions() {
     const QString title = row->title;
     auto library = library_;
     QPointer<LibraryPanel> guard(this);
-    browse_thread().post([guard, library, asset_id, title](std::stop_token) {
+    browse_thread_->post([guard, library, asset_id, title](std::stop_token) {
         auto revisions = library->revisions(asset_id);
         auto asset = library->asset(asset_id);
         const std::optional<std::int64_t> head = asset && *asset ? (*asset)->current_revision_id : std::nullopt;
@@ -718,7 +737,7 @@ void LibraryPanel::present_revisions(std::int64_t asset_id, const QString& title
     auto library = library_;
     QPointer<LibraryPanel> guard(this);
     // Restore creates a new head referencing the old content; history is kept (section 24.3).
-    write_thread().post([guard, library, asset_id, revision_id, head](std::stop_token) {
+    write_thread_->post([guard, library, asset_id, revision_id, head](std::stop_token) {
         auto restored = library->restore_revision(asset_id, revision_id, head);
         const QString message = restored ? tr("Restored revision as the new head")
                                          : tr("Not restored: %1").arg(QString::fromStdString(restored.error().describe()));
@@ -743,8 +762,13 @@ void LibraryPanel::prepare_drag_file() {
     const auto asset_id = row->asset_id;
     const std::string title = row->title.toStdString();
     const auto cache = drag_cache_;
-    // The file is written and closed in the background before any drag can start.
-    browse_thread().post([guard, library, asset_id, title, cache, parser = parser_](std::stop_token) {
+    // The file is written and closed in the background before any drag can start. Only the latest
+    // row is prepared: moving through the list does not queue a parse per row.
+    const std::uint64_t generation = ++*drag_latest_;
+    browse_thread_->post([guard, library, asset_id, title, cache, parser = parser_, generation,
+                          latest = drag_latest_](std::stop_token) {
+        if (generation != latest->load())
+            return;
         auto asset = library->asset(asset_id);
         if (!asset || !*asset || !(*asset)->current_revision_id)
             return;
@@ -777,7 +801,7 @@ void LibraryPanel::run_metadata_task(std::function<Status(library::Library&, std
     const auto asset_id = row->asset_id;
     auto library = library_;
     QPointer<LibraryPanel> guard(this);
-    write_thread().post([guard, library, asset_id, task = std::move(task)](std::stop_token) {
+    write_thread_->post([guard, library, asset_id, task = std::move(task)](std::stop_token) {
         const Status status = task(*library, asset_id);
         QMetaObject::invokeMethod(
             qApp, // context outlives the task; the lambda checks the guard
@@ -809,7 +833,9 @@ void LibraryPanel::deliver_results(std::uint64_t generation, std::vector<Library
     next_page_ = std::move(next);
     const int count = model_->rowCount({});
     // Pages are fetched as the list scrolls; the count says when more exist (no full count query).
-    status_->setText(count == 0 ? tr("No match (items still being indexed are not searched musically)")
+    status_->setText(count == 0 && current_query_.empty()
+                         ? tr("This library is empty. Use Add Folder… to import MIDI files.")
+                     : count == 0 ? tr("No match (items still being indexed are not searched musically)")
                      : next_page_ ? tr("%1+ results (scroll for more)").arg(count)
                                   : tr("%n result(s)", nullptr, count));
 }
@@ -822,7 +848,7 @@ void LibraryPanel::open_selected() {
     QPointer<LibraryPanel> guard(this);
     auto library = library_;
     const auto asset_id = row->asset_id;
-    browse_thread().post([guard, library, asset_id, parser = parser_](std::stop_token) {
+    browse_thread_->post([guard, library, asset_id, parser = parser_](std::stop_token) {
         std::optional<DocumentData> document;
         QString error;
         std::int64_t revision_id = 0;
@@ -859,7 +885,7 @@ void LibraryPanel::set_metadata(int action) {
     const bool favorite = !row->favorite;
     auto library = library_;
     QPointer<LibraryPanel> guard(this);
-    write_thread().post([guard, library, asset_id, action, favorite](std::stop_token) {
+    write_thread_->post([guard, library, asset_id, action, favorite](std::stop_token) {
         const Status status = action == 0 ? library->set_favorite(asset_id, favorite)
                                           : library->set_rating(asset_id, action - 10);
         QMetaObject::invokeMethod(

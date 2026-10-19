@@ -60,6 +60,8 @@ struct ImportOptions {
     /// Parser for imported SMF/RMID bytes; empty parses in this process. The application passes
     /// the isolated parser worker (section 28.2).
     midi::MidiParser parser;
+    /// Called after each file with (files done, files found so far); runs on the import thread.
+    std::function<void(std::size_t done, std::size_t found)> progress;
     /// Fault-injection point between capture and the identity recheck (tests, diagnostics).
     std::function<void(const std::filesystem::path& source, std::size_t attempt)> after_capture;
 };

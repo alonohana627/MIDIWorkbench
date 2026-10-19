@@ -24,9 +24,9 @@ class RecoveryJournal;
 
 namespace mwb::ui {
 
-/// Finishes queued recovery work (flushes, clean closes) and stops the recovery thread; called
-/// once when the main window closes.
-void stop_recovery_thread();
+/// Waits until queued recovery work (flushes, clean closes) has run; called when the main window
+/// closes. The thread stays available (it is shared by every document).
+void drain_recovery_thread();
 
 /// GUI-side owner of one open document: the working session (model, history, saves) plus view
 /// state that is not document content (active sequence and track, selection, edit cursor).

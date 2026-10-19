@@ -261,6 +261,19 @@ void ControllerLane::paintEvent(QPaintEvent*) {
     }
 }
 
+bool ControllerLane::event(QEvent* event) {
+    // A focused velocity lane keeps Up/Down (nudge velocity) instead of the window's transpose.
+    if (event->type() == QEvent::ShortcutOverride && target_.kind == LaneTarget::Kind::velocity) {
+        const auto* key = static_cast<QKeyEvent*>(event);
+        if ((key->key() == Qt::Key_Up || key->key() == Qt::Key_Down) &&
+            (key->modifiers() & ~Qt::ShiftModifier) == Qt::NoModifier) {
+            event->accept();
+            return true;
+        }
+    }
+    return QWidget::event(event);
+}
+
 void ControllerLane::contextMenuEvent(QContextMenuEvent* event) {
     // Change what this lane shows, or remove it.
     QMenu menu(this);

@@ -6,6 +6,7 @@
 #include "mwb/document/session.hpp"
 #include "mwb/ui/clipboard.hpp"
 #include "mwb/ui/document_controller.hpp"
+#include "mwb/ui/drag_export.hpp"
 #include "mwb/ui/editor_math.hpp"
 #include "mwb/ui/keyboard_widget.hpp"
 #include "mwb/ui/piano_roll.hpp"
@@ -264,6 +265,20 @@ TEST_SUITE("keyboard") {
 }
 
 TEST_SUITE("clipboard") {
+    TEST_CASE("drag files from long multi-byte titles get valid names") {
+        test::TemporaryDirectory directory;
+        std::string title;
+        for (int index = 0; index < 40; ++index)
+            title += "æ¼¢"; // 120 bytes of 3-byte characters: the 80-byte cut lands mid-character
+        const std::vector<std::uint8_t> bytes{'M', 'T', 'h', 'd'};
+        auto written = write_drag_file(directory.path(), "x" + title, bytes);
+        REQUIRE_MESSAGE(written, (written ? "" : written.error().describe()));
+        CHECK(std::filesystem::exists(*written));
+        const auto stem = written->filename().u8string();
+        CHECK(stem.size() <= 84); // 80 bytes of name plus ".mid"
+    }
+
+
     TEST_CASE("selection payload round-trips and is validated like a file") {
         ClipboardPayload payload;
         payload.ppq = 480;

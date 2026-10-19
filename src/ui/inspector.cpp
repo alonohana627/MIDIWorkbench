@@ -19,6 +19,7 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QSettings>
 #include <QSpinBox>
 #include <QVBoxLayout>
 
@@ -371,7 +372,28 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     connect(preview_button, &QPushButton::clicked, this, &InspectorPanel::preview);
     connect(apply_button, &QPushButton::clicked, this, &InspectorPanel::apply_preview);
     connect(cancel_button, &QPushButton::clicked, this, &InspectorPanel::cancel_preview);
-    column->addWidget(transform_box);
+    // Tools used on every edit come right after the selection; settings below fold away.
+    column->insertWidget(column->indexOf(selection_box) + 1, transform_box);
+    const auto collapsible = [](QGroupBox* box, const QString& key, bool expanded_by_default) {
+        box->setCheckable(true);
+        const bool expanded = QSettings().value("inspector/expanded/" + key, expanded_by_default).toBool();
+        const auto show_content = [box](bool on) {
+            for (auto* child : box->findChildren<QWidget*>(Qt::FindDirectChildrenOnly))
+                child->setVisible(on);
+            box->setFlat(!on);
+        };
+        box->setChecked(expanded);
+        show_content(expanded);
+        box->setToolTip(QObject::tr("Click the title to show or hide this section"));
+        QObject::connect(box, &QGroupBox::toggled, box, [key, show_content](bool on) {
+            show_content(on);
+            QSettings().setValue("inspector/expanded/" + key, on);
+        });
+    };
+    collapsible(song_box, "song", true);
+    collapsible(track_box, "track", false);
+    collapsible(scale_box, "scale", false);
+    collapsible(chord_box, "chord", false);
     column->addStretch(1);
 
     for (auto* form : content->findChildren<QFormLayout*>()) {

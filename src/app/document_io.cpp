@@ -1,5 +1,7 @@
 #include "mwb/app/document_io.hpp"
 
+#include "mwb/core/text.hpp"
+
 #include "mwb/document/file_system.hpp"
 #include "mwb/document/native_format.hpp"
 #include "mwb/worker/worker.hpp"
@@ -23,7 +25,14 @@ std::string path_to_utf8(const std::filesystem::path& path) {
 }
 
 std::filesystem::path path_from_utf8(std::string_view text) {
-    return std::filesystem::path(std::u8string(text.begin(), text.end()));
+    // Invalid UTF-8 would make the path conversion throw: it is replaced, never thrown.
+    const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t*>(text.data()), text.size());
+    if (is_valid_utf8(bytes))
+        return std::filesystem::path(std::u8string(text.begin(), text.end()));
+    std::u8string cleaned;
+    for (const char character : text)
+        cleaned.push_back(static_cast<unsigned char>(character) < 0x80 ? static_cast<char8_t>(character) : u8'_');
+    return std::filesystem::path(cleaned);
 }
 
 FileKind identify_file(std::span<const std::uint8_t> head) {

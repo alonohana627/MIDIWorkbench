@@ -225,7 +225,8 @@ EditorTab::EditorTab(std::unique_ptr<DocumentController> controller, QWidget* pa
     horizontal->addWidget(vertical);
     horizontal->setStretchFactor(0, 0);
     horizontal->setStretchFactor(1, 1);
-    horizontal->setSizes({168, 1000});
+    horizontal->setSizes({140, 1000});
+    horizontal->setCollapsible(0, true); // drag the divider left to hide the track list
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->addWidget(horizontal);
@@ -233,6 +234,7 @@ EditorTab::EditorTab(std::unique_ptr<DocumentController> controller, QWidget* pa
     add_lane(LaneTarget{LaneTarget::Kind::velocity, 0, 0});
     connect(&piano_roll_->view(), &PianoRollView::mapping_changed, this, &EditorTab::sync_lanes);
     connect(controller_.get(), &DocumentController::document_changed, this, &EditorTab::sync_lanes);
+    connect(drum_grid_, &DrumGridView::status_message, this, &EditorTab::status_message);
     connect(drum_grid_, &DrumGridView::open_in_piano_roll, this, [this](Tick tick, int) {
         show_drum_grid(false);
         piano_roll_->view().scroll_to_tick(tick);
@@ -260,6 +262,7 @@ void EditorTab::add_lane(LaneTarget target) {
     lanes_container_->layout()->addWidget(lane);
     lanes_.push_back(lane);
     connect(lane, &ControllerLane::remove_requested, this, &EditorTab::remove_lane);
+    connect(lane, &ControllerLane::status_message, this, &EditorTab::status_message);
     sync_lanes();
 }
 

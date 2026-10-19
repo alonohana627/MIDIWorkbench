@@ -27,8 +27,19 @@ public:
                         return;
                     task = std::move(tasks_.front());
                     tasks_.pop_front();
+                    running_ = true;
                 }
-                task(stop);
+                try {
+                    task(stop);
+                } catch (...) {
+                    // A failing task must not terminate the application; its result simply never
+                    // arrives (tasks report their own errors through Result values).
+                }
+                {
+                    std::lock_guard lock(mutex_);
+                    running_ = false;
+                }
+                idle_.notify_all();
             }
         });
     }
@@ -42,6 +53,12 @@ public:
     TaskThread(const TaskThread&) = delete;
     TaskThread& operator=(const TaskThread&) = delete;
 
+    /// Blocks until every queued task has run; the thread stays available afterwards.
+    void wait_idle() {
+        std::unique_lock lock(mutex_);
+        idle_.wait(lock, [this] { return tasks_.empty() && !running_; });
+    }
+
     void post(std::function<void(std::stop_token)> task) {
         {
             std::lock_guard lock(mutex_);
@@ -53,6 +70,8 @@ public:
 private:
     std::mutex mutex_;
     std::condition_variable_any wake_;
+    std::condition_variable_any idle_;
+    bool running_ = false;
     std::deque<std::function<void(std::stop_token)>> tasks_;
     bool drain_ = false;
     std::jthread thread_; // declared last: joined before the queue is destroyed

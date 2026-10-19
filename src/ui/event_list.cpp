@@ -10,6 +10,7 @@
 
 #include <QHeaderView>
 #include <QItemSelectionModel>
+#include <QAction>
 #include <QLineEdit>
 #include <QTableView>
 #include <QVBoxLayout>

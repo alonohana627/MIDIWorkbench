@@ -143,6 +143,13 @@ void apply_theme(Theme theme) {
                                               " min-width: 24px; min-height: 24px; }"
                                               "QScrollBar { background: #000000; border: 1px solid #FFFFFF; }"
                                               "QSplitter::handle { background: #FFFFFF; }"
+                                              "QAbstractSpinBox::up-button, QAbstractSpinBox::down-button { width: 16px;"
+                                              " background: #000000; border-left: 1px solid #FFFFFF; }"
+                                              "QAbstractSpinBox::up-arrow { width: 0; height: 0; border-left: 4px solid transparent;"
+                                              " border-right: 4px solid transparent; border-bottom: 5px solid #FFFFFF; }"
+                                              "QAbstractSpinBox::down-arrow { width: 0; height: 0; border-left: 4px solid transparent;"
+                                              " border-right: 4px solid transparent; border-top: 5px solid #FFFFFF; }"
+                                              "QLineEdit, QAbstractSpinBox, QComboBox { padding: 1px 4px; }"
                                               "QMainWindow::separator { background: #FFFFFF; width: 2px; height: 2px; }")
                                         : QString()));
     if (!g_follow_connected) {
@@ -191,7 +198,7 @@ RollColors roll_colors() {
         colors.root_tint.setAlpha(80);
         colors.member_tint.setAlpha(36);
     } else {
-        colors = RollColors{QColor("#1D1F23"), QColor("#18191C"), QColor("#3A3D43"), QColor("#24262A"), QColor("#30333A"),
+        colors = RollColors{QColor("#23252A"), QColor("#17181B"), QColor("#4A4E56"), QColor("#24262A"), QColor("#30333A"),
                             QColor("#50555E"), QColor("#6A707B"), accent, accent, QColor("#3FB37F"), QColor("#9AA0AA"),
                             danger_color(), QColor("#C9CBD0"), QColor("#2B2D31"), QColor("#1B1C1F"), QColor("#1E1F22"),
                             QColor("#C9CBD0"), QColor("#8B8E96"), QColor("#FFFFFF"), QColor("#17181B"), true, false};

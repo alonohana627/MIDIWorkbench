@@ -55,6 +55,7 @@ protected:
     void keyPressEvent(QKeyEvent* event) override;
     void leaveEvent(QEvent* event) override;
     void contextMenuEvent(QContextMenuEvent* event) override;
+    bool event(QEvent* event) override;
 
 private:
     struct Stroke {

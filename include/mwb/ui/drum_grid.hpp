@@ -40,14 +40,21 @@ protected:
     void mousePressEvent(QMouseEvent* event) override;
     void mouseDoubleClickEvent(QMouseEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;
+    void keyPressEvent(QKeyEvent* event) override;
+    bool event(QEvent* event) override;
 
 private:
     [[nodiscard]] std::vector<int> rows() const;
+    /// Toggles the step at (pitch, column): clears one note, adds one, or opens an ambiguous cell.
+    void toggle_cell(int pitch, std::int64_t column, bool accent);
     [[nodiscard]] Tick step_ticks() const;
     [[nodiscard]] std::optional<std::pair<int, std::int64_t>> cell_at(QPointF point) const;
 
     DocumentController& controller_;
     Tick origin_ = 0;
+    /// Keyboard cursor: row index into rows() and visible column.
+    int cursor_row_ = 0;
+    std::int64_t cursor_column_ = 0;
     int normal_velocity_ = 90;
     int accent_velocity_ = 120;
     static constexpr int name_width = 150;

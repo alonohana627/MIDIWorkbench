@@ -200,13 +200,23 @@ Theme theme_from_name(const QString& name) {
     return Theme::system;
 }
 
-void apply_base_font(QApplication& application) {
+namespace {
+qreal g_platform_point_size = 0;
+int g_font_size_step = 0;
+} // namespace
+
+void apply_base_font(QApplication& application, int size_step) {
     QFont font = QApplication::font();
+    if (g_platform_point_size <= 0)
+        g_platform_point_size = font.pointSizeF() > 0 ? font.pointSizeF() : 9.0;
+    g_font_size_step = std::clamp(size_step, -2, 8);
     font.setFamilies({"Segoe UI Variable Text", "Segoe UI", "Tahoma", "Noto Sans", "DejaVu Sans"});
-    const qreal size = font.pointSizeF() > 0 ? font.pointSizeF() : 9.0;
-    font.setPointSizeF(size + 1.0); // a little larger than the platform default, not a lot
+    // A little larger than the platform default, plus the user's step.
+    font.setPointSizeF(g_platform_point_size + 1.0 + g_font_size_step);
     application.setFont(font);
 }
+
+int font_size_step() { return g_font_size_step; }
 
 QPalette make_palette(Theme theme) {
     const PaletteSpec& spec = resolve(theme) == Theme::light           ? light_spec
@@ -397,7 +407,9 @@ QColor note_fill(const QColor& base, int velocity) {
         lightness = 0.70 + 0.10 * v; // bright fills with black labels on the black grid
     QColor color = base.toHsl();
     const float hue = color.hslHueF() < 0 ? 0.6f : color.hslHueF();
-    return QColor::fromHslF(hue, 0.65f, static_cast<float>(lightness));
+    // Keep the source's saturation (a picked track color stays itself; gray stays gray).
+    const float saturation = std::min(0.85f, color.hslSaturationF());
+    return QColor::fromHslF(hue, saturation, static_cast<float>(lightness));
 }
 
 } // namespace mwb::ui

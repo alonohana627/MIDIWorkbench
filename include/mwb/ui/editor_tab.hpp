@@ -29,6 +29,12 @@ class TrackListWidget : public QWidget {
 public:
     explicit TrackListWidget(DocumentController& controller, QWidget* parent = nullptr);
 
+    /// Sets a track's color (notes and the swatch use it); one undoable edit.
+    bool set_track_color(TrackId track, const QColor& color);
+    /// Opens a color picker for the active track.
+    void choose_active_track_color();
+    [[nodiscard]] QToolButton* color_button() const { return color_button_; }
+
 signals:
     void status_message(const QString& text);
 
@@ -49,6 +55,7 @@ private:
     QTableWidget* table_ = nullptr;
     bool rebuilding_ = false;
     QWidget* delete_button_ = nullptr;
+    QToolButton* color_button_ = nullptr;
 };
 
 /// One document's center and bottom editor: track list, piano roll or drum grid, controller

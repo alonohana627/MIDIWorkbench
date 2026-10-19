@@ -102,7 +102,7 @@ int main(int argc, char** argv) {
         QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, QString::fromStdString(workspace));
     }
     // Font and theme before any widget exists, so every widget inherits them.
-    mwb::ui::apply_base_font(application);
+    mwb::ui::apply_base_font(application, QSettings().value("ui/font_step", 0).toInt());
     mwb::ui::apply_theme(mwb::ui::theme_from_name(
         theme.empty() ? QSettings().value("ui/theme", "system").toString() : QString::fromStdString(theme)));
 

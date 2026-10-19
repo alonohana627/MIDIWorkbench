@@ -1825,6 +1825,73 @@ TEST_SUITE("window") {
     }
 }
 
+TEST_SUITE("window") {
+    TEST_CASE("a track's color is picked undoably and the piano roll paints its notes with it") {
+        WindowFixture fixture;
+        auto* tab = fixture.window->current_tab();
+        auto& controller = tab->controller();
+        const NewNote note{controller.active_track(), 0, 960, 60, 127, 0, 0};
+        auto changes = insert_notes(controller.document(), std::span(&note, 1));
+        REQUIRE(changes);
+        REQUIRE(controller.apply(*changes));
+        auto* list = fixture.window->findChild<TrackListWidget*>();
+        REQUIRE(list);
+        REQUIRE(list->color_button());
+        CHECK(list->color_button()->isEnabled());
+        const auto before = controller.active_sequence().tracks.front().color_rgba;
+        REQUIRE(list->set_track_color(controller.active_track(), QColor(220, 40, 40)));
+        CHECK(controller.active_sequence().tracks.front().color_rgba == 0xDC2828FFu);
+        // The roll's note keeps the picked hue (red), not the default blue.
+        auto& view = tab->piano_roll();
+        QTest::qWait(30);
+        const QImage image = view.grab().toImage();
+        const auto& mapping = view.mapping();
+        const QPoint inside(PianoRollView::keyboard_width + static_cast<int>(mapping.tick_to_x(480)),
+                            PianoRollView::ruler_height + static_cast<int>(mapping.pitch_to_y(60) + mapping.row_height / 2));
+        const QColor painted = image.pixelColor(inside);
+        CHECK(painted.red() > painted.blue() + 40);
+        CHECK(controller.undo());
+        CHECK(controller.active_sequence().tracks.front().color_rgba == before);
+    }
+
+    TEST_CASE("View > Font Size changes the application font live and remembers it") {
+        WindowFixture fixture;
+        CHECK(font_size_step() == 0);
+        fixture.window->set_font_size(0);
+        QTest::qWait(30);
+        const qreal normal = QApplication::font().pointSizeF();
+        fixture.window->set_font_size(4);
+        QTest::qWait(30);
+        CHECK(QApplication::font().pointSizeF() == doctest::Approx(normal + 4));
+        CHECK(fixture.window->current_tab()->font().pointSizeF() == doctest::Approx(normal + 4)); // widgets follow
+        CHECK(QSettings().value("ui/font_step").toInt() == 4);
+        fixture.window->set_font_size(0);
+        CHECK(QApplication::font().pointSizeF() == doctest::Approx(normal));
+    }
+
+    TEST_CASE("with the scale on, scale rows are light, rows outside are dark and the root row is accented") {
+        WindowFixture fixture;
+        auto* tab = fixture.window->current_tab();
+        auto* bar = fixture.window->findChild<ScaleBar*>();
+        REQUIRE(bar);
+        bar->scale_button()->click(); // empty song: C major
+        REQUIRE(tab->controller().active_sequence().settings.highlight_scale);
+        auto& view = tab->piano_roll();
+        QTest::qWait(30);
+        const QImage image = view.grab().toImage();
+        const auto& mapping = view.mapping();
+        const auto row_color = [&](int pitch) {
+            return image.pixelColor(PianoRollView::keyboard_width + 300,
+                                    PianoRollView::ruler_height + static_cast<int>(mapping.pitch_to_y(pitch) + mapping.row_height / 2));
+        };
+        const auto lightness = [](const QColor& color) { return color.lightnessF(); };
+        // D and E (in C major) against C# and D# (outside): a clear step, not a faint tint.
+        CHECK(lightness(row_color(62)) > lightness(row_color(61)) + 0.08);
+        CHECK(lightness(row_color(64)) > lightness(row_color(63)) + 0.08);
+        CHECK(row_color(60) != row_color(62)); // the root row carries the accent
+    }
+}
+
 TEST_SUITE("reviewer_probe4") {
     TEST_CASE("probe4: ruler seek while playing a real song") {
         WindowFixture fixture;

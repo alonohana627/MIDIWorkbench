@@ -6,6 +6,8 @@
 #include "mwb/ui/drum_grid.hpp"
 
 #include <QCheckBox>
+#include <QColorDialog>
+#include <QMenu>
 #include <QComboBox>
 #include <QKeyEvent>
 #include <QHBoxLayout>
@@ -70,7 +72,7 @@ TrackListWidget::TrackListWidget(DocumentController& controller, QWidget* parent
         button->setAutoRaise(true);
         button->setToolTip(tip);
         button->setAccessibleName(tip);
-        button->setMinimumSize(28, 28);
+        button->setMinimumSize(26, 26);
         connect(button, &QToolButton::clicked, this, slot);
         buttons->addWidget(button);
     };
@@ -80,7 +82,36 @@ TrackListWidget::TrackListWidget(DocumentController& controller, QWidget* parent
     delete_button_ = buttons->itemAt(buttons->count() - 1)->widget();
     make_button(IconId::up, tr("Move track up"), [this] { move_active_track(-1); });
     make_button(IconId::down, tr("Move track down"), [this] { move_active_track(1); });
+    // Track color: the button shows the active track's color and opens a picker; the track
+    // table's context menu and a click on a row's swatch open it too.
+    color_button_ = new QToolButton(this);
+    color_button_->setAutoRaise(true);
+    color_button_->setToolTip(tr("Track color..."));
+    color_button_->setAccessibleName(tr("Track color"));
+    color_button_->setMinimumSize(26, 26);
+    connect(color_button_, &QToolButton::clicked, this, &TrackListWidget::choose_active_track_color);
+    buttons->addWidget(color_button_);
     buttons->addStretch(1);
+    table_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(table_, &QWidget::customContextMenuRequested, this, [this](const QPoint& point) {
+        const int row = table_->rowAt(point.y());
+        if (row < 0)
+            return;
+        table_->setCurrentCell(row, column_name);
+        QMenu menu(this);
+        menu.addAction(tr("Track Color..."), this, &TrackListWidget::choose_active_track_color);
+        menu.addAction(tr("Rename"), this, [this, row] { table_->editItem(table_->item(row, column_name)); });
+        menu.exec(table_->viewport()->mapToGlobal(point));
+    });
+    connect(table_, &QTableWidget::cellClicked, this, [this](int row, int column) {
+        if (column != column_name)
+            return;
+        // The swatch sits at the start of the name cell; a click on it picks the color.
+        const QRect cell = table_->visualItemRect(table_->item(row, column));
+        const QPoint at = table_->viewport()->mapFromGlobal(QCursor::pos());
+        if (at.x() - cell.left() < 20)
+            choose_active_track_color();
+    });
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->addWidget(sequence_);
@@ -221,6 +252,20 @@ void TrackListWidget::rebuild() {
         check(column_mute, track.muted, tr("Mute %1").arg(track_name));
         check(column_solo, track.solo, tr("Solo %1").arg(track_name));
     }
+    if (color_button_) {
+        // The color button shows the active track's color as a swatch.
+        if (active && *active < tracks.size()) {
+            QPixmap swatch(16, 16);
+            swatch.fill(Qt::transparent);
+            QPainter painter(&swatch);
+            painter.setPen(palette().color(QPalette::WindowText));
+            painter.setBrush(color_from_rgba(tracks[*active].color_rgba));
+            painter.drawRoundedRect(QRectF(1.5, 1.5, 13, 13), 3, 3);
+            painter.end();
+            color_button_->setIcon(QIcon(swatch));
+        }
+        color_button_->setEnabled(active.has_value());
+    }
     // Keep the focused column (Mute or Solo stays current after it was toggled from the keyboard).
     if (active)
         table_->setCurrentCell(static_cast<int>(*active), std::max(current_column, 0));
@@ -239,6 +284,31 @@ void TrackListWidget::set_track_flag(TrackId track_id, int column, bool value) {
     ChangeBuilder builder(controller_.document(), column == column_mute ? "Mute track" : "Solo track");
     builder.set_track_properties(track_id, updated);
     controller_.apply(builder.finish());
+}
+
+bool TrackListWidget::set_track_color(TrackId track_id, const QColor& color) {
+    const auto index = controller_.active_sequence().track_index(track_id);
+    if (!index || !color.isValid())
+        return false;
+    Track updated = track_header(controller_.active_sequence().tracks[*index]); // properties only, no events
+    updated.color_rgba = ((static_cast<std::uint32_t>(color.rgb()) & 0xFFFFFFu) << 8) | 0xFFu;
+    if (updated.color_rgba == controller_.active_sequence().tracks[*index].color_rgba)
+        return true;
+    ChangeBuilder builder(controller_.document(), "Change track color");
+    builder.set_track_properties(track_id, updated);
+    return controller_.apply(builder.finish());
+}
+
+void TrackListWidget::choose_active_track_color() {
+    const auto index = controller_.active_track_index();
+    if (!index)
+        return;
+    const auto& track = controller_.active_sequence().tracks[*index];
+    const TrackId id = track.id;
+    const QColor chosen = QColorDialog::getColor(color_from_rgba(track.color_rgba), this,
+                                                 tr("Color of %1").arg(QString::fromStdString(track.name)));
+    if (chosen.isValid())
+        set_track_color(id, chosen);
 }
 
 void TrackListWidget::add_track() {

@@ -812,6 +812,17 @@ void MainWindow::build_menus() {
         theme_group->addAction(action);
         theme_menu->addAction(action);
     }
+    auto* font_menu = view->addMenu(tr("&Font Size"));
+    auto* font_group = new QActionGroup(font_menu);
+    for (const auto& [step, label] : {std::pair{-1, tr("Small")}, std::pair{0, tr("Normal")}, std::pair{2, tr("Large")},
+                                      std::pair{4, tr("Extra Large")}}) {
+        auto* action = add_command(QString("view.font_size_%1").arg(step + 1), tr("Font Size: %1").arg(label), {},
+                                   [this, step] { set_font_size(step); });
+        action->setCheckable(true);
+        action->setChecked(font_size_step() == step);
+        font_group->addAction(action);
+        font_menu->addAction(action);
+    }
     auto* colors_menu = view->addMenu(tr("Note &Colors"));
     auto* colors_group = new QActionGroup(colors_menu);
     for (const auto& [mode, label] : {std::pair{NoteColorMode::track, tr("By Track")}, std::pair{NoteColorMode::channel, tr("By Channel")},
@@ -1182,6 +1193,17 @@ void MainWindow::refresh_tooltips() {
             continue; // a disabled command keeps its explanation (update_command_state)
         action->setToolTip(shortcut.isEmpty() ? name : QString("%1 (%2)").arg(name, shortcut.toString(QKeySequence::NativeText)));
     }
+}
+
+void MainWindow::set_font_size(int step) {
+    apply_base_font(*qApp, step);
+    QSettings().setValue("ui/font_step", step);
+    // Widgets with their own font (the monospace readouts) follow the new size too.
+    cursor_label_->setFont(mono_font());
+    position_label_->setFont(mono_font());
+    position_label_->setFixedWidth(QFontMetrics(mono_font()).horizontalAdvance(QStringLiteral("000.00.000  ♩=000.0  00/00  Pause *")) + 16);
+    tempo_field_->setMinimumWidth(QFontMetrics(tempo_field_->font()).horizontalAdvance(QStringLiteral("000.0 BPM")) + 36);
+    statusBar()->showMessage(tr("Font size changed"), 3000);
 }
 
 void MainWindow::set_theme(const QString& name) {

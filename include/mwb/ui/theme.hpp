@@ -15,9 +15,12 @@ enum class Theme { system, dark, light, high_contrast };
 [[nodiscard]] QString theme_name(Theme theme);
 [[nodiscard]] Theme theme_from_name(const QString& name);
 
-/// Sets the base font once at startup: Segoe UI family list and one point larger than the
-/// platform default, so every widget inherits the same slightly larger size.
-void apply_base_font(QApplication& application);
+/// Sets the base font: Segoe UI family list and one point larger than the platform default,
+/// plus `size_step` points (the View > Font Size choice), so every widget inherits it. Can be
+/// called again at run time; the platform size is read only the first time.
+void apply_base_font(QApplication& application, int size_step = 0);
+/// The font size step in effect (0 = normal).
+[[nodiscard]] int font_size_step();
 
 /// Applies Fusion, the theme palette and the small shared stylesheet; remembers the theme so
 /// custom-painted widgets can read roll_colors(). `system` resolves to dark or light and follows

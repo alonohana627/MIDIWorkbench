@@ -69,6 +69,8 @@ public:
 
     /// Opens a document file (MIDI or native) in a new tab.
     bool open_path(const std::filesystem::path& path);
+    /// View > Font Size: applies the step live and remembers it.
+    void set_font_size(int step);
     /// Creates a document from a built-in template name ("blank", "melody", "chords", "bassline", "drums").
     void new_from_template(const QString& name);
     /// Imports or reopens a document already in memory (used by recovery and the library).

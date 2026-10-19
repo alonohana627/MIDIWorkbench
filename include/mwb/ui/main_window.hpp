@@ -130,6 +130,8 @@ private:
     bool confirm_close(EditorTab* tab);
     /// Waits for the tab's background save in a modal progress loop; returns its error text.
     QString wait_for_save_modal(EditorTab* tab);
+    /// True while a close waits for a background save (no second close starts meanwhile).
+    bool waiting_for_save_ = false;
     void apply_layout(const QString& name);
     void reset_layout();
     void show_command_palette(const QString& query = {});

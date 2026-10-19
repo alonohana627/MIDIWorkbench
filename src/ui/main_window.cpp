@@ -1662,8 +1662,13 @@ QString MainWindow::wait_for_save_modal(EditorTab* tab) {
     progress.setWindowModality(Qt::WindowModal);
     progress.setCancelButton(nullptr);
     progress.setMinimumDuration(400); // quick saves never flash a window
+    // User input waits until the save reports, also in the 400 ms before the dialog shows: no
+    // second close, edit or shortcut can run inside this wait (final review N2). Painting and the
+    // save's own completion still run; the input is delivered afterwards.
+    const bool nested = std::exchange(waiting_for_save_, true);
     if (controller.saving())
-        loop.exec();
+        loop.exec(QEventLoop::ExcludeUserInputEvents);
+    waiting_for_save_ = nested;
     disconnect(connection);
     return error;
 }
@@ -1689,6 +1694,8 @@ bool MainWindow::confirm_close(EditorTab* tab) {
 }
 
 void MainWindow::close_tab(int index) {
+    if (waiting_for_save_)
+        return; // a close that arrives while a close is waiting for its save is not started twice
     QPointer<EditorTab> tab = qobject_cast<EditorTab*>(tabs_->widget(index));
     if (tab && recording_->recording() && tab == current_tab())
         recording_->toggle_recording(); // the take lands in this document before it is asked about
@@ -1710,6 +1717,10 @@ void MainWindow::close_tab(int index) {
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
+    if (waiting_for_save_) {
+        event->ignore(); // the window closes after the running save, when asked again
+        return;
+    }
     if (recording_->recording())
         recording_->toggle_recording(); // keep the take: it becomes an unsaved edit the prompt covers
     for (int index = 0; index < tabs_->count(); ++index) {

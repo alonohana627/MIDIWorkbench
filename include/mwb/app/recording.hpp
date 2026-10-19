@@ -83,6 +83,9 @@ public:
     [[nodiscard]] Result<RecordedTake> finish(const DocumentData& document, Tick stop_tick, std::string take_name);
 
     [[nodiscard]] std::size_t captured() const { return raw_.size(); }
+    /// Nothing arrived and nothing was lost: finishing would only add an empty take (an undo
+    /// step and an unsaved change for a take the user never played), so callers drop it.
+    [[nodiscard]] bool empty() const { return raw_.empty() && lost_ == 0; }
     /// Raw messages captured so far (for journaling full chunks while recording, section 21.2).
     [[nodiscard]] std::span<const CapturedMessage> raw() const { return raw_; }
     /// Identity the finished take will carry, fixed when recording starts so capture chunks

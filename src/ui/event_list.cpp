@@ -424,6 +424,13 @@ EventListPanel::EventListPanel(DocumentController& controller, QWidget* parent)
     });
 }
 
+void EventListPanel::showEvent(QShowEvent* event) {
+    QWidget::showEvent(event);
+    // A hidden list skips selection updates (sync_from_selection), so opening it (a new panel,
+    // or the dock shown again) catches up with what is selected now.
+    sync_from_selection();
+}
+
 void EventListPanel::sync_to_selection() {
     if (syncing_)
         return;

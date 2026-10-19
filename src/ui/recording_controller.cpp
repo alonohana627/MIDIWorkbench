@@ -313,6 +313,15 @@ void RecordingController::finish_take(bool stop_transport) {
         emit status_message(tr("Take cancelled during the count-in"));
         return;
     }
+    if (recorder.empty()) {
+        // No input at all: no take, so no undo step and the document stays clean. The take
+        // number is not used up either; the next real take gets it.
+        emit recording_changed(false);
+        if (journal)
+            journal->discard_capture(recorder.take_id());
+        emit status_message(tr("Nothing was played; no take kept"));
+        return;
+    }
     auto take = recorder.finish(controller_->document(), stop_tick, "Take " + std::to_string(take_number_++));
     emit recording_changed(false);
     if (!take) {

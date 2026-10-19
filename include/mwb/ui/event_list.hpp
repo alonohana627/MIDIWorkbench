@@ -87,6 +87,9 @@ class EventListPanel : public QWidget {
 public:
     explicit EventListPanel(DocumentController& controller, QWidget* parent = nullptr);
 
+protected:
+    void showEvent(QShowEvent* event) override;
+
 private:
     void sync_from_selection();
     void sync_to_selection();

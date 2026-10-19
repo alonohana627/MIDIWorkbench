@@ -115,10 +115,17 @@ QSize DragHandle::minimumSizeHint() const { return sizeHint(); } // never squeez
 
 void DragHandle::paintEvent(QPaintEvent*) {
     QPainter painter(this);
-    // A quiet border (it is a handle, not the primary button) and a hover fill.
+    // A quiet border (it is a handle, not the primary button) and a hover fill; the label is the
+    // normal button text, readable in every theme (final review N1: the border grey was 1.3:1).
     painter.setPen(palette().color(QPalette::Mid));
-    painter.setBrush(underMouse() ? palette().color(QPalette::Midlight) : palette().color(QPalette::Button));
+    painter.setBrush(palette().color(QPalette::Button));
     painter.drawRoundedRect(rect().adjusted(1, 1, -1, -1), 4, 4);
+    if (underMouse()) {
+        // Hover: a thin accent line under the label instead of a fill that could cost contrast.
+        painter.setPen(QPen(palette().color(QPalette::Highlight), 2));
+        painter.drawLine(QPoint(8, height() - 4), QPoint(width() - 8, height() - 4));
+    }
+    painter.setPen(palette().color(QPalette::ButtonText));
     painter.drawText(rect(), Qt::AlignCenter, tr("⇲ Drag MIDI"));
 }
 

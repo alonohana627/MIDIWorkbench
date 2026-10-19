@@ -36,6 +36,7 @@
 #include <mutex>
 #include <QAction>
 #include <QCheckBox>
+#include <QDockWidget>
 #include <QDoubleSpinBox>
 #include <QComboBox>
 #include <QKeyEvent>
@@ -596,6 +597,39 @@ TEST_SUITE("recording") {
         CHECK(notes[1].end == 960);
     }
 
+    TEST_CASE("a take with no input is not inserted: no undo step, no unsaved change (final review N3)") {
+        auto controller = make_controller();
+        REQUIRE_FALSE(controller->is_dirty());
+        const bool could_undo = controller->can_undo();
+        const auto takes = controller->document().takes.size();
+        FakePlayback playback;
+        RecordingController recording(playback);
+        recording.set_target(controller.get(), nullptr);
+        recording.set_count_in_bars(0);
+        QSignalSpy messages(&recording, &RecordingController::status_message);
+        recording.toggle_recording();
+        REQUIRE(recording.recording());
+        playback.clock = 1920; // a bar passes with nothing played
+        recording.toggle_recording();
+        CHECK_FALSE(recording.recording());
+        CHECK(playback.stops == 1); // the transport still stops
+        CHECK(controller->document().takes.size() == takes);
+        CHECK(controller->can_undo() == could_undo);
+        CHECK_FALSE(controller->is_dirty());
+        REQUIRE_FALSE(messages.isEmpty());
+        CHECK(messages.last().at(0).toString().contains("no take"));
+
+        // The next take that has input is still kept, and is "Take 1".
+        recording.toggle_recording();
+        live(recording, playback, 2000, 60, true);
+        live(recording, playback, 2400, 60, false);
+        playback.clock = 3840;
+        recording.toggle_recording();
+        REQUIRE(controller->document().takes.size() == takes + 1);
+        CHECK(controller->document().takes.back().name == "Take 1");
+        CHECK(controller->is_dirty());
+    }
+
     TEST_CASE("loop takes fold the unfolded passes and keep the last complete one") {
         auto controller = make_controller();
         FakePlayback playback;
@@ -919,6 +953,64 @@ TEST_SUITE("window") {
 }
 
 TEST_SUITE("event_list") {
+    TEST_CASE("the event list shows the current selection when it is opened") {
+        auto controller = make_controller();
+        std::vector<NewNote> notes;
+        for (int index = 0; index < 8; ++index)
+            notes.push_back(NewNote{controller->active_track(), index * 480, index * 480 + 240,
+                                    static_cast<std::uint8_t>(60 + index), 100, 0, 0});
+        auto changes = insert_notes(controller->document(), notes);
+        REQUIRE(changes);
+        REQUIRE(controller->apply(*changes));
+        const auto& all = controller->notes().notes;
+        REQUIRE(all.size() == 8);
+        controller->set_selection({all[2].on_id, all[5].on_id}); // selected before the list exists
+
+        EventListPanel panel(*controller);
+        auto* table = panel.findChild<QTableView*>();
+        REQUIRE(table);
+        panel.resize(800, 400);
+        panel.show();
+        CHECK(table->selectionModel()->selectedRows().size() == 2);
+
+        // Hidden lists ignore selection changes; showing it again catches up.
+        panel.hide();
+        controller->set_selection({all[7].on_id});
+        CHECK(table->selectionModel()->selectedRows().size() == 2); // stale while hidden
+        panel.show();
+        const auto rows = table->selectionModel()->selectedRows();
+        REQUIRE(rows.size() == 1);
+        CHECK(table->model()->index(rows[0].row(), 0).data().isValid());
+        CHECK_FALSE(controller->selection().empty()); // showing the list did not change the selection
+        CHECK(controller->selection().contains(all[7].on_id));
+    }
+
+    TEST_CASE("opening the Event List dock in the window highlights the notes already selected") {
+        WindowFixture fixture;
+        auto& controller = fixture.window->current_tab()->controller();
+        std::vector<NewNote> notes;
+        for (int index = 0; index < 4; ++index)
+            notes.push_back(NewNote{controller.active_track(), index * 480, index * 480 + 240,
+                                    static_cast<std::uint8_t>(60 + index), 100, 0, 0});
+        auto changes = insert_notes(controller.document(), notes);
+        REQUIRE(changes);
+        REQUIRE(controller.apply(*changes));
+        std::set<EventId> all;
+        for (const auto& note : controller.notes().notes)
+            all.insert(note.on_id);
+        controller.set_selection(all); // the final review's case: 4 notes selected, then the list opened
+        auto* dock = fixture.window->findChild<QDockWidget*>("dock.events");
+        REQUIRE(dock);
+        REQUIRE_FALSE(dock->isVisible());
+        dock->show(); // the panel is created when the dock becomes visible
+        QTest::qWait(100);
+        auto* panel = qobject_cast<EventListPanel*>(dock->widget());
+        REQUIRE(panel);
+        auto* table = panel->findChild<QTableView*>();
+        REQUIRE(table);
+        CHECK(table->selectionModel()->selectedRows().size() == 4);
+    }
+
     TEST_CASE("the filter matches cached type, data and track text after typing pauses") {
         auto controller = make_controller();
         std::vector<NewNote> notes;
@@ -3227,5 +3319,69 @@ TEST_SUITE("window") {
         CHECK(fixture.window->isWindowModified());
         auto* tabs = fixture.window->findChild<QTabWidget*>();
         CHECK(tabs->tabToolTip(tabs->currentIndex()).contains(title));
+    }
+}
+
+TEST_SUITE("theme") {
+    TEST_CASE("the Drag MIDI label is readable in every theme (final review N1)") {
+        application();
+        for (const Theme theme : {Theme::dark, Theme::light, Theme::high_contrast}) {
+            CAPTURE(static_cast<int>(theme));
+            apply_theme(theme);
+            test::TemporaryDirectory directory;
+            DragHandle handle(directory.path());
+            handle.resize(handle.sizeHint() + QSize(20, 8));
+            QImage image(handle.size(), QImage::Format_ARGB32);
+            handle.render(&image);
+            // The handle's own background, inside the border, beside the label.
+            const QColor background = image.pixelColor(4, image.height() / 2);
+            double best = 1.0;
+            for (int y = 0; y < image.height(); ++y)
+                for (int x = 6; x < image.width() - 6; ++x)
+                    best = std::max(best, contrast(image.pixelColor(x, y), background));
+            CHECK(best >= 4.5); // the text's strongest pixels against the fill
+            CHECK(contrast(handle.palette().color(QPalette::ButtonText), handle.palette().color(QPalette::Button)) >= 4.5);
+        }
+        apply_theme(Theme::dark);
+    }
+}
+
+TEST_SUITE("window") {
+    TEST_CASE("a close waiting for its save cannot be started again (final review N2)") {
+        WindowFixture fixture;
+        const auto path = fixture.directory.path() / "slow.mwb";
+        REQUIRE(document::save_native(make_blank_document("Slow"), path));
+        REQUIRE(fixture.window->open_path(path));
+        REQUIRE(wait_until([&] {
+            auto* tab = fixture.window->current_tab();
+            return tab && tab->controller().file_path() == path;
+        }, 5000));
+        QPointer<EditorTab> tab = fixture.window->current_tab();
+        edit_current(*fixture.window, 61);
+        tab->controller().save_native_async(path);
+        auto* tabs = fixture.window->findChild<QTabWidget*>();
+        const int count = tabs->count();
+        int reentered = 0;
+        bool still_open_inside = false;
+        bool window_still_open = false;
+        // Fires inside the wait: a second close request, and a user key queued for the window.
+        QTimer::singleShot(0, fixture.window.get(), [&] {
+            if (!tab || !tab->controller().saving())
+                return; // the save already finished: nothing to probe
+            ++reentered;
+            emit tabs->tabCloseRequested(tabs->indexOf(tab));
+            still_open_inside = !tab.isNull() && tabs->indexOf(tab) >= 0;
+            // Window-system input (keys, clicks) is held by the wait's ExcludeUserInputEvents
+            // loop; a programmatic request like this one is what the re-entry guard stops.
+            fixture.window->close(); // closing the window meanwhile is refused too
+            window_still_open = fixture.window->isVisible();
+        });
+        emit tabs->tabCloseRequested(tabs->indexOf(tab));
+        CHECK((tab.isNull() || tabs->indexOf(tab) < 0)); // closed exactly once
+        CHECK(tabs->count() == count - 1);
+        if (reentered > 0) {
+            CHECK(still_open_inside); // the second request did nothing
+            CHECK(window_still_open); // nor did closing the window
+        }
     }
 }

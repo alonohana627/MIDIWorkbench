@@ -80,6 +80,8 @@ std::optional<std::uint8_t> parse_pitch(std::string_view text, int octave_offset
     int accidental = 0;
     for (std::size_t index = 1; index < split; ++index)
         accidental += text[index] == '#' ? 1 : -1;
+    if (octave < -20 || octave > 20 || octave_offset < -20 || octave_offset > 20)
+        return std::nullopt; // no MIDI pitch there; also keeps the arithmetic far from overflow (code-core-22)
     const int value = (octave - octave_offset) * 12 + base + accidental;
     if (value < 0 || value > 127)
         return std::nullopt;

@@ -46,6 +46,9 @@ enum class MediaType : std::uint8_t { smf, rmid, native };
 struct LibraryOptions {
     int busy_timeout_ms = 5000;          ///< Also bounds the wait for a free read connection.
     std::size_t read_connections = 4;
+    /// Opens a directory that still carries the INCOMPLETE marker of an unfinished restore; only
+    /// restore_backup's final check does this (code-library-20).
+    bool allow_incomplete = false;
 };
 
 /// What to do when equal bytes arrive from another path (section 24.2).
@@ -201,6 +204,9 @@ struct SearchRequest {
     bool across_sequences = false; ///< Explicit "across any sequences" mode.
     /// False forces SQL paging even when the browse index is ready (parity tests, diagnostics).
     bool use_browse_index = true;
+    /// Search as you type: an unquoted last word without a trailing space matches as a prefix
+    /// (the library panel's search box; the CLI matches whole words).
+    bool prefix_last_word = false;
 };
 
 /// State of the in-memory browse index (section 19.4).

@@ -29,6 +29,9 @@ class TrackListWidget : public QWidget {
 public:
     explicit TrackListWidget(DocumentController& controller, QWidget* parent = nullptr);
 
+signals:
+    void status_message(const QString& text);
+
 protected:
     /// Delete/Backspace in the track table delete the active track (not notes in the editor).
     bool eventFilter(QObject* watched, QEvent* event) override;

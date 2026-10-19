@@ -15,8 +15,11 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <unistd.h>
 #endif
 
+#include <array>
 #include <cstring>
 #include <mutex>
 #include <fstream>
@@ -103,6 +106,21 @@ Status write_file_atomically(const std::filesystem::path& path, std::span<const 
         std::filesystem::remove(temporary, error);
         return flushed;
     }
+    if (!allow_overwrite) {
+        // Without --overwrite the final step itself refuses an existing file, so a file created
+        // after the check above is never replaced (code-runtime-25).
+#ifdef _WIN32
+        const bool moved = MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
+#else
+        const bool moved = ::link(temporary.c_str(), path.c_str()) == 0 && ::unlink(temporary.c_str()) == 0;
+#endif
+        if (!moved) {
+            std::filesystem::remove(temporary, error);
+            return make_error(ErrorCode::io, "destination exists; pass --overwrite to replace it",
+                              path_to_utf8(path.filename()));
+        }
+        return ok();
+    }
     if (auto replaced = document::file_system::replace_file(temporary, path); !replaced) {
         std::filesystem::remove(temporary, error);
         return replaced;
@@ -112,7 +130,20 @@ Status write_file_atomically(const std::filesystem::path& path, std::span<const 
 
 Result<OpenedDocument> open_document(const std::filesystem::path& path, const midi::ParseLimits& limits,
                                      std::stop_token stop, const midi::MidiParser& parser) {
-    auto bytes = read_file_bytes(path, std::max<std::uintmax_t>(limits.max_bytes, default_native_limit));
+    // The kind decides the size limit, so a huge MIDI file is refused before it is read, not
+    // after reading up to the native limit (code-runtime-24).
+    std::uintmax_t limit = std::max<std::uintmax_t>(limits.max_bytes, default_native_limit);
+    {
+        std::array<std::uint8_t, 16> head{};
+        std::ifstream probe(path, std::ios::binary);
+        if (probe) {
+            probe.read(reinterpret_cast<char*>(head.data()), static_cast<std::streamsize>(head.size()));
+            const auto got = static_cast<std::size_t>(std::max<std::streamsize>(0, probe.gcount()));
+            if (identify_file(std::span(head.data(), got)) == FileKind::midi)
+                limit = limits.max_bytes;
+        }
+    }
+    auto bytes = read_file_bytes(path, limit);
     if (!bytes)
         return std::unexpected(bytes.error());
     OpenedDocument opened;

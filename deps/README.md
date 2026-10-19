@@ -60,6 +60,9 @@ Current patches:
   known meta events so the adapter can preserve malformed payloads as evidence.
 - `libremidi/0002-writer-format-division-end-of-track.patch`: explicit SMF format (including type
   2), raw division word (SMPTE), and end-of-track placement after the last event.
+- `libremidi/0003-reader-capped-track-reserve.patch`: cap the per-track event reservation at
+  65,536, so a track that declares a huge length with few events (one big SysEx) cannot reserve
+  gigabytes before the payload limits reject it (code-core-13).
 
 Not compiled: libremidi's optional `client.cpp` (fails with this libc++; the application uses
 `observer`, `midi_in` and `midi_out` directly). signalsmith-dsp is exposed only through its

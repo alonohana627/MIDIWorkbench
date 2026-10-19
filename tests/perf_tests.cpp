@@ -105,6 +105,19 @@ TEST_SUITE("perf") {
     }
 }
 
+TEST_SUITE("perf") {
+    TEST_CASE("E100K semantic hash, computed per journaled edit and per playback snapshot (code-core-12)") {
+        const auto document = make_e100k();
+        Sha256Digest digest{};
+        const double hash = median_ms(5, [&] { digest = semantic_hash(document); });
+        std::printf("E100K: semantic_hash %.1f ms\n", hash);
+        CHECK(digest != Sha256Digest{});
+        // The cost is SHA-256 itself (picosha2, ~220 MB/s over ~8 MB of canonical bytes), not the
+        // call pattern: staging the small updates measured the same. A regression guard only.
+        CHECK(hash <= 60.0);
+    }
+}
+
 TEST_SUITE("perf_library") {
     // Section 33.3 on the synthetic L100K catalog with M10K melody streams: first pages and
     // selective filters (SQL and the browse index) <= 150 ms p95 warm, exact motif search

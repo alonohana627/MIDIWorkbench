@@ -335,7 +335,12 @@ SequenceSummary analyze_sequence(const Sequence& sequence, const AnalysisOptions
         summary.tempo_origin = TempoOrigin::unknown;
     }
 
-    // Per-track facts, pitch range, events of interest.
+    // Per-track facts, pitch range, events of interest. Notes are bucketed by track once, not
+    // rescanned per track (O(tracks * notes), code-core-11).
+    std::vector<std::vector<NoteSpan>> notes_by_track(sequence.tracks.size());
+    for (const auto& note : pairing.notes)
+        if (note.on_track < notes_by_track.size())
+            notes_by_track[note.on_track].push_back(note);
     std::vector<NoteSpan> key_notes;
     for (std::size_t track_index = 0; track_index < sequence.tracks.size(); ++track_index) {
         const auto& track = sequence.tracks[track_index];
@@ -373,10 +378,7 @@ SequenceSummary analyze_sequence(const Sequence& sequence, const AnalysisOptions
             case EventCategory::sysex_f7: summary.has_sysex = true; break;
             }
         }
-        std::vector<NoteSpan> track_notes;
-        for (const auto& note : pairing.notes)
-            if (note.on_track == track_index)
-                track_notes.push_back(note);
+        const std::vector<NoteSpan>& track_notes = notes_by_track[track_index];
         row.note_count = track_notes.size();
         bool all_channel_ten = !track_notes.empty();
         for (const auto& note : track_notes) {

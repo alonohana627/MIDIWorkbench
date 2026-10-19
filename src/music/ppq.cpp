@@ -2,6 +2,7 @@
 
 #include "mwb/music/grid.hpp"
 
+#include <algorithm>
 #include <deque>
 #include <format>
 #include <map>
@@ -135,14 +136,14 @@ Result<TransformPreview> change_sequence_ppq(const DocumentData& document, Seque
                 ++report.changed;
             }
         }
-        Track header = sequence.tracks[track];
+        Track header = track_header(sequence.tracks[track]); // header fields only, never a copy of every event
         auto end = convert(header.end_tick);
         if (!end)
             return std::unexpected(end.error());
         header.end_tick = *end;
         editor->set_track_header(track, std::move(header));
     }
-    Sequence header = sequence;
+    Sequence header = sequence_header(sequence);
     header.division.ppq = new_ppq;
     auto end = convert(header.end_tick);
     if (!end)
@@ -176,6 +177,24 @@ Result<TransformPreview> change_sequence_ppq(const DocumentData& document, Seque
     TransformPreview preview;
     preview.report = std::move(report);
     preview.changes = editor->finish("Change PPQ");
+    // Recording takes of this sequence's tracks keep their evidence range in the new resolution
+    // too (code-core-14): one remove + insert per take, at the same position.
+    for (std::size_t index = 0; index < document.takes.size(); ++index) {
+        const auto& take = document.takes[index];
+        if (std::ranges::none_of(sequence.tracks, [&](const Track& track) { return track.id == take.track; }))
+            continue;
+        RecordingTake converted = take;
+        auto start = convert(take.start_tick);
+        auto finish = convert(take.end_tick);
+        if (!start || !finish)
+            return make_error(ErrorCode::limit_exceeded, "take conversion overflows");
+        converted.start_tick = *start;
+        converted.end_tick = std::max(*finish, *start);
+        if (converted == take)
+            continue;
+        preview.changes.operations.push_back(TakeRemove{index, take});
+        preview.changes.operations.push_back(TakeInsert{index, std::move(converted)});
+    }
     return preview;
 }
 

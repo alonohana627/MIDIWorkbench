@@ -155,7 +155,8 @@ CommandOutput command_inspect(const CommandOptions& options) {
         sequences.push_back(sequence_json(sequence));
     CommandOutput output;
     output.json = {{"schema_version", 1},
-                   {"status", errors.empty() ? "ok" : "warning"},
+                   // Errors are "error", warnings alone "warning", neither "ok" (code-runtime-33).
+                   {"status", !errors.empty() ? "error" : !warnings.empty() ? "warning" : "ok"},
                    {"command", "inspect"},
                    {"summary", summary_json(*opened)},
                    {"sequences", std::move(sequences)},

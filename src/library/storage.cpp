@@ -326,6 +326,35 @@ Result<FileDigest> hash_file(const std::filesystem::path& path, std::stop_token 
     return digest;
 }
 
+std::optional<std::filesystem::path> relative_inside(const std::filesystem::path& path,
+                                                     const std::filesystem::path& root) {
+    const auto same = [](const std::filesystem::path& left, const std::filesystem::path& right) {
+#ifdef _WIN32
+        const auto& a = left.native();
+        const auto& b = right.native();
+        return CompareStringOrdinal(a.c_str(), static_cast<int>(a.size()), b.c_str(), static_cast<int>(b.size()), TRUE) ==
+               CSTR_EQUAL;
+#else
+        return left == right;
+#endif
+    };
+    const auto normal_path = path.lexically_normal();
+    const auto normal_root = root.lexically_normal();
+    auto item = normal_path.begin();
+    for (const auto& part : normal_root) {
+        if (part.empty())
+            continue; // a trailing separator
+        if (item == normal_path.end() || !same(*item, part))
+            return std::nullopt;
+        ++item;
+    }
+    std::filesystem::path rest;
+    for (; item != normal_path.end(); ++item)
+        if (!item->empty())
+            rest /= *item;
+    return rest;
+}
+
 std::filesystem::path path_from_utf8_text(std::string_view text) {
     return std::filesystem::path(std::u8string(text.begin(), text.end()));
 }

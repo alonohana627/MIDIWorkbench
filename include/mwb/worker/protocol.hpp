@@ -81,6 +81,7 @@ private:
     std::optional<std::uint64_t> transfer_;
     std::uint64_t expected_index_ = 0;
     std::uint64_t total_ = 0;
+    std::uint64_t size_ = 0; ///< Declared by the first chunk; every later chunk must agree.
     std::vector<std::uint8_t> data_;
 };
 

@@ -160,6 +160,11 @@ Result<RecordedTake> TakeRecorder::finish(const DocumentData& document, Tick sto
         if (options_.loop && pass > started.pass) {
             notes.push_back({started.start, options_.loop->end, static_cast<std::uint8_t>(key.first),
                              static_cast<std::uint8_t>(key.second), started.velocity, 0, true, started.pass});
+            // Held through whole passes in between: each of them sounds the note for the full
+            // loop, so a composed middle pass keeps it (code-runtime-28).
+            for (auto middle = started.pass + 1; middle < pass; ++middle)
+                notes.push_back({options_.loop->begin, options_.loop->end, static_cast<std::uint8_t>(key.first),
+                                 static_cast<std::uint8_t>(key.second), started.velocity, 0, true, middle});
             started.start = options_.loop->begin;
             started.pass = pass;
             ++result.synthetic_closures;
@@ -188,6 +193,7 @@ Result<RecordedTake> TakeRecorder::finish(const DocumentData& document, Tick sto
         return true;
     };
 
+    std::map<std::pair<std::uint8_t, std::uint8_t>, std::uint8_t> carried; // (channel, controller) -> value
     for (std::size_t index = 0; index < raw_.size(); ++index) {
         const CapturedMessage& message = raw_[index];
         if (message.size == 0)
@@ -217,7 +223,14 @@ Result<RecordedTake> TakeRecorder::finish(const DocumentData& document, Tick sto
             }
             continue;
         }
-        if (tick < window.begin || tick >= window.end)
+        if (tick < window.begin) {
+            // With held-note capture, the controller state of the count-in (a sustain pedal held
+            // into the take) is carried to the punch-in like the held notes (code-runtime-27).
+            if (options_.capture_held_notes && kind == 0xB0)
+                carried[{channel, message.bytes[1]}] = message.bytes[2];
+            continue;
+        }
+        if (tick >= window.end)
             continue;
         Event event;
         event.id = EventId::generate();
@@ -225,7 +238,27 @@ Result<RecordedTake> TakeRecorder::finish(const DocumentData& document, Tick sto
         event.category = EventCategory::channel;
         event.code = status;
         event.payload = channel_data_length(status) == 1 ? Payload{message.bytes[1]} : Payload{message.bytes[1], message.bytes[2]};
+        if (kind == 0xA0) {
+            // Polyphonic pressure follows its note through the input transpose (code-runtime-29).
+            const int pitch = message.bytes[1] + options_.transpose;
+            if (pitch < 0 || pitch > 127)
+                continue;
+            event.payload = Payload{static_cast<std::uint8_t>(pitch), message.bytes[2]};
+        }
         controls.push_back({std::move(event), pass});
+    }
+    if (!carried.empty()) {
+        std::int64_t start_pass = 0;
+        const Tick start = fold(window.begin, start_pass);
+        for (const auto& [slot, value] : carried) {
+            Event event;
+            event.id = EventId::generate();
+            event.tick = start;
+            event.category = EventCategory::channel;
+            event.code = static_cast<std::uint8_t>(0xB0 | slot.first);
+            event.payload = Payload{slot.second, value};
+            controls.push_back({std::move(event), start_pass});
+        }
     }
     // Still-held notes close at the stop position, labeled synthetic (section 8.4 rule 7).
     std::int64_t stop_pass = 0;

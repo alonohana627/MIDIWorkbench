@@ -122,6 +122,7 @@ const DocumentData& DocumentController::document() const { return session_->docu
 bool DocumentController::apply(const ChangeSet& changes, QString* error) {
     if (changes.empty())
         return true;
+    const auto evicted_before = session_->history().evicted_entries();
     auto result = session_->apply(changes);
     if (!result) {
         const QString message = QString::fromStdString(changes.label + ": " + result.error().describe());
@@ -131,6 +132,8 @@ bool DocumentController::apply(const ChangeSet& changes, QString* error) {
         return false;
     }
     after_change();
+    if (session_->history().evicted_entries() > evicted_before)
+        emit history_trimmed(); // code-document-17: the boundary is shown, not silent
     return true;
 }
 

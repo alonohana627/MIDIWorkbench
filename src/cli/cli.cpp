@@ -50,6 +50,22 @@ nlohmann::json error_json(const Error& error) {
     return {{"code", std::string(error_code_name(error.code))}, {"message", error.describe()}};
 }
 
+namespace {
+/// Name of the (sub)command that was parsed, e.g. "library import"; "cli" before parsing.
+std::string parsed_command(const CLI::App& application) {
+    std::string name;
+    const CLI::App* current = &application;
+    while (true) {
+        const auto chosen = current->get_subcommands();
+        if (chosen.empty())
+            break;
+        current = chosen.front();
+        name += (name.empty() ? "" : " ") + current->get_name();
+    }
+    return name.empty() ? std::string("cli") : name;
+}
+} // namespace
+
 CommandOutput failure(const std::string& command, const Error& error) {
     CommandOutput output;
     output.exit_code = exit_code_for(error.code);
@@ -83,6 +99,10 @@ int run(const std::vector<std::string>& arguments, std::string& standard_output,
     CLI::App application{"MIDI Workbench command-line interface", "mwb-cli"};
     application.require_subcommand(1);
     application.add_flag("--warnings-as-errors", options.warnings_as_errors, "Treat warnings as failures");
+    // Global flags may follow the subcommand too (`inspect a.mid --warnings-as-errors`): options a
+    // subcommand does not know fall through to the application (code-runtime-20). Subcommands
+    // created below inherit this.
+    application.fallthrough();
 
     auto* inspect = application.add_subcommand("inspect", "Report container, sequences, tracks, timing and warnings");
     inspect->add_option("input", options.input, "MIDI or native file")->required();
@@ -187,6 +207,10 @@ int run(const std::vector<std::string>& arguments, std::string& standard_output,
         return exit_success;
     } catch (const CLI::ParseError& error) {
         standard_error = std::string("error: ") + error.what() + "\n";
+        // Machine output is always versioned JSON on stdout, also for argument errors, so scripts
+        // that parse stdout never see an empty string (spec 31, code-runtime-21).
+        const auto refused = failure("arguments", Error{ErrorCode::invalid_argument, error.what(), {}, {}});
+        standard_output = refused.json.dump(2) + "\n";
         return exit_invalid_arguments;
     }
 
@@ -228,13 +252,23 @@ int run(const std::vector<std::string>& arguments, std::string& standard_output,
         output = command_bench(options);
 
     } catch (const std::exception& error) {
-        // Exception barrier: library or JSON exceptions become a stable internal-failure result.
-        output = failure("cli", Error{ErrorCode::internal, std::string("unexpected failure: ") + error.what(), {}, {}});
+        // Exception barrier: library or JSON exceptions become a stable internal-failure result,
+        // reported under the command that failed (code-runtime-33).
+        output = failure(parsed_command(application),
+                         Error{ErrorCode::internal, std::string("unexpected failure: ") + error.what(), {}, {}});
+    } catch (...) {
+        output = failure(parsed_command(application), Error{ErrorCode::internal, "unexpected failure", {}, {}});
     }
     if (options.warnings_as_errors && output.exit_code == exit_success && output.json.contains("warnings") &&
         !output.json["warnings"].empty()) {
+        // The warnings are now the errors: status and arrays agree (code-runtime-33).
         output.exit_code = exit_invalid_data;
         output.json["status"] = "error";
+        if (!output.json.contains("errors") || !output.json["errors"].is_array())
+            output.json["errors"] = nlohmann::json::array();
+        for (const auto& warning : output.json["warnings"])
+            output.json["errors"].push_back(warning);
+        output.json["warnings"] = nlohmann::json::array();
     }
     // Text from files (titles, track names) may not be valid UTF-8: replace, never throw.
     standard_output = output.json.dump(2, ' ', false, nlohmann::json::error_handler_t::replace) + "\n";

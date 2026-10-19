@@ -90,10 +90,20 @@ void FieldReader::rational(std::string_view key, Rational& out) {
     const auto* field = find(key);
     if (!field || !status_)
         return;
+    // Both parts stay within the recipe magnitude bound, so grid and strength products of a
+    // fraction and a tick count can never overflow (code-core-9).
+    const auto bounded = [](std::int64_t value) {
+        return value <= max_parameter_magnitude && value >= -max_parameter_magnitude;
+    };
     if (field->is_number_integer()) {
         std::int64_t value = 0;
-        if (read_int64(key, value))
-            out = Rational{value, 1};
+        if (!read_int64(key, value))
+            return;
+        if (!bounded(value)) {
+            fail(key, "fraction out of range");
+            return;
+        }
+        out = Rational{value, 1};
         return;
     }
     if (!field->is_string()) {
@@ -103,6 +113,10 @@ void FieldReader::rational(std::string_view key, Rational& out) {
     auto parsed = Rational::parse(field->get<std::string>());
     if (!parsed) {
         fail(key, parsed.error().message);
+        return;
+    }
+    if (!bounded(parsed->numerator) || !bounded(parsed->denominator)) {
+        fail(key, "fraction out of range");
         return;
     }
     out = *parsed;
@@ -122,7 +136,12 @@ void FieldReader::integer_list(std::string_view key, std::vector<std::int64_t>& 
             fail(key, "expected an array of integers");
             return;
         }
-        values.push_back(item.get<std::int64_t>());
+        const auto value = item.get<std::int64_t>();
+        if (value > max_parameter_magnitude || value < -max_parameter_magnitude) {
+            fail(key, "integer out of range"); // same bound as single integers (code-core-9)
+            return;
+        }
+        values.push_back(value);
     }
     out = std::move(values);
 }

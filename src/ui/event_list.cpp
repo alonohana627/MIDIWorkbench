@@ -385,7 +385,8 @@ EventListPanel::EventListPanel(DocumentController& controller, QWidget* parent)
     table_->setModel(proxy_);
     table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     table_->setSelectionMode(QAbstractItemView::ExtendedSelection);
-    table_->verticalHeader()->setDefaultSectionSize(20);
+    // At least the 24 DIP hit target of spec 29.3 (ux-panels-35), more for large fonts.
+    table_->verticalHeader()->setDefaultSectionSize(std::max(24, table_->fontMetrics().height() + 8));
     table_->verticalHeader()->hide();
     table_->horizontalHeader()->setStretchLastSection(true);
     table_->setAccessibleName(tr("Event list"));
@@ -444,21 +445,24 @@ void EventListPanel::sync_from_selection() {
         return;
     syncing_ = true;
     table_->clearSelection();
-    int first = -1;
-    std::size_t synced = 0;
-    for (const auto& id : controller_.selection()) {
-        const int row = model_->row_of(id);
-        if (row < 0)
-            continue;
-        const auto index = proxy_->mapFromSource(model_->index(row, 0));
-        table_->selectionModel()->select(index, QItemSelectionModel::Select | QItemSelectionModel::Rows);
-        if (first < 0 || index.row() < first)
-            first = index.row();
-        if (++synced >= 2000)
-            break; // bounded synchronization for huge selections
-    }
-    if (first >= 0)
-        table_->scrollTo(proxy_->index(first, 0));
+    // The rows in table order, so a huge selection marks its first 2,000 events (the ones the
+    // user sees first), not 2,000 picked in identity order (uiB-36). One selection change.
+    std::vector<int> rows;
+    for (const auto& id : controller_.selection())
+        if (const int row = model_->row_of(id); row >= 0) {
+            const auto index = proxy_->mapFromSource(model_->index(row, 0));
+            if (index.isValid())
+                rows.push_back(index.row());
+        }
+    std::ranges::sort(rows);
+    if (rows.size() > 2000)
+        rows.resize(2000); // bounded synchronization for huge selections
+    QItemSelection selection;
+    for (const int row : rows)
+        selection.select(proxy_->index(row, 0), proxy_->index(row, proxy_->columnCount() - 1));
+    table_->selectionModel()->select(selection, QItemSelectionModel::Select | QItemSelectionModel::Rows);
+    if (!rows.empty())
+        table_->scrollTo(proxy_->index(rows.front(), 0));
     syncing_ = false;
 }
 

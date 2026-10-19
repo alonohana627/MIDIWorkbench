@@ -103,6 +103,9 @@ struct Predicate {
     Field field = Field::any_text;
     PredicateValue value;
     bool quoted = false; ///< Value was a quoted string (phrase semantics for text fields).
+    /// The last token matches as a prefix ("lea" finds "lead"): set for the word being typed at
+    /// the end of a search box query (mark_prefix_term), never by the parser itself.
+    bool prefix = false;
     friend bool operator==(const Predicate&, const Predicate&) = default;
 };
 
@@ -154,6 +157,10 @@ inline constexpr int query_json_version = 1;
 /// maximal runs of [a-z0-9]. Returns nullopt when the text contains non-ASCII bytes, whose
 /// tokenization only SQLite can decide.
 [[nodiscard]] std::optional<std::vector<std::string>> ascii_fts_tokens(std::string_view folded_text);
+
+/// Search-as-you-type (code-library-28): when `text` ends in an unquoted bare word (no trailing
+/// space), that text predicate matches its last token as a prefix. Returns whether one was marked.
+bool mark_prefix_term(Query& query, std::string_view text);
 
 /// Inclusive integer interval a numeric condition selects over [minimum, maximum]
 /// (empty when low > high). Used identically by SQL compilation and in-memory evaluation.

@@ -201,9 +201,14 @@ const char* reader_result_name(libremidi::reader::parse_result result) {
 }
 
 std::string title_from_name(std::string_view original_name) {
-    const std::filesystem::path path(std::u8string(original_name.begin(), original_name.end()));
-    const auto stem = path.stem().u8string();
-    std::string title(stem.begin(), stem.end());
+    // Plain text handling, not std::filesystem::path: a name that is not valid UTF-8 would throw
+    // there and fail the whole import (code-core-23). The bytes after the last separator, with
+    // the extension removed, decoded like MIDI text (UTF-8, else Windows-1252).
+    const auto separator = original_name.find_last_of("/\\");
+    auto name = separator == std::string_view::npos ? original_name : original_name.substr(separator + 1);
+    if (const auto dot = name.find_last_of('.'); dot != std::string_view::npos && dot > 0)
+        name = name.substr(0, dot);
+    const auto title = decode_midi_text(std::span(reinterpret_cast<const std::uint8_t*>(name.data()), name.size()));
     return title.empty() ? std::string("Imported MIDI") : title;
 }
 
@@ -414,6 +419,10 @@ Result<ImportResult> import_midi_unguarded(std::span<const std::uint8_t> bytes, 
                        "header is longer than six bytes; the extension was skipped");
     if (report.decoded_tracks == 0)
         return make_error(ErrorCode::invalid_data, "file contains no tracks");
+    if (report.format == 0 && report.decoded_tracks > 1)
+        add_diagnostic(diagnostics, Severity::warning, "smf.type0_tracks",
+                       "a type-0 file holds " + std::to_string(report.decoded_tracks) +
+                           " tracks; they were kept as separate tracks");
 
     DocumentData document;
     document.id = DocumentId::generate();

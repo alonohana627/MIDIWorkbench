@@ -143,7 +143,9 @@ void RecordingController::install_input(std::shared_ptr<platform::IMidiInput> in
                 message.time_ns = buffer[index].arrival_ns;
                 message.size = buffer[index].size;
                 message.bytes = buffer[index].bytes;
-                message.quality = std::string(platform::timestamp_quality_name(buffer[index].quality));
+                // The stored time is the callback's arrival clock, not the driver timestamp, so the
+                // evidence says so (spec 8.4 rule 1, code-runtime-17).
+                message.quality = std::string(platform::timestamp_quality_name(platform::TimestampQuality::arrival_estimated));
                 inbox->messages.push_back(message);
             }
         }

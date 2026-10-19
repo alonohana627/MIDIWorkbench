@@ -96,6 +96,7 @@ std::vector<Diagnostic> validate_document(const DocumentData& document, const Do
     std::size_t total_events = 0;
     std::unordered_set<Uuid, UuidHash> identities;
     const auto unique_id = [&](const Uuid& id) { return identities.insert(id).second; };
+    std::unordered_set<Uuid, UuidHash> document_tracks;
 
     for (std::size_t sequence_index = 0; sequence_index < document.sequences.size(); ++sequence_index) {
         const auto& sequence = document.sequences[sequence_index];
@@ -165,6 +166,26 @@ std::vector<Diagnostic> validate_document(const DocumentData& document, const Do
             if (index > 0 && scale_regions[index - 1].end_tick > region.start_tick)
                 add(Severity::error, "scale_region.overlap", "scale regions overlap", s);
         }
+        // References and identities a corrupt file could break before the UI trips over them
+        // (code-core-18).
+        for (const auto& region : sequence.regions)
+            if (!unique_id(region.id.uuid()))
+                add(Severity::error, "identity.duplicate", "duplicate region identity", s);
+        for (const auto& region : sequence.scale_regions)
+            if (!unique_id(region.id.uuid()))
+                add(Severity::error, "identity.duplicate", "duplicate scale region identity", s);
+        for (const auto& recipe : sequence.recipes)
+            if (!unique_id(recipe.id.uuid()))
+                add(Severity::error, "identity.duplicate", "duplicate recipe identity", s);
+        if (sequence.settings.loop_region &&
+            std::none_of(sequence.regions.begin(), sequence.regions.end(),
+                         [&](const Region& region) { return region.id == *sequence.settings.loop_region; }))
+            add(Severity::error, "settings.loop_region", "the loop names a region that does not exist", s);
+        const auto positive = [](const Rational& value) { return value.numerator > 0 && value.denominator > 0; };
+        if (!positive(sequence.settings.snap) || !positive(sequence.settings.default_note_length))
+            add(Severity::error, "settings.snap", "snap grid and new-note length must be positive fractions", s);
+        for (const auto& track : sequence.tracks)
+            document_tracks.insert(track.id.uuid());
         const auto pairing = pair_notes(sequence);
         if (!pairing.orphan_ends.empty())
             add(Severity::info, "notes.orphan_end",
@@ -173,6 +194,9 @@ std::vector<Diagnostic> validate_document(const DocumentData& document, const Do
             add(Severity::info, "notes.ambiguous",
                 std::to_string(pairing.ambiguous_count) + " overlapping same-key notes paired first-in-first-out", s);
     }
+    for (const auto& take : document.takes)
+        if (!document_tracks.contains(take.track.uuid()))
+            add(Severity::error, "take.track", "a recording take refers to a track that does not exist");
     if (total_events > limits.max_events_per_document)
         add(Severity::warning, "limit.events", "document exceeds the editable event limit; open for inspection only");
     return diagnostics;

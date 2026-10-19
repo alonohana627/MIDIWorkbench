@@ -195,8 +195,15 @@ Result<VoiceLeadingResult> voice_lead(std::span<const ProgressionStep> steps, co
         return make_error(ErrorCode::invalid_argument, "voice-leading register must lie inside 0..127");
     if (options.register_tolerance < 0 || options.register_tolerance > 24)
         return make_error(ErrorCode::invalid_argument, "register tolerance must lie in 0..24");
-    if (options.candidate_limit == 0)
-        return make_error(ErrorCode::invalid_argument, "candidate limit must be positive");
+    // The dynamic program is O(steps * limit^2): bounded so a recipe cannot make it run for hours
+    // (code-core-10). 4096 candidates per chord is far more than any voicing needs.
+    if (options.candidate_limit == 0 || options.candidate_limit > 4096)
+        return make_error(ErrorCode::invalid_argument, "candidate limit must lie in 1..4096");
+    if (steps.size() > 1024)
+        return make_error(ErrorCode::limit_exceeded, "a progression has at most 1024 steps");
+    if (options.weights.movement < 0 || options.weights.crossing < 0 || options.weights.register_violation < 0 ||
+        options.weights.common_tone < 0)
+        return make_error(ErrorCode::invalid_argument, "voice-leading weights must not be negative");
     if (options.voice_count < 0 || options.voice_count > 8)
         return make_error(ErrorCode::invalid_argument, "voice count must lie in 0..8");
     int voice_count = options.voice_count;
@@ -400,6 +407,14 @@ Result<std::pair<std::vector<ProgressionStep>, VoiceLeadingOptions>> progression
         MWB_TRY(options_reader.status());
     }
     MWB_TRY(reader.status());
+    // The same bounds as voice_lead(), reported when the recipe is read (code-core-10).
+    if (steps.size() > 1024)
+        return make_error(ErrorCode::invalid_data, "a progression has at most 1024 steps");
+    if (options.candidate_limit == 0 || options.candidate_limit > 4096)
+        return make_error(ErrorCode::invalid_data, "candidate limit must lie in 1..4096");
+    if (options.weights.movement < 0 || options.weights.crossing < 0 || options.weights.register_violation < 0 ||
+        options.weights.common_tone < 0)
+        return make_error(ErrorCode::invalid_data, "voice-leading weights must not be negative");
     return std::pair{std::move(steps), std::move(options)};
 }
 

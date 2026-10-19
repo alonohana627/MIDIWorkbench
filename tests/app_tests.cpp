@@ -170,6 +170,54 @@ TEST_SUITE("recording") {
         CHECK(raw->size() == 2);
     }
 
+    TEST_CASE("a note held through a whole loop pass sounds in that pass (code-runtime-28)") {
+        auto document = make_blank_document();
+        RecordingOptions options;
+        options.loop = TimeRange{0, 1000};
+        TakeRecorder recorder(document.sequences[0].tracks[0].id, options, millisecond_ticks);
+        recorder.add(message(500, 0x90, 60, 90));  // pass 0
+        recorder.add(message(2300, 0x80, 60, 0));  // pass 2: held through all of pass 1
+        auto take = recorder.finish(document, 2500, "Held loop");
+        REQUIRE(take);
+        REQUIRE(apply_change_set(document, take->changes));
+        const auto notes = track_notes(document);
+        // Stopped during pass 3 (index 2): pass index 1 is composed, and the note fills it.
+        REQUIRE(notes.size() == 1);
+        CHECK(notes[0].start == 0);
+        CHECK(notes[0].end == 1000);
+    }
+
+    TEST_CASE("held-note capture carries the count-in pedal; poly pressure is transposed (code-runtime-27/29)") {
+        auto document = make_blank_document();
+        RecordingOptions options;
+        options.punch = TimeRange{100, 300};
+        options.capture_held_notes = true;
+        options.transpose = 2;
+        TakeRecorder recorder(document.sequences[0].tracks[0].id, options, millisecond_ticks);
+        recorder.add(message(40, 0xB0, 64, 127)); // sustain pressed during the count-in
+        recorder.add(message(50, 0x90, 60, 90));
+        recorder.add(message(120, 0xA0, 60, 70)); // pressure on the held key
+        recorder.add(message(150, 0x80, 60, 0));
+        recorder.add(message(200, 0xB0, 64, 0));
+        auto take = recorder.finish(document, 400, "Pedal");
+        REQUIRE(take);
+        REQUIRE(apply_change_set(document, take->changes));
+        bool pedal_at_punch = false;
+        bool pressure_transposed = false;
+        for (const auto& event : document.sequences[0].tracks[0].events) {
+            if (event.is_channel() && event.message() == ChannelMessage::control_change && event.data1() == 64 &&
+                event.data2() == 127)
+                pedal_at_punch = event.tick == 100;
+            if (event.is_channel() && event.message() == ChannelMessage::poly_pressure)
+                pressure_transposed = event.data1() == 62 && event.data2() == 70;
+        }
+        CHECK(pedal_at_punch);
+        CHECK(pressure_transposed);
+        const auto notes = track_notes(document);
+        REQUIRE(notes.size() == 1);
+        CHECK(notes[0].pitch == 62);
+    }
+
     TEST_CASE("lost input and interruptions make the take incomplete") {
         auto document = make_blank_document();
         TakeRecorder recorder(document.sequences[0].tracks[0].id, {}, millisecond_ticks);

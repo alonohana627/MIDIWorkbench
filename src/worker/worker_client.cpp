@@ -41,6 +41,7 @@ struct WorkerClient::Process {
     std::mutex mutex;
     std::condition_variable available;
     std::deque<std::vector<std::uint8_t>> received;
+    std::size_t buffered_bytes = 0; ///< Bytes in `received`, guarded by `mutex`.
     bool ended = false;
     std::jthread reader;
     FrameDecoder decoder;
@@ -85,6 +86,12 @@ struct WorkerClient::Process {
                 const auto got = static_cast<std::size_t>(result);
 #endif
                 std::lock_guard lock(mutex);
+                // A worker that writes far more than any reply needs (frames are at most 1 MiB,
+                // transfers bounded by the aggregate limit) is misbehaving: stop buffering it
+                // (code-runtime-19); the request then fails as a crashed worker.
+                buffered_bytes += got;
+                if (buffered_bytes > max_aggregate_bytes + max_frame_payload * 4)
+                    break;
                 received.emplace_back(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(got));
                 available.notify_all();
             }
@@ -112,6 +119,7 @@ struct WorkerClient::Process {
                 continue;
             }
             while (!received.empty()) {
+                buffered_bytes -= std::min(buffered_bytes, received.front().size());
                 decoder.feed(received.front());
                 received.pop_front();
             }
@@ -262,7 +270,10 @@ Result<std::unique_ptr<WorkerClient>> WorkerClient::start(const std::filesystem:
     auto reply = client->process_->next_frame(std::chrono::steady_clock::now() + limits.heartbeat_timeout, {});
     if (!reply)
         return std::unexpected(reply.error());
-    if (reply->kind != FrameKind::hello || reply->payload.value("nonce", std::string()) != nonce)
+    // Type-checked, never thrown: a malformed reply fails the start (code-runtime-19).
+    const auto& payload = reply->payload;
+    if (reply->kind != FrameKind::hello || !payload.is_object() || !payload.contains("nonce") ||
+        !payload["nonce"].is_string() || payload["nonce"].get<std::string>() != nonce)
         return make_error(ErrorCode::invalid_data, "mwb-worker answered the handshake incorrectly");
     return client;
 }

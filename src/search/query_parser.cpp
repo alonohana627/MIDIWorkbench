@@ -6,6 +6,7 @@
 #include "mwb/core/text.hpp"
 #include "mwb/core/utility.hpp"
 
+#include <functional>
 #include <tao/pegtl.hpp>
 #include <tao/pegtl/contrib/parse_tree.hpp>
 
@@ -703,6 +704,27 @@ bool is_text_field(Field field) noexcept {
 Error QueryError::to_error() const {
     return Error{ErrorCode::invalid_argument, message, std::format("{} at bytes {}..{}", code, span.begin, span.end),
                  nullptr};
+}
+
+bool mark_prefix_term(Query& query, std::string_view text) {
+    if (text.empty() || text.back() == ' ' || text.back() == '\t' || text.back() == '"' || text.back() == ')')
+        return false; // a finished word, a phrase or a group: matched exactly
+    QueryNode* last = nullptr;
+    const std::function<void(QueryNode&)> visit = [&](QueryNode& node) {
+        if (node.kind == NodeKind::predicate && (!last || node.span.end > last->span.end))
+            last = &node;
+        for (auto& child : node.children)
+            visit(child);
+    };
+    visit(query.root);
+    if (last == nullptr || last->span.end != text.size() || last->predicate.quoted ||
+        !std::holds_alternative<std::string>(last->predicate.value))
+        return false;
+    const auto field = last->predicate.field;
+    if (field != Field::any_text && field != Field::text && field != Field::title && field != Field::source)
+        return false; // tags, numbers and names of things are matched exactly
+    last->predicate.prefix = true;
+    return true;
 }
 
 std::optional<std::vector<std::string>> ascii_fts_tokens(std::string_view folded_text) {

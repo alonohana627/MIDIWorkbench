@@ -49,8 +49,6 @@ struct NewNote {
 [[nodiscard]] Result<ChangeSet> delete_notes(const DocumentData& document, SequenceId sequence,
                                              std::span<const EventId> notes, std::string label = "Delete notes");
 
-/// Copies notes by `offset` ticks and `transpose` semitones onto `destination` (or their own track).
-/// Returns the change set and the identities of the created notes.
 /// Splits one note at `at` (start < at < end) into two notes as one change set: the original
 /// note ends at `at` and a new note with the same pitch, velocity and channel covers [at, end).
 /// Returns the new note's identity in `created`.
@@ -61,6 +59,8 @@ struct SplitNote {
 [[nodiscard]] Result<SplitNote> split_note(const DocumentData& document, SequenceId sequence, EventId note, Tick at,
                                            std::string label = "Split note");
 
+/// Copies notes by `offset` ticks and `transpose` semitones onto `destination` (or their own track).
+/// Returns the change set and the identities of the created notes.
 struct DuplicatedNotes {
     ChangeSet changes;
     std::vector<EventId> created;

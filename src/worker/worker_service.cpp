@@ -28,7 +28,16 @@ public:
                     return 3; // protocol violation: abandon the stream
                 if (!*frame)
                     break;
-                if (!handle(**frame))
+                // A type-confused request field fails that request, never the worker (code-runtime-19).
+                bool keep_serving = true;
+                try {
+                    keep_serving = handle(**frame);
+                } catch (const std::exception& error) {
+                    fail((*frame)->request_id, Error{ErrorCode::invalid_argument, std::string("malformed request: ") + error.what(), {}, {}});
+                    input_ = ChunkAssembler{};
+                    input_bytes_.clear();
+                }
+                if (!keep_serving)
                     return 0;
             }
         }

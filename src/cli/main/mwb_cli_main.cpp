@@ -40,6 +40,9 @@ std::vector<std::string> utf8_arguments([[maybe_unused]] int argc, [[maybe_unuse
 
 int main(int argc, char** argv) {
 #ifdef _WIN32
+    // The console code page is shared with the window this runs in: UTF-8 for our output, then
+    // the user's setting again, so later legacy tools print correctly (code-runtime-22).
+    const UINT previous_code_page = GetConsoleOutputCP();
     SetConsoleOutputCP(CP_UTF8);
 #endif
     std::string standard_output;
@@ -47,5 +50,11 @@ int main(int argc, char** argv) {
     const int code = mwb::cli::run(utf8_arguments(argc, argv), standard_output, standard_error);
     std::fwrite(standard_output.data(), 1, standard_output.size(), stdout);
     std::fwrite(standard_error.data(), 1, standard_error.size(), stderr);
+    std::fflush(stdout);
+    std::fflush(stderr);
+#ifdef _WIN32
+    if (previous_code_page != 0)
+        SetConsoleOutputCP(previous_code_page);
+#endif
     return code;
 }

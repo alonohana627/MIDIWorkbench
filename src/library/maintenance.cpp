@@ -97,8 +97,18 @@ Result<std::unique_ptr<SQLite::Database>> open_for_verification(const std::files
         std::error_code error;
         if (!std::filesystem::is_regular_file(database_path, error))
             return make_error(ErrorCode::not_found, "the library catalog is missing");
-        auto database = std::make_unique<SQLite::Database>(sqlite_support::path_to_utf8(database_path),
-                                                           SQLite::OPEN_READWRITE, 5000);
+        // Read-only first, so verifying a backup on read-only media (or a library) never writes
+        // or checkpoints anything; read-write only when SQLite cannot read a WAL database
+        // without creating its -shm file (code-library-32).
+        std::unique_ptr<SQLite::Database> database;
+        try {
+            database = std::make_unique<SQLite::Database>(sqlite_support::path_to_utf8(database_path),
+                                                          SQLite::OPEN_READONLY, 5000);
+            database->exec("SELECT count(*) FROM sqlite_schema");
+        } catch (const SQLite::Exception&) {
+            database = std::make_unique<SQLite::Database>(sqlite_support::path_to_utf8(database_path),
+                                                          SQLite::OPEN_READWRITE, 5000);
+        }
         int enabled = 0;
         sqlite3_db_config(database->getHandle(), SQLITE_DBCONFIG_DEFENSIVE, 1, &enabled);
         sqlite3_db_config(database->getHandle(), SQLITE_DBCONFIG_TRUSTED_SCHEMA, 0, &enabled);
@@ -337,7 +347,18 @@ Result<VerifyReport> restore_backup(const std::filesystem::path& backup, const s
     if (!report->ok())
         return make_error(ErrorCode::invalid_data, "the restored library failed verification", report->to_json());
     {
-        auto opened = Library::open(destination);
+        // The catalog in a backup is untrusted input: only the exact reference schema of its
+        // version is accepted, so extra triggers or views never run in the app (code-library-21).
+        auto catalog = open_for_verification(destination / "library.sqlite");
+        if (!catalog)
+            return std::unexpected(std::move(catalog).error());
+        const auto version = static_cast<std::int32_t>(sqlite_support::pragma_integer(**catalog, "user_version"));
+        MWB_TRY(sqlite_support::verify_schema_whitelist(**catalog, catalog_reference_ddl(version), "the restored catalog"));
+    }
+    {
+        LibraryOptions options;
+        options.allow_incomplete = true; // the marker is removed only after this check
+        auto opened = Library::open(destination, options);
         if (!opened)
             return std::unexpected(opened.error().wrapped(ErrorCode::invalid_data, "the restored library cannot be opened"));
     }
@@ -347,19 +368,21 @@ Result<VerifyReport> restore_backup(const std::filesystem::path& backup, const s
 
 Result<RepairReport> repair_library(Library& library, const RepairOptions& options) {
     RepairReport report;
-    report.safety_backup = library.root() / "backups" / std::format("{}-pre-repair", now_utc_ms());
-    auto backup = create_backup(library, report.safety_backup);
-    if (backup) {
-        report.full_backup = true;
-    } else {
-        // Damaged objects prevent a verified full backup; keep at least the catalog evidence.
-        auto catalog_only = report.safety_backup; // native form: any library path, any code page
-        catalog_only += "-catalog";
-        std::error_code error;
-        std::filesystem::create_directories(catalog_only, error);
-        MWB_TRY(library.backup_catalog(catalog_only / "library.sqlite"));
-        report.safety_backup = catalog_only;
-    }
+    // Both repairs rewrite catalog rows only (full-text and derived indexes); objects are never
+    // touched, so the safety copy is the catalog plus its descriptor, not a second copy of every
+    // object on a large library (code-library-22). `full_backup` stays false.
+    auto catalog_only = library.root() / "backups"; // native form: any library path, any code page
+    catalog_only /= std::format("{}-pre-repair-catalog", now_utc_ms());
+    std::error_code error;
+    std::filesystem::create_directories(catalog_only, error);
+    if (error)
+        return make_error(ErrorCode::io, "cannot create the repair safety folder");
+    MWB_TRY(library.backup_catalog(catalog_only / "library.sqlite"));
+    std::filesystem::copy_file(library.root() / "library.json", catalog_only / "library.json",
+                               std::filesystem::copy_options::overwrite_existing, error);
+    if (error)
+        return make_error(ErrorCode::io, "cannot copy library.json into the repair safety folder");
+    report.safety_backup = catalog_only;
     if (options.rebuild_fts) {
         auto rows = library.rebuild_fts();
         if (!rows)

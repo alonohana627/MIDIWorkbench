@@ -143,6 +143,7 @@ private:
     bool apply_when_ready_ = false;
     QString last_quantize_json_;
     bool updating_ = false;
+    bool tool_defaults_loaded_ = false; ///< Defaults are loaded once; later documents keep the values.
     /// Values shown at the last refresh (start, length, pitch, velocity, channel).
     std::array<int, 5> shown_{};
     TaskThread transform_thread_;        ///< Last member: joined first on destruction.

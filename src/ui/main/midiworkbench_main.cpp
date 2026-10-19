@@ -7,6 +7,7 @@
 //   --theme <name>          system, dark, light or high_contrast for this run (not saved)
 //   QT_QPA_PLATFORM=offscreen, MWB_AUDIO_BACKEND=null, MWB_MIDI_BACKEND=null for no devices.
 #include "mwb/app/environment.hpp"
+#include "mwb/document/recovery.hpp"
 #include "mwb/ui/main_window.hpp"
 #include "mwb/ui/theme.hpp"
 
@@ -105,8 +106,15 @@ int main(int argc, char** argv) {
     mwb::ui::apply_theme(mwb::ui::theme_from_name(
         theme.empty() ? QSettings().value("ui/theme", "system").toString() : QString::fromStdString(theme)));
 
-    mwb::ui::MainWindow window(options, directories);
-    if (!options.exit_when_ready || !options.screenshot.empty())
-        window.show();
-    return application.exec();
+    int code = 0;
+    {
+        mwb::ui::MainWindow window(options, directories);
+        if (!options.exit_when_ready || !options.screenshot.empty())
+            window.show();
+        code = application.exec();
+    } // the window drains its recovery thread here
+    // Queued checkpoint serialization is no longer needed: drop it and join the threads, so exit
+    // never waits for it or runs it during static destruction (code-document-18).
+    mwb::document::shutdown_recovery_executors();
+    return code;
 }

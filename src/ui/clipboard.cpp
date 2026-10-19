@@ -4,6 +4,7 @@
 #include "mwb/core/note_edit.hpp"
 #include "mwb/core/pitch.hpp"
 #include "mwb/ui/document_controller.hpp"
+#include "mwb/ui/editor_math.hpp"
 
 #include <QMimeData>
 #include <nlohmann/json.hpp>
@@ -226,16 +227,11 @@ std::vector<EventId> paste_clipboard(DocumentController& controller, const QMime
             *error = QString::fromStdString(changes.error().message);
         return {};
     }
-    const auto before = controller.notes().notes;
+    // The created notes are the change set's own note-on insertions: no copy of every note and
+    // no set of all identities per paste (uiB-26).
+    std::vector<EventId> created = inserted_note_starts(*changes);
     if (!controller.apply(*changes))
         return {};
-    std::set<EventId> previous;
-    for (const auto& note : before)
-        previous.insert(note.on_id);
-    std::vector<EventId> created;
-    for (const auto& note : controller.notes().notes)
-        if (!previous.contains(note.on_id))
-            created.push_back(note.on_id);
     if (error && payload->ppq != destination_ppq)
         *error = QObject::tr("Pasted from PPQ %1 into PPQ %2; largest timing error %3 tick(s)")
                      .arg(payload->ppq)

@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cwctype>
 #include <format>
 #include <fstream>
 #include <set>
@@ -342,6 +344,9 @@ TEST_SUITE("catalog") {
         CHECK(*library->collection_members(*manual) == std::vector<std::int64_t>{one, two});
         REQUIRE(library->move_in_collection(*manual, two, 0).has_value());
         CHECK(*library->collection_members(*manual) == std::vector<std::int64_t>{two, one});
+        REQUIRE(library->move_in_collection(*manual, two, 5).has_value()); // past the end: last
+        CHECK(*library->collection_members(*manual) == std::vector<std::int64_t>{one, two});
+        REQUIRE(library->move_in_collection(*manual, two, 0).has_value());
         CHECK(library->collection_members(*manual, 1)->size() == 1);
         const auto smart = library->create_smart_collection("Fast bass", "tag:bass bpm:>100");
         REQUIRE(smart.has_value());
@@ -360,6 +365,14 @@ TEST_SUITE("catalog") {
         CHECK(all_ids(*library, scoped) == std::vector<std::int64_t>{one});
         REQUIRE(library->remove_tag(one, "bass").has_value());
         CHECK(all_ids(*library, scoped).empty());
+        // Its last use gone, "bass" leaves the tag list (code-library-37).
+        CHECK(std::ranges::none_of(*library->list_tags(), [](const auto& tag) { return tag.normalized_name == "bass"; }));
+        // collection: names manual collections; a smart one is refused, not silently empty (code-library-27).
+        SearchRequest smart_name;
+        smart_name.query_text = "collection:\"fast bass\"";
+        auto refused = library->search(smart_name);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().code == ErrorCode::invalid_argument);
         // Long multi-byte titles are recorded in the change outbox without splitting a character.
         std::string long_title;
         for (int index = 0; index < 120; ++index)
@@ -569,8 +582,11 @@ TEST_SUITE("import") {
         always.after_capture = [&](const std::filesystem::path& path, std::size_t attempt) {
             write_bytes(path, phrase_smf(Phrase{}.set_pitches(std::vector<int>(attempt + 2, 60))));
         };
+        const auto started = std::chrono::steady_clock::now();
         auto unstable = library->import_paths({file}, always);
         REQUIRE(unstable.has_value());
+        // The retries waited 100 and 250 ms for the writer to finish (code-library-18).
+        CHECK(std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(340));
         CHECK(unstable->counts.changed_during_read == 1);
         CHECK(unstable->counts.imported == 0);
         CHECK(std::filesystem::is_empty(library->root() / "staging"));
@@ -621,6 +637,17 @@ TEST_SUITE("import") {
         const auto adopted = library->restore_revision(asset, candidate, edited_head);
         REQUIRE(adopted.has_value());
         CHECK(library->revision_bytes(*adopted).value() == phrase_smf(Phrase{}.set_pitches({90, 91, 92})));
+
+        // A trashed song whose source gets new bytes comes back with the new revision (code-library-17).
+        auto other = temporary.path() / "in2" / "other.mid";
+        write_bytes(other, phrase_smf(Phrase{}.set_pitches({40, 42})));
+        const auto other_asset = *library->import_paths({other})->items[0].asset_id;
+        REQUIRE(library->trash({other_asset}).has_value());
+        write_bytes(other, phrase_smf(Phrase{}.set_pitches({41, 43})));
+        auto revived = library->import_paths({other});
+        REQUIRE(revived.has_value());
+        CHECK(revived->counts.imported == 1);
+        CHECK_FALSE(library->asset(other_asset)->value().deleted_ms.has_value());
 
         std::stop_source stop;
         stop.request_stop();
@@ -866,11 +893,13 @@ TEST_SUITE("backup") {
         CHECK(std::filesystem::exists(broken_backup / incomplete_marker_name));
         CHECK_FALSE(restore_backup(broken_backup, temporary.path() / "never").has_value());
 
-        // Repair: safety backup first (catalog only, since objects are damaged), then FTS rebuild.
+        // Repair: a catalog-only safety copy first (repairs never touch objects), then FTS rebuild.
         auto repaired = repair_rebuild_fts(*library);
         REQUIRE(repaired.has_value());
         CHECK_FALSE(repaired->full_backup);
         CHECK(std::filesystem::exists(repaired->safety_backup / "library.sqlite"));
+        CHECK(std::filesystem::exists(repaired->safety_backup / "library.json"));
+        CHECK_FALSE(std::filesystem::exists(repaired->safety_backup / "objects")); // no second object store
         CHECK(repaired->fts_rows == 2);
         SearchRequest glow;
         glow.query_text = "glow";
@@ -944,7 +973,9 @@ TEST_SUITE("analysis") {
         REQUIRE(library->commit_revision(CommitRequest{asset, first, RevisionOrigin::edit, "edit"},
                                          phrase_smf(Phrase{}.set_pitches({62, 65, 69, 72})), MediaType::smf)
                     .has_value());
-        REQUIRE(library->set_key_override(asset, 0, 9, "minor").has_value());
+        REQUIRE(library->set_key_override(asset, 0, 9, "Minor").has_value()); // spelled like search does (code-library-15)
+        CHECK(library->set_key_override(asset, 0, 9, "sideways").error().code == ErrorCode::invalid_argument);
+        CHECK(library->set_key_override(asset, 7, 9, "minor").error().code == ErrorCode::not_found);
         const auto head = library->asset(asset)->value().current_revision_id;
         REQUIRE(library->restore_revision(asset, *first, head).has_value());
         SearchRequest request;
@@ -1303,9 +1334,118 @@ TEST_SUITE("import") {
         CHECK(rows->front().source_missing);
         CHECK_FALSE(rows->front().deleted);
         CHECK_FALSE(library->mark_sources_missing(temporary.path() / "not a root", {}).has_value());
+        // The library's own folder is never a source (code-library-19).
+        auto own = library->import_paths({library->root() / "objects"});
+        REQUIRE(own.has_value());
+        CHECK(own->counts.failed == 1);
+        CHECK(own->counts.imported == 0);
+#ifdef _WIN32
+        // Another spelling of the same folder is the same source root (code-library-19).
+        {
+            auto upper_folder = folder.native();
+            std::ranges::transform(upper_folder, upper_folder.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towupper(c)); });
+            REQUIRE(library->import_paths({std::filesystem::path(upper_folder)}).has_value());
+            CHECK(library->source_roots()->size() == 1);
+        }
+        // A hint may spell the folder differently: Windows paths match case-insensitively.
+        write_bytes(folder / "a2.mid", phrase_smf(Phrase{}.set_pitches({70, 71})));
+        auto spelled = library->import_paths({folder / "a2.mid"}, follow);
+        REQUIRE(spelled.has_value());
+        const auto a2 = only_asset(*spelled, "a2.mid");
+        std::filesystem::remove(folder / "a2.mid");
+        auto upper = folder.native();
+        std::ranges::transform(upper, upper.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towupper(c)); });
+        CHECK(*library->mark_sources_missing(folder, {std::filesystem::path(upper) / L"SUB" / L".." / L"A2.MID"}) == 1);
+        CHECK(library->browse_rows_for({a2})->front().source_missing);
+#endif
         // The file coming back makes the location present again.
         write_bytes(folder / "sub" / "b.mid", phrase_smf(Phrase{}.set_pitches({60, 62, 64})));
         REQUIRE(library->import_paths({folder / "sub" / "b.mid"}, follow).has_value());
         CHECK_FALSE(library->browse_rows_for({asset})->front().source_missing);
+    }
+}
+
+TEST_SUITE("import") {
+    TEST_CASE("paths inside a folder are found after normalizing, case-insensitively on Windows (review_7)") {
+        const std::filesystem::path root = std::filesystem::path("C:/Music") / "Folder";
+        CHECK(relative_inside(root / "a" / "b.mid", root) == std::filesystem::path("a") / "b.mid");
+        CHECK(relative_inside(root / "x" / ".." / "b.mid", root) == std::filesystem::path("b.mid"));
+        CHECK(relative_inside(root, root) == std::filesystem::path());
+        CHECK_FALSE(relative_inside(std::filesystem::path("C:/Music") / "Folder2" / "b.mid", root).has_value());
+        CHECK_FALSE(relative_inside(std::filesystem::path("C:/Music") / "b.mid", root).has_value());
+#ifdef _WIN32
+        CHECK(relative_inside(std::filesystem::path("c:/MUSIC/folder/B.mid"), root) == std::filesystem::path("B.mid"));
+#else
+        CHECK_FALSE(relative_inside(std::filesystem::path("C:/MUSIC/folder/B.mid"), root).has_value());
+#endif
+    }
+}
+
+TEST_SUITE("catalog") {
+    TEST_CASE("reopening: interrupted jobs are queued again, an unfinished restore is refused, verify is read-only") {
+        test::TemporaryDirectory temporary;
+        const auto root = temporary.path() / "library";
+        std::int64_t job = 0;
+        {
+            auto library = make_library(root);
+            job = library->enqueue_job("analyze", "analyze-crash", "{}").value();
+            auto leased = library->lease_job();
+            REQUIRE(leased.has_value());
+            REQUIRE(leased->has_value());
+            CHECK((*leased)->id == job);
+            CHECK_FALSE(library->lease_job()->has_value()); // running: not leased twice
+        } // a crash while running
+        {
+            auto reopened = Library::open(root);
+            REQUIRE(reopened.has_value());
+            auto again = (*reopened)->lease_job();
+            REQUIRE(again.has_value());
+            REQUIRE(again->has_value());
+            CHECK((*again)->id == job); // spec 28.1 (code-library-24)
+        }
+        // Verification does not need (or use) write access (code-library-32).
+        std::filesystem::permissions(root / "library.sqlite", std::filesystem::perms::owner_write |
+                                                                  std::filesystem::perms::group_write |
+                                                                  std::filesystem::perms::others_write,
+                                     std::filesystem::perm_options::remove);
+        auto verified = verify_library(root);
+        std::filesystem::permissions(root / "library.sqlite", std::filesystem::perms::owner_write,
+                                     std::filesystem::perm_options::add);
+        REQUIRE_MESSAGE(verified, (verified ? "" : verified.error().describe()));
+        CHECK(verified->ok());
+        // A directory with the INCOMPLETE marker of an unfinished restore is not opened (code-library-20).
+        write_bytes(root / "INCOMPLETE", Bytes{'x'});
+        auto incomplete = Library::open(root);
+        REQUIRE_FALSE(incomplete.has_value());
+        CHECK(incomplete.error().code == ErrorCode::invalid_data);
+    }
+}
+
+TEST_SUITE("catalog") {
+    TEST_CASE("search as you type: the last bare word matches as a prefix, in SQL and in the browse index (code-library-28)") {
+        test::TemporaryDirectory temporary;
+        auto library = make_library(temporary.path() / "library");
+        write_bytes(temporary.path() / "in" / "rising lead.mid", phrase_smf(Phrase{}.set_name("Rising Lead")));
+        REQUIRE(library->import_paths({temporary.path() / "in"}).has_value());
+        REQUIRE(library->populate_synthetic(300, 4).has_value());
+        const auto ids = [&](const std::string& text, bool prefix, bool index) {
+            SearchRequest request;
+            request.query_text = text;
+            request.prefix_last_word = prefix;
+            request.use_browse_index = index;
+            return sorted(all_ids(*library, request, 50));
+        };
+        const auto exact_lead = ids("lead", false, false);
+        REQUIRE_FALSE(exact_lead.empty());
+        CHECK(ids("lea", false, false).empty()); // whole words without the flag (the CLI)
+        CHECK(ids("lea", true, false) == exact_lead);
+        CHECK(ids("lea ", true, false).empty()); // a finished word is exact
+        CHECK(ids("\"lea\"", true, false).empty()); // so is a phrase
+        CHECK_FALSE(ids("rising le", true, false).empty());
+        REQUIRE(library->build_browse_index()->ready);
+        for (const auto* text : {"lea", "rising le", "title:ris", "bass gro", "lea bpm:100..140", "NOT lea", "le"}) {
+            CAPTURE(text);
+            CHECK(ids(text, true, true) == ids(text, true, false)); // identical semantics
+        }
     }
 }

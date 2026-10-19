@@ -36,7 +36,7 @@ literally (Unicode is fine).
 | `library analyze --library DIR [--profile all\|fingerprints\|motif]` | Builds summaries, fingerprints and motif indexes |
 | `library backup --library DIR --output DIR` | Consistent verified backup with manifest |
 | `library verify --library DIR [--objects]` | Integrity, foreign keys, object hashes (read-only) |
-| `library repair --library DIR [--rebuild-fts] [--rebuild-derived]` | Safety backup, then rebuilds the full-text index and/or drops the derived indexes (fingerprints, motif, features) so the next `library analyze` rebuilds them |
+| `library repair --library DIR [--rebuild-fts] [--rebuild-derived]` | Catalog safety copy, then rebuilds the full-text index and/or drops the derived indexes (fingerprints, motif, features) so the next `library analyze` rebuilds them |
 | `library gc --library DIR [--grace-days D]` | Removes objects no revision references (and stray files in `objects/`) once older than the grace period (default 30 days); suspended while a backup runs |
 | `devices` | Audio endpoints and MIDI ports with stable IDs |
 | `capabilities` | Build ID, compiler, Qt, dependency versions, SQLite options, backends, parser isolation |

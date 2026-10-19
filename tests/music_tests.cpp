@@ -436,6 +436,14 @@ TEST_SUITE("progression") {
         CHECK(after.sequences.front().recipes.front().tool_id == "progression");
         CHECK(notes_of(after).size() == preview->report.created);
         CHECK(semantic_hash(applied(after, invert(preview->changes))) == semantic_hash(document));
+        // The stored recipe regenerates the same notes (code-core-15): on the source it was
+        // recorded from it replays exactly; on the result the source changed, so it needs consent.
+        const auto& recipe = after.sequences.front().recipes.front();
+        const auto replayed = replay_recipe(document, recipe, false);
+        REQUIRE_MESSAGE(replayed, (replayed ? "" : replayed.error().describe()));
+        CHECK(notes_of(run(document, *replayed)) == notes_of(after));
+        CHECK(replay_recipe(after, recipe, false).error().code == ErrorCode::conflict);
+        CHECK(replay_recipe(after, recipe, true).has_value());
     }
 }
 
@@ -895,6 +903,12 @@ TEST_SUITE("transform") {
         scale_region.start_tick = 960;
         scale_region.end_tick = 1920;
         document.sequences.front().scale_regions.push_back(scale_region);
+        RecordingTake take; // recording evidence of this sequence's track (code-core-14)
+        take.id = TakeId::generate();
+        take.track = document.sequences.front().tracks.front().id;
+        take.start_tick = 960;
+        take.end_tick = 3840;
+        document.takes.push_back(take);
         const auto preview = change_sequence_ppq(document, document.sequences.front().id, 96);
         REQUIRE(preview.has_value());
         CHECK(preview->report.clipped == 1);
@@ -906,6 +920,10 @@ TEST_SUITE("transform") {
         CHECK(sequence.regions.front().end_tick == 144);
         CHECK(sequence.scale_regions.front().start_tick == 96);
         CHECK(sequence.tracks.front().end_tick == 192);
+        REQUIRE(after.takes.size() == 1);
+        CHECK(after.takes.front().id == take.id);
+        CHECK(after.takes.front().start_tick == 96);
+        CHECK(after.takes.front().end_tick == 384);
         CHECK(semantic_hash(applied(after, invert(preview->changes))) == semantic_hash(document));
     }
 

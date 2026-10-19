@@ -75,8 +75,10 @@ public:
                        std::shared_ptr<document::RecoveryJournal> journal = nullptr, bool journal_prepared = false);
     [[nodiscard]] EditorTab* current_tab() const;
     /// Offers recoverable sessions left by a crash (section 5.5).
-    void offer_recovery();
-    void present_recovery(std::vector<document::RecoverableSession> sessions);
+    /// `asked`: from the File menu (an empty result is then reported).
+    void offer_recovery(bool asked = false);
+    /// Shows the dialog when there is crashed work; returns whether it did.
+    bool present_recovery(std::vector<document::RecoverableSession> sessions);
     /// Opens an in-memory document in a tab after its recovery journal (whose first checkpoint
     /// serializes the whole document) was created on the I/O thread; `opened` runs with the tab.
     void open_prepared(DocumentData document, bool recovered, std::function<void(EditorTab*)> opened = {});
@@ -114,6 +116,10 @@ private:
     void update_command_state();
     void update_status_from_transport();
     void flush_recovery();
+    /// The recovery readout for the current document (switching tabs updates it at once).
+    void update_recovery_label();
+    /// "<document>[*] - MIDI Workbench" for the current tab.
+    void update_window_title();
     /// Saves the current tab; `blocking` waits for durable completion (used when closing).
     bool save_current(bool save_as, bool blocking = false);
     bool save_tab(EditorTab* tab, bool save_as, bool blocking);
@@ -122,6 +128,8 @@ private:
     void export_current_midi();
     void close_tab(int index);
     bool confirm_close(EditorTab* tab);
+    /// Waits for the tab's background save in a modal progress loop; returns its error text.
+    QString wait_for_save_modal(EditorTab* tab);
     void apply_layout(const QString& name);
     void reset_layout();
     void show_command_palette(const QString& query = {});

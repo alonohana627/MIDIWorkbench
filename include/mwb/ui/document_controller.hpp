@@ -122,6 +122,8 @@ signals:
     void dirty_changed(bool dirty);
     /// A command was rejected; the message names the operation and the reason.
     void edit_rejected(const QString& message);
+    /// The undo memory budget dropped the oldest undo steps (section 21.1 history boundary).
+    void history_trimmed();
     /// A background save finished; `error` is empty on durable success.
     void save_finished(const QString& error);
     void recovery_flushed(const QString& error);

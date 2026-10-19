@@ -9,6 +9,8 @@
 #include "mwb/core/note_edit.hpp"
 #include "mwb/core/pitch.hpp"
 #include "mwb/document/native_format.hpp"
+#include "mwb/document/file_system.hpp"
+#include "mwb/library/storage.hpp"
 #include "mwb/document/recovery.hpp"
 #include "mwb/document/session.hpp"
 #include "mwb/midi/codec.hpp"
@@ -19,6 +21,7 @@
 #include "mwb/ui/command_palette.hpp"
 #include "mwb/ui/document_controller.hpp"
 #include "mwb/ui/drag_export.hpp"
+#include "mwb/ui/drum_grid.hpp"
 #include "mwb/ui/editor_tab.hpp"
 #include "mwb/ui/event_list.hpp"
 #include "mwb/ui/inspector.hpp"
@@ -29,6 +32,10 @@
 #include "mwb/ui/tempo_field.hpp"
 
 #include <QApplication>
+#include <QDesktopServices>
+#include <QLocale>
+#include <QProgressDialog>
+#include <QEventLoop>
 #include <QClipboard>
 #include <QDateTime>
 #include <QCloseEvent>
@@ -144,9 +151,11 @@ DocumentData template_document(const QString& name) {
 MainWindow::MainWindow(StartupOptions options, app::DataDirectories directories, QWidget* parent)
     : QMainWindow(parent), options_(std::move(options)), directories_(std::move(directories)) {
     setWindowTitle(tr("MIDI Workbench"));
+    // Below this the roll is squeezed between the panels and status messages overlap the
+    // readouts (ux-visual-22).
+    setMinimumSize(1024, 640);
     setDockNestingEnabled(true);
     setAcceptDrops(true); // .mid/.midi/.rmi/.mwb files can be dropped in (section 14.3)
-    clean_drag_cache(directories_.drag_cache);
     tabs_ = new QTabWidget(this);
     tabs_->setTabsClosable(true);
     tabs_->setMovable(true);
@@ -183,6 +192,9 @@ MainWindow::MainWindow(StartupOptions options, app::DataDirectories directories,
     build_docks();
     library_->set_drag_cache(directories_.drag_cache);
     io_thread_ = std::make_unique<TaskThread>();
+    // Old drag files are removed off the GUI thread: a slow or network profile never delays the
+    // window (section 19.4, code-uiA-27).
+    io_thread_->post([cache = directories_.drag_cache](std::stop_token) { clean_drag_cache(cache); });
     parser_ = std::make_shared<app::WorkerParser>(to_path(QCoreApplication::applicationDirPath()) / "mwb-worker.exe");
     import_parser_ = std::make_shared<app::WorkerParser>(to_path(QCoreApplication::applicationDirPath()) / "mwb-worker.exe");
     const auto bind = [](std::shared_ptr<app::WorkerParser> parser) {
@@ -277,6 +289,9 @@ MainWindow::MainWindow(StartupOptions options, app::DataDirectories directories,
                                      .arg(QString::fromStdString(pitch_name(static_cast<std::uint8_t>(root))))
                                      .arg(velocity),
                                  3000);
+        // The on-screen keyboard shows the octaves the letter keys now play (ux-editing-33).
+        if (auto* tab = current_tab())
+            tab->keyboard().set_view_start(std::clamp(root - 12, 0, 127));
     });
     transport_timer_.setInterval(33); // display sampling only (section 13.4)
     connect(&transport_timer_, &QTimer::timeout, this, &MainWindow::update_status_from_transport);
@@ -310,7 +325,7 @@ MainWindow::MainWindow(StartupOptions options, app::DataDirectories directories,
         new_from_template("blank"); // with files, a blank appears only if every open fails
     update_status_from_transport(); // the position readout is filled before the first timer tick
     if (!options_.skip_recovery_prompt && !options_.exit_when_ready)
-        QTimer::singleShot(0, this, &MainWindow::offer_recovery);
+        QTimer::singleShot(0, this, [this] { offer_recovery(false); });
     if (options_.exit_when_ready || !options_.screenshot.empty())
         QTimer::singleShot(0, this, &MainWindow::write_screenshot_and_exit);
 }
@@ -322,6 +337,18 @@ MainWindow::~MainWindow() {
     // before the service (a member) goes, not later with the child objects.
     delete recording_;
     recording_ = nullptr;
+    // Children are deleted after the members, playback_ among them: nothing that calls into
+    // playback_ may still be connected then (code-uiA-15).
+    if (computer_keyboard_)
+        disconnect(computer_keyboard_, nullptr, this, nullptr);
+    for (int index = 0; index < tabs_->count(); ++index)
+        if (auto* tab = qobject_cast<EditorTab*>(tabs_->widget(index))) {
+            disconnect(&tab->piano_roll(), nullptr, this, nullptr);
+            disconnect(&tab->keyboard(), nullptr, this, nullptr);
+            disconnect(tab, nullptr, this, nullptr);
+        }
+    if (tempo_multiplier_)
+        disconnect(tempo_multiplier_, nullptr, this, nullptr);
     playback_->panic(false);
     io_thread_.reset(); // joins a pending open or export
     drain_recovery_thread(); // queued clean closes land before the process ends
@@ -370,7 +397,7 @@ void MainWindow::build_actions() {
     add_command("file.export_midi", tr("&Export MIDI…"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_E),
                 [this] { export_current_midi(); });
     add_command("file.close", tr("&Close Document"), QKeySequence::Close, [this] { close_tab(tabs_->currentIndex()); });
-    add_command("file.recover", tr("Recover Sessions…"), {}, [this] { offer_recovery(); });
+    add_command("file.recover", tr("Recover Sessions…"), {}, [this] { offer_recovery(true); });
     add_command("file.quit", tr("E&xit"), QKeySequence::Quit, [this] { close(); });
 
     undo_action_ = add_command("edit.undo", tr("&Undo"), QKeySequence(Qt::CTRL | Qt::Key_Z),
@@ -407,6 +434,24 @@ void MainWindow::build_actions() {
                 [this] { move_selection_by_grid(-1); });
     add_command("edit.move_right", tr("Move Notes or Play Position Right"), QKeySequence(Qt::Key_Right),
                 [this] { move_selection_by_grid(1); });
+    // Keyboard selection and length (ux-editing-26): Alt+Left/Right step through the notes,
+    // Shift+Left/Right change the selected notes' length by the grid.
+    add_command("edit.select_previous_note", tr("Select Previous Note"), QKeySequence(Qt::ALT | Qt::Key_Left), [this] {
+        if (auto* tab = current_tab())
+            tab->piano_roll().select_adjacent_note(-1);
+    });
+    add_command("edit.select_next_note", tr("Select Next Note"), QKeySequence(Qt::ALT | Qt::Key_Right), [this] {
+        if (auto* tab = current_tab())
+            tab->piano_roll().select_adjacent_note(1);
+    });
+    add_command("edit.shorten", tr("Shorten Notes by Grid"), QKeySequence(Qt::SHIFT | Qt::Key_Left), [this] {
+        if (auto* tab = current_tab())
+            tab->piano_roll().change_length_by_grid(-1);
+    });
+    add_command("edit.lengthen", tr("Lengthen Notes by Grid"), QKeySequence(Qt::SHIFT | Qt::Key_Right), [this] {
+        if (auto* tab = current_tab())
+            tab->piano_roll().change_length_by_grid(1);
+    });
     // Ctrl+Left/Right always move the play position (Space then plays from there), whether or not
     // notes are selected. The step follows the zoom and grows while the key is held.
     add_command("transport.position_left", tr("Play Position Left"), QKeySequence(Qt::CTRL | Qt::Key_Left),
@@ -449,14 +494,19 @@ void MainWindow::build_actions() {
     add_command("view.drum_grid", tr("Toggle Drum Grid"), QKeySequence(Qt::CTRL | Qt::Key_G), with_tab([](EditorTab& tab) { tab.show_drum_grid(!tab.showing_drum_grid()); }));
     add_command("view.add_cc_lane", tr("Add Controller Lane…"), {}, with_tab([this](EditorTab& tab) {
         bool ok_value = false;
-        const QStringList kinds = {tr("CC number…"), tr("Pitch bend"), tr("Channel pressure"), tr("Release velocity")};
+        // Velocity can come back after it was removed; lanes start on the track's own channel
+        // (r5ui-16).
+        const QStringList kinds = {tr("CC number…"), tr("Pitch bend"), tr("Channel pressure"), tr("Release velocity"),
+                                   tr("Velocity")};
         const QString kind = QInputDialog::getItem(this, tr("Add lane"), tr("Lane"), kinds, 0, false, &ok_value);
         if (!ok_value)
             return;
         LaneTarget target;
         const auto selected = tab.controller().selected_notes();
-        target.channel = selected.empty() ? 0 : selected.front().channel;
-        if (kind == kinds[0]) {
+        target.channel = selected.empty() ? default_channel_for(tab.controller()) : selected.front().channel;
+        if (kind == kinds[4]) {
+            target.kind = LaneTarget::Kind::velocity;
+        } else if (kind == kinds[0]) {
             target.kind = LaneTarget::Kind::controller;
             target.controller = static_cast<std::uint8_t>(QInputDialog::getInt(this, tr("Controller"), tr("CC number"), 1, 0, 127, 1, &ok_value));
             if (!ok_value)
@@ -666,8 +716,10 @@ void MainWindow::build_actions() {
             QStringList names{tr("None")};
             for (const auto& [id, name] : ports)
                 names << name;
+            // The input in use is preselected, not "None" (ux-panels-42).
+            const int current = std::max<int>(0, static_cast<int>(names.indexOf(recording_->input_name())));
             bool chosen = false;
-            const QString name = QInputDialog::getItem(this, tr("MIDI Input"), tr("Input device"), names, 0, false, &chosen);
+            const QString name = QInputDialog::getItem(this, tr("MIDI Input"), tr("Input device"), names, current, false, &chosen);
             if (!chosen)
                 return;
             QString id;
@@ -829,8 +881,24 @@ void MainWindow::build_docks() {
     library_dock_->setObjectName("dock.library");
     library_dock_->setWidget(library_);
     addDockWidget(Qt::LeftDockWidgetArea, library_dock_);
+    connect(library_, &LibraryPanel::opened, this, [this](bool) { update_command_state(); });
     connect(library_, &LibraryPanel::open_requested, this,
             [this](DocumentData document, qint64 asset, qint64 revision, std::optional<TimeRange> reveal) {
+                // An item already open is shown, not opened again: two tabs saving revisions of one
+                // item would conflict (ux-panels-33). A melody hit still moves to its match.
+                for (int index = 0; index < tabs_->count(); ++index) {
+                    auto* existing = qobject_cast<EditorTab*>(tabs_->widget(index));
+                    const auto source = library_sources_.find(existing);
+                    if (!existing || source == library_sources_.end() || source->second.first != asset)
+                        continue;
+                    tabs_->setCurrentWidget(existing);
+                    if (reveal) {
+                        existing->controller().set_edit_cursor(reveal->begin);
+                        existing->piano_roll().scroll_to_tick(reveal->begin);
+                    }
+                    statusBar()->showMessage(tr("This library item is already open"), 4000);
+                    return;
+                }
                 open_prepared(std::move(document), false, [this, asset, revision, reveal](EditorTab* tab) {
                     library_sources_[tab] = {asset, revision};
                     if (!reveal)
@@ -906,8 +974,12 @@ void MainWindow::build_docks() {
     events_dock_->hide();
     connect(events_dock_, &QDockWidget::visibilityChanged, this, [this](bool visible) {
         auto* tab = current_tab();
-        if (visible && tab && !events_dock_->widget())
+        if (visible && tab && !events_dock_->widget()) {
             events_dock_->setWidget(new EventListPanel(tab->controller(), events_dock_));
+            // Opens with room for about ten events, not two (ux-visual-24).
+            if (events_dock_->height() < 200)
+                resizeDocks({events_dock_}, {240}, Qt::Vertical);
+        }
         else if (!visible && events_dock_->widget()) {
             auto* old = events_dock_->widget();
             events_dock_->setWidget(nullptr);
@@ -1177,6 +1249,21 @@ void MainWindow::open_document(DocumentData document, std::optional<std::filesys
 }
 
 bool MainWindow::open_path(const std::filesystem::path& path) {
+    // A document that is already open is shown, not opened twice: two tabs saving to one file
+    // would overwrite each other's changes (code-uiA-28).
+    std::error_code absolute_error;
+    const auto wanted = std::filesystem::absolute(path, absolute_error);
+    for (int index = 0; index < tabs_->count(); ++index) {
+        auto* tab = qobject_cast<EditorTab*>(tabs_->widget(index));
+        if (!tab || tab->controller().file_path().empty())
+            continue;
+        const auto same = library::relative_inside(wanted, std::filesystem::absolute(tab->controller().file_path(), absolute_error));
+        if (same && same->empty()) {
+            tabs_->setCurrentWidget(tab);
+            statusBar()->showMessage(tr("%1 is already open").arg(to_qstring(path.filename())), 4000);
+            return true;
+        }
+    }
     // Reading and parsing (in the worker process) happen on the I/O thread; the tab opens when
     // the result arrives, and the window keeps responding meanwhile.
     ++pending_opens_;
@@ -1207,6 +1294,16 @@ bool MainWindow::open_path(const std::filesystem::path& path) {
             [guard, path, opened, journal] {
                 if (guard)
                     guard->finish_open(path, std::move(*opened), journal);
+            },
+            Qt::QueuedConnection);
+    }, [guard, path] {
+        // The task threw (an unwrapped storage exception): the open still finishes, as a failure,
+        // so pending_opens_ never stays raised (code-uiA-23).
+        QMetaObject::invokeMethod(
+            qApp,
+            [guard, path] {
+                if (guard)
+                    guard->finish_open(path, make_error(ErrorCode::internal, "the file could not be opened"), nullptr);
             },
             Qt::QueuedConnection);
     });
@@ -1253,18 +1350,44 @@ void MainWindow::connect_tab(EditorTab* tab) {
             tabs_->setTabText(index, QString::fromStdString(tab->controller().document().title) +
                                          (tab->controller().is_dirty() ? "*" : ""));
     });
-    connect(&controller, &DocumentController::dirty_changed, this, [this, tab](bool dirty) {
+    // The tab text, its close button's tooltip and accessible name follow the title and dirty
+    // state (a renamed document is not announced under its old name, code-uiA-34).
+    const auto refresh_label = [this, tab] {
         const int index = tabs_->indexOf(tab);
-        if (index >= 0)
-            tabs_->setTabText(index, QString::fromStdString(tab->controller().document().title) + (dirty ? "*" : ""));
-    });
+        if (index < 0)
+            return;
+        const QString title = QString::fromStdString(tab->controller().document().title);
+        tabs_->setTabText(index, title + (tab->controller().is_dirty() ? "*" : ""));
+        // The tab names its file; the window title (taskbar, Alt+Tab, screen readers) names the
+        // current document and its unsaved state (ux-visual-21/30).
+        const auto& path = tab->controller().file_path();
+        tabs_->setTabToolTip(index, path.empty() ? tr("%1 (not saved to a file)").arg(title) : to_qstring(path));
+        if (tab == current_tab())
+            update_window_title();
+        if (auto* close = tabs_->tabBar()->tabButton(index, QTabBar::RightSide)) {
+            close->setToolTip(tr("Close %1").arg(title));
+            close->setAccessibleName(tr("Close %1").arg(title));
+        }
+    };
+    connect(&controller, &DocumentController::dirty_changed, this, refresh_label);
+    connect(&controller, &DocumentController::document_changed, this, refresh_label);
     connect(&controller, &DocumentController::selection_changed, this, &MainWindow::update_command_state);
     connect(&controller, &DocumentController::save_finished, this, [this, tab](const QString& error) {
         if (!error.isEmpty()) {
             QMessageBox::warning(this, tr("Save"), tr("The document was not saved:\n%1").arg(error));
             return;
         }
-        statusBar()->showMessage(tr("Saved %1").arg(to_qstring(tab->controller().file_path().filename())), 4000);
+        const auto path = tab->controller().file_path();
+        // A network or removable target is saved, but the user is told the limitation and the
+        // recovery session stays as a second copy (spec 21.3, code-document-22).
+        if (const auto limitation = document::file_system::destination_limitation(path)) {
+            statusBar()->showMessage(tr("Saved %1. %2").arg(to_qstring(path.filename()), QString::fromStdString(*limitation)), 10000);
+            return;
+        }
+        statusBar()->showMessage(tr("Saved %1").arg(to_qstring(path.filename())), 4000);
+    });
+    connect(&controller, &DocumentController::history_trimmed, this, [this] {
+        statusBar()->showMessage(tr("Undo history reached its memory budget: the oldest steps can no longer be undone"), 8000);
     });
     connect(&controller, &DocumentController::edit_rejected, this,
             [this](const QString& message) { statusBar()->showMessage(message, 8000); });
@@ -1289,6 +1412,8 @@ void MainWindow::connect_tab(EditorTab* tab) {
                                    .arg(QString::fromStdString(pitch_name(static_cast<std::uint8_t>(std::clamp(pitch, 0, 127)))))
                                    .arg(pitch));
     });
+    // The readout never shows a stale position after the pointer left the roll (ux-panels-43).
+    connect(&view, &PianoRollView::hover_left, this, [this] { cursor_label_->setText(tr("Pointer: —")); });
     const auto preset = [tab]() {
         const auto active = tab->controller().active_track_index();
         return active ? tab->controller().active_sequence().tracks[*active].instrument.synth_preset : std::string("classic");
@@ -1297,6 +1422,12 @@ void MainWindow::connect_tab(EditorTab* tab) {
         playback_->audition_note_on(pitch, velocity, 0, preset());
     });
     connect(&view, &PianoRollView::audition_note_off, this, [this](int pitch) { playback_->audition_note_off(pitch, 0); });
+    // Setting a drum step plays it, on the track's channel and instrument (ux-editing-21).
+    connect(&tab->drum_grid(), &DrumGridView::audition_note_on, this, [this, tab, preset](int pitch, int velocity) {
+        playback_->audition_note_on(pitch, velocity, default_channel_for(tab->controller()), preset());
+    });
+    connect(&tab->drum_grid(), &DrumGridView::audition_note_off, this,
+            [this, tab](int pitch) { playback_->audition_note_off(pitch, default_channel_for(tab->controller())); });
     connect(&tab->keyboard(), &KeyboardWidget::note_on, this, [this, preset](int pitch, int velocity) {
         playback_->audition_note_on(pitch, velocity, 0, preset());
         recording_->live_note(pitch, velocity, true);
@@ -1307,8 +1438,24 @@ void MainWindow::connect_tab(EditorTab* tab) {
     });
 }
 
+void MainWindow::update_window_title() {
+    auto* tab = current_tab();
+    if (!tab) {
+        setWindowTitle(tr("MIDI Workbench"));
+        setWindowModified(false);
+        return;
+    }
+    setWindowTitle(tr("%1[*] - MIDI Workbench").arg(QString::fromStdString(tab->controller().document().title)));
+    setWindowModified(tab->controller().is_dirty());
+}
+
 void MainWindow::current_tab_changed() {
     auto* tab = current_tab();
+    update_window_title();
+    if (cursor_label_)
+        cursor_label_->setText(tr("Pointer: —")); // the previous tab's position is not this one's
+    if (recovery_label_)
+        update_recovery_label();
     inspector_->set_controller(tab ? &tab->controller() : nullptr);
     recording_->set_target(tab ? &tab->controller() : nullptr, tab ? &tab->keyboard() : nullptr);
     drag_handle_->set_controller(tab ? &tab->controller() : nullptr);
@@ -1388,6 +1535,19 @@ void MainWindow::update_command_state() {
             action->setEnabled(enabled);
             action->setToolTip(enabled ? QString() : tr("Select notes first"));
         }
+        // Library commands say what they need instead of silently doing nothing (ux-panels-36).
+        if (id.startsWith("library.") && library_) {
+            const bool open = library_->is_open();
+            const bool selection_needed = id == "library.save_selection" || id == "library.find_melody" ||
+                                          id == "library.find_similar";
+            const bool has_selection = has_tab && !tab->controller().selection().empty();
+            const bool enabled = open && (!selection_needed || has_selection) && (id == "library.revisions" || has_tab);
+            action->setEnabled(enabled);
+            action->setToolTip(enabled            ? QString()
+                               : !open            ? tr("Open or create a library first (Open Library… or New Library… in the library panel)")
+                               : selection_needed ? tr("Select notes first")
+                                                  : QString());
+        }
     }
     if (transport_bar_)
         refresh_tooltips();
@@ -1413,8 +1573,16 @@ bool MainWindow::save_tab(EditorTab* tab, bool save_as, bool blocking) {
         statusBar()->showMessage(tr("A save of this document is still in progress"), 4000);
         return false;
     }
-    if (blocking || options_.exit_when_ready || isHidden()) {
-        // Closing the window must not race a background save.
+    if (blocking && !options_.exit_when_ready && !isHidden()) {
+        // Closing waits for the durable save, but in the modal progress loop, not by blocking the
+        // GUI thread; a failure is reported by the save_finished handler (code-uiA-13).
+        QPointer<EditorTab> guard(tab);
+        controller.save_native_async(path);
+        const QString error = wait_for_save_modal(tab);
+        return guard && error.isEmpty() && !controller.saving();
+    }
+    if (options_.exit_when_ready || isHidden()) {
+        // No event loop to wait in (headless runs, a hidden window): a direct save.
         QString error;
         if (!controller.save_native(path, &error)) {
             QMessageBox::warning(this, tr("Save"), tr("The document was not saved:\n%1").arg(error));
@@ -1476,8 +1644,35 @@ void MainWindow::export_current_midi() {
     });
 }
 
+QString MainWindow::wait_for_save_modal(EditorTab* tab) {
+    // The GUI never blocks on the file system (section 19.4, code-uiA-13): a small modal
+    // "Saving..." window keeps the event loop (and painting) running until the background save
+    // reports, and the user cannot start another action meanwhile.
+    auto& controller = tab->controller();
+    if (!controller.saving())
+        return {};
+    QString error;
+    QEventLoop loop;
+    const auto connection = connect(&controller, &DocumentController::save_finished, &loop, [&](const QString& text) {
+        error = text;
+        loop.quit();
+    });
+    QProgressDialog progress(tr("Saving %1…").arg(QString::fromStdString(controller.document().title)), QString(), 0, 0,
+                             this);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setCancelButton(nullptr);
+    progress.setMinimumDuration(400); // quick saves never flash a window
+    if (controller.saving())
+        loop.exec();
+    disconnect(connection);
+    return error;
+}
+
 bool MainWindow::confirm_close(EditorTab* tab) {
-    tab->controller().wait_for_save(); // a save in flight lands (or fails) before the question
+    QPointer<EditorTab> waited(tab);
+    std::ignore = wait_for_save_modal(tab); // a save in flight lands (or fails) before the question
+    if (!waited)
+        return false;
     if (!tab->controller().is_dirty())
         return true;
     QPointer<EditorTab> guard(tab);
@@ -1541,14 +1736,25 @@ void MainWindow::flush_recovery() {
     for (int index = 0; index < tabs_->count(); ++index)
         if (auto* tab = qobject_cast<EditorTab*>(tabs_->widget(index)))
             tab->controller().flush_recovery_async();
-    if (auto* tab = current_tab(); tab && tab->controller().recovery_journal()) {
-        const auto ms = tab->controller().recovery_journal()->last_durable_ms();
-        const QString& error = tab->controller().recovery_error();
-        recovery_label_->show();
-        recovery_label_->setText(error.isEmpty()
-                                     ? tr("Recovery saved %1").arg(QDateTime::fromMSecsSinceEpoch(ms).toString("HH:mm:ss"))
-                                     : tr("! Recovery not saved: %1").arg(error));
+    update_recovery_label();
+}
+
+void MainWindow::update_recovery_label() {
+    auto* tab = current_tab();
+    if (!tab)
+        return;
+    recovery_label_->show();
+    // Always about the current document: a tab without a journal never shows another tab's time
+    // (code-uiA-19).
+    if (!tab->controller().recovery_journal()) {
+        recovery_label_->setText(tr("! Recovery unavailable for this document"));
+        return;
     }
+    const auto ms = tab->controller().recovery_journal()->last_durable_ms();
+    const QString& error = tab->controller().recovery_error();
+    recovery_label_->setText(error.isEmpty()
+                                 ? tr("Recovery saved %1").arg(QDateTime::fromMSecsSinceEpoch(ms).toString("HH:mm:ss"))
+                                 : tr("! Recovery not saved: %1").arg(error));
 }
 
 void MainWindow::open_prepared(DocumentData document, bool recovered, std::function<void(EditorTab*)> opened) {
@@ -1576,19 +1782,30 @@ void MainWindow::open_prepared(DocumentData document, bool recovered, std::funct
                         opened(tab);
             },
             Qt::QueuedConnection);
+    }, [guard, shared, recovered] {
+        // Creating the journal threw: open the document without recovery rather than never.
+        QMetaObject::invokeMethod(
+            qApp,
+            [guard, shared, recovered] {
+                if (!guard)
+                    return;
+                --guard->pending_opens_;
+                guard->open_document(std::move(*shared), std::nullopt, recovered, nullptr, true);
+            },
+            Qt::QueuedConnection);
     });
 }
 
-void MainWindow::offer_recovery() {
+void MainWindow::offer_recovery(bool asked) {
     // Listing reads SQLite: done on the I/O thread; the dialog appears when the list arrives.
     QPointer<MainWindow> guard(this);
     const auto recovery_directory = directories_.recovery;
-    io_thread_->post([guard, recovery_directory](std::stop_token) {
+    io_thread_->post([guard, recovery_directory, asked](std::stop_token) {
         auto sessions = std::make_shared<Result<std::vector<document::RecoverableSession>>>(
             document::list_recoverable_sessions(recovery_directory));
         QMetaObject::invokeMethod(
             qApp,
-            [guard, sessions] {
+            [guard, sessions, asked] {
                 if (!guard)
                     return;
                 if (!*sessions) {
@@ -1596,40 +1813,64 @@ void MainWindow::offer_recovery() {
                         tr("Could not read recovery data: %1").arg(QString::fromStdString(sessions->error().describe())), 8000);
                     return;
                 }
-                guard->present_recovery(std::move(**sessions));
+                // A damaged or foreign recovery database was set aside and a fresh one started
+                // (code-document-2): said once, so the user knows older crash data was not used.
+                if (const auto notice = document::take_recovery_database_notice())
+                    guard->statusBar()->showMessage(QString::fromStdString(*notice), 12000);
+                const bool offered = guard->present_recovery(std::move(**sessions));
+                // Asked from the File menu: an empty answer is still an answer (ux-panels-40).
+                if (asked && !offered)
+                    QMessageBox::information(guard, tr("Recover Sessions"), tr("There is no unsaved work to recover."));
             },
             Qt::QueuedConnection);
     });
 }
 
-void MainWindow::present_recovery(std::vector<document::RecoverableSession> sessions) {
+bool MainWindow::present_recovery(std::vector<document::RecoverableSession> sessions) {
     // Exclude sessions this process owns.
     std::vector<document::RecoverableSession> candidates;
+    std::vector<Uuid> settled;
     for (const auto& session : sessions) {
         bool own = false;
         for (int index = 0; index < tabs_->count(); ++index)
             if (auto* tab = qobject_cast<EditorTab*>(tabs_->widget(index)); tab && tab->controller().recovery_journal() &&
                                                                               tab->controller().recovery_journal()->session_id() == session.session_id)
                 own = true;
-        if (!own && !session.live) // another running instance's sessions are not crashed work
-            candidates.push_back(session);
+        if (own || session.live) // another running instance's sessions are not crashed work
+            continue;
+        if (!session.has_unsaved_work()) {
+            // Never edited, or saved after its last edit: the file already holds everything, so
+            // it is not offered (code-document-16) and its leftover data is removed.
+            settled.push_back(session.session_id);
+            continue;
+        }
+        candidates.push_back(session);
+    }
+    if (!settled.empty()) {
+        const auto recovery_directory = directories_.recovery;
+        io_thread_->post([recovery_directory, settled](std::stop_token) {
+            for (const auto& session_id : settled)
+                std::ignore = document::discard_recovery_session(recovery_directory, session_id);
+        });
     }
     if (candidates.empty())
-        return;
+        return false;
     QDialog dialog(this);
     dialog.setWindowTitle(tr("Recover unsaved work"));
     auto* layout = new QVBoxLayout(&dialog);
-    layout->addWidget(new QLabel(tr("These sessions were not closed normally. Recovery opens a new unsaved document; "
-                                    "it never replaces a saved file."),
-                                 &dialog));
+    auto* explanation = new QLabel(tr("These sessions were not closed normally. Recovery opens a new unsaved document; "
+                                      "it never replaces a saved file."),
+                                   &dialog);
+    explanation->setWordWrap(true); // the dialog keeps a readable width (ux-visual-26)
+    layout->addWidget(explanation);
     auto* list = new QListWidget(&dialog);
     for (const auto& session : candidates) {
         const QString saved = session.source.last_explicit_save_ms
-                                  ? QDateTime::fromMSecsSinceEpoch(*session.source.last_explicit_save_ms).toString()
+                                  ? QLocale().toString(QDateTime::fromMSecsSinceEpoch(*session.source.last_explicit_save_ms), QLocale::ShortFormat)
                                   : tr("never saved");
         auto* item = new QListWidgetItem(tr("%1 — last durable edit %2, last save %3%4")
                                              .arg(QString::fromStdString(session.source.document_name))
-                                             .arg(QDateTime::fromMSecsSinceEpoch(session.last_durable_edit_ms).toString())
+                                             .arg(QLocale().toString(QDateTime::fromMSecsSinceEpoch(session.last_durable_edit_ms), QLocale::ShortFormat))
                                              .arg(saved)
                                              .arg(session.source.file_path_utf8
                                                       ? " — " + QString::fromStdString(*session.source.file_path_utf8)
@@ -1663,7 +1904,7 @@ void MainWindow::present_recovery(std::vector<document::RecoverableSession> sess
     });
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
     if (dialog.exec() != QDialog::Accepted)
-        return;
+        return true;
     std::vector<Uuid> chosen;
     for (int row = 0; row < list->count(); ++row)
         if (list->item(row)->checkState() == Qt::Checked)
@@ -1714,6 +1955,7 @@ void MainWindow::present_recovery(std::vector<document::RecoverableSession> sess
             std::ignore = document::discard_recovery_session(recovery_directory, session_id); // evidence no longer needed
         }
     });
+    return true;
 }
 
 // --- Editing commands ----------------------------------------------------------------------------
@@ -1731,10 +1973,24 @@ void MainWindow::transpose_selection(int semitones) {
     // The controller's cached pairing of the active sequence: a key press does not re-pair the
     // whole sequence (code-core-2).
     auto preview = music::move_notes(controller.document(), selection, parameters, &controller.notes());
-    if (preview)
-        controller.apply(preview->changes);
-    else
+    if (!preview) {
         statusBar()->showMessage(QString::fromStdString(preview.error().message), 5000);
+        return;
+    }
+    if (!controller.apply(preview->changes))
+        return;
+    // A key transpose is heard like a mouse move (ux-editing-26): the top selected note, briefly.
+    const auto moved = controller.selected_notes();
+    if (moved.empty())
+        return;
+    const auto top = std::ranges::max_element(moved, {}, &NoteSpan::pitch);
+    const int channel = top->channel;
+    const int pitch = top->pitch;
+    const auto active = controller.active_track_index();
+    const std::string preset =
+        active ? controller.active_sequence().tracks[*active].instrument.synth_preset : std::string("classic");
+    playback_->audition_note_on(pitch, top->velocity, channel, preset);
+    QTimer::singleShot(150, this, [this, pitch, channel] { playback_->audition_note_off(pitch, channel); });
 }
 
 void MainWindow::transpose_selection_by_degree(int degrees) {
@@ -2385,6 +2641,14 @@ std::optional<bool> MainWindow::route_control_key(QKeyEvent& key, QWidget& focus
         key.accept();
         return false;
     }
+    // A number field never takes a space: Space plays even after a click on a spin-box arrow
+    // left the focus there (ux-panels-20).
+    const bool numeric = qobject_cast<QAbstractSpinBox*>(&focus) ||
+                         (focus.parentWidget() && qobject_cast<QAbstractSpinBox*>(focus.parentWidget()));
+    if (space && numeric) {
+        key.ignore(); // not taken by the field: the Play/Stop shortcut fires
+        return true;
+    }
     // Letters and digits are the tool and transport commands: only real text input keeps them.
     // A closed combo would jump to a matching item (a document edit), a table would start renaming.
     const bool character = (code >= Qt::Key_0 && code <= Qt::Key_9) || (code >= Qt::Key_A && code <= Qt::Key_Z) || space;
@@ -2497,7 +2761,11 @@ void MainWindow::show_about() {
                          QString::fromUtf8(notice.homepage.data(), static_cast<qsizetype>(notice.homepage.size())),
                          QString::fromUtf8(notice.license_text.data(), static_cast<qsizetype>(notice.license_text.size())).toHtmlEscaped());
     browser->setHtml(html);
+    // Links open in the browser; the dialog never tries to load a web page itself, which would
+    // replace the license text with an error (ux-panels-41).
     browser->setOpenExternalLinks(false);
+    browser->setOpenLinks(false);
+    connect(browser, &QTextBrowser::anchorClicked, browser, [](const QUrl& url) { QDesktopServices::openUrl(url); });
     layout->addWidget(browser);
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
@@ -2550,6 +2818,9 @@ void MainWindow::show_diagnostics() {
     layout->addWidget(browser);
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    // One click puts the whole report on the clipboard for a support request (ux-panels-41).
+    auto* copy = buttons->addButton(tr("Copy to Clipboard"), QDialogButtonBox::ActionRole);
+    connect(copy, &QPushButton::clicked, browser, [browser] { QApplication::clipboard()->setText(browser->toPlainText()); });
     layout->addWidget(buttons);
     dialog.resize(720, 600);
     dialog.exec();

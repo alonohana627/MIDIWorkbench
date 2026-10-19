@@ -12,9 +12,7 @@ namespace mwb {
 
 namespace {
 
-bool order_less(const Event& a, const Event& b) {
-    return a.tick != b.tick ? a.tick < b.tick : a.order_key < b.order_key;
-}
+constexpr EventOrder order_less{}; // the one (tick, order_key) order (code-core-25)
 
 bool same_slot(const Event& a, const Event& b) { return a.tick == b.tick && a.order_key == b.order_key; }
 

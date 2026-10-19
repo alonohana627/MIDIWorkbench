@@ -13,6 +13,7 @@
 #include <QCoreApplication>
 #include <QMetaObject>
 #include <QCheckBox>
+#include <QAccessible>
 #include <QComboBox>
 #include <QFormLayout>
 #include <QDoubleSpinBox>
@@ -185,7 +186,14 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     start_ = spin(0, INT32_MAX, 0, selection_box);
     length_ = spin(1, INT32_MAX, 240, selection_box);
     pitch_ = spin(0, 127, 60, selection_box);
-    velocity_ = spin(1, 127, 100, selection_box);
+    // The note name follows the typed number at once, not only after commit (ux-panels-21).
+    connect(pitch_, &QSpinBox::valueChanged, pitch_, [this](int value) {
+        pitch_->setSuffix(QString("  (%1)").arg(QString::fromStdString(pitch_name(static_cast<std::uint8_t>(value)))));
+    });
+    velocity_ = spin(0, 127, 100, selection_box);
+    // 0 is not a note velocity: it stands for "the selected notes differ" (uiB-33), so typing the
+    // first note's value still sets them all.
+    velocity_->setSpecialValueText(tr("mixed"));
     channel_ = spin(1, 16, 1, selection_box); // displayed 1-16
     selection_form->addRow(tr("Start"), start_);
     selection_form->addRow(tr("Length"), length_);
@@ -228,7 +236,9 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     song_tempo_->setToolTip(tr("Tempo at the start of the song (writes a tempo event at bar 1)"));
     song_numerator_ = spin(1, 255, 4, song_box);
     song_numerator_->setKeyboardTracking(false);
+    song_numerator_->setAccessibleName(tr("Meter numerator")); // the meter row has no buddy label (ux-panels-28)
     song_denominator_ = new QComboBox(song_box);
+    song_denominator_->setAccessibleName(tr("Meter denominator"));
     for (const int denominator : {1, 2, 4, 8, 16, 32})
         song_denominator_->addItem(QString::number(denominator), denominator);
     auto* meter_row = new QHBoxLayout;
@@ -296,6 +306,9 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
             for (const auto& port : *outputs)
                 track_output_->addItem(tr("MIDI out: %1").arg(QString::fromStdString(port.display_name)),
                                        QString::fromStdString(port.stable_id));
+        // A port that vanished stays shown as such: the track still routes to it (ux-panels-25).
+        if (!current.isEmpty() && track_output_->findData(current) < 0)
+            track_output_->addItem(tr("MIDI out: %1 (not connected)").arg(current), current);
         track_output_->setCurrentIndex(std::max(0, track_output_->findData(current)));
     });
     connect(track_output_, &QComboBox::activated, this, &InspectorPanel::apply_track_fields);
@@ -337,7 +350,7 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     scale_form->addRow(fold_);
     scale_form->addRow(tr("New input"), input_policy_);
     scale_form->addRow(tr("Snap"), snap_);
-    auto* scale_note = new QLabel(tr("Changing the scale never moves notes. Use Conform to scale below to change them."),
+    auto* scale_note = new QLabel(tr("Changing the scale never moves notes. Use Conform to scale in Transform selection above to change them."),
                                   scale_box);
     scale_note->setWordWrap(true);
     scale_form->addRow(scale_note);
@@ -442,10 +455,12 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
         header->setAccessibleDescription(QObject::tr("Shows or hides the %1 section").arg(title));
         column->insertWidget(column->indexOf(box), header);
         const bool expanded = QSettings().value("inspector/expanded/" + key, expanded_by_default).toBool();
-        const auto apply = [box, header](bool on) {
+        const auto apply = [box, header, title](bool on) {
             header->setArrowType(on ? Qt::DownArrow : Qt::RightArrow);
             header->setChecked(on);
             box->setVisible(on);
+            // Announced as a section that is expanded or collapsed, not as "checked" (ux-visual-10).
+            header->setAccessibleName(on ? QObject::tr("%1, expanded").arg(title) : QObject::tr("%1, collapsed").arg(title));
         };
         apply(expanded);
         QObject::connect(header, &QToolButton::toggled, box, [key, apply](bool on) {
@@ -512,7 +527,12 @@ void InspectorPanel::set_controller(DocumentController* controller) {
     connect(controller, &DocumentController::document_changed, this, &InspectorPanel::refresh);
     connect(controller, &DocumentController::view_state_changed, this, &InspectorPanel::refresh);
     refresh();
-    load_tool_defaults();
+    // The tool keeps the user's values across tab switches; only scale-dependent fields follow the
+    // new document (ux-panels-23). The very first document loads the tool's defaults.
+    if (std::exchange(tool_defaults_loaded_, true))
+        update_parameters_from_form();
+    else
+        load_tool_defaults();
 }
 
 void InspectorPanel::refresh() {
@@ -554,8 +574,11 @@ void InspectorPanel::refresh() {
         }
         new_velocity_->setValue(sequence.settings.default_velocity);
         const bool ppq = sequence.division.is_ppq();
-        for (QWidget* widget : std::initializer_list<QWidget*>{song_tempo_, song_numerator_, song_denominator_, song_loop_bars_})
+        for (QWidget* widget : std::initializer_list<QWidget*>{song_tempo_, song_numerator_, song_denominator_, song_loop_bars_}) {
             widget->setEnabled(ppq);
+            // A disabled field says why (spec 6.3, ux-panels-27).
+            widget->setToolTip(ppq ? QString() : tr("Tempo, meter and loop in bars need a PPQ (musical) time base"));
+        }
     }
     scale_root_->setCurrentIndex(sequence.root_pc);
     int scale_index = -1;
@@ -586,7 +609,12 @@ void InspectorPanel::refresh() {
         track_drum_->setChecked(track.is_drum);
         track_channel_override_->setCurrentIndex(track.routing.channel_override ? *track.routing.channel_override + 1 : 0);
         track_transpose_->setValue(track.routing.transpose);
-        const int preset = track_preset_->findText(QString::fromStdString(track.instrument.synth_preset));
+        // A preset this version does not list is shown as it is, never replaced by "classic" on
+        // the next track edit (ux-panels-25).
+        const QString stored = QString::fromStdString(track.instrument.synth_preset);
+        if (!stored.isEmpty() && track_preset_->findText(stored) < 0)
+            track_preset_->addItem(stored);
+        const int preset = track_preset_->findText(stored);
         track_preset_->setCurrentIndex(std::max(0, preset));
         track_program_->setValue(track.instrument.program + 1);
         const QString endpoint = track.routing.output == OutputKind::external_midi && track.routing.endpoint_id
@@ -614,8 +642,11 @@ void InspectorPanel::refresh_selection() {
                                        "With nothing selected, the tools below act on the active track.")
                                   : tr("%n note(s) selected", nullptr, static_cast<int>(selected.size())));
     // No fake values when nothing is selected: the numeric rows are hidden.
-    for (auto* box : {start_, length_, pitch_, velocity_, channel_})
-        selection_form_->setRowVisible(box, !selected.empty());
+    // Start, length, pitch and channel only describe one note: hidden for several, never stale
+    // disabled values of an earlier note (ux-panels-21). Velocity covers several ("mixed").
+    for (auto* box : {start_, length_, pitch_, channel_})
+        selection_form_->setRowVisible(box, selected.size() == 1);
+    selection_form_->setRowVisible(velocity_, !selected.empty());
     selection_form_->setRowVisible(chord_label_, selected.size() >= 2);
     const bool single = selected.size() == 1;
     for (auto* box : {start_, length_, pitch_, channel_})
@@ -630,7 +661,8 @@ void InspectorPanel::refresh_selection() {
         channel_->setValue(note.channel + 1);
         pitch_->setSuffix(QString("  (%1)").arg(QString::fromStdString(pitch_name(note.pitch))));
     } else if (!selected.empty()) {
-        velocity_->setValue(selected.front().velocity);
+        const bool same = std::ranges::all_of(selected, [&](const NoteSpan& note) { return note.velocity == selected.front().velocity; });
+        velocity_->setValue(same ? selected.front().velocity : 0);
     }
     update_position_suffixes();
     shown_ = {start_->value(), length_->value(), pitch_->value(), velocity_->value(), channel_->value()};
@@ -681,16 +713,19 @@ void InspectorPanel::apply_note_fields() {
             if (now[4] != shown_[4])
                 update.channel = static_cast<std::uint8_t>(now[4] - 1);
         }
-        if (now[3] != shown_[3])
+        if (now[3] != shown_[3] && now[3] > 0) // "mixed" (0) never flattens
             update.velocity = static_cast<std::uint8_t>(now[3]);
         updates.push_back(update);
     }
-    shown_ = now;
     auto changes = update_notes(controller_->document(), controller_->active_sequence().id, updates, "Edit note properties");
-    if (changes)
-        controller_->apply(*changes);
-    else
+    if (changes && controller_->apply(*changes)) {
+        shown_ = now;
+        return;
+    }
+    if (!changes)
         emit status_message(QString::fromStdString(changes.error().message));
+    // Rejected: the fields show the document again, never values it does not have (uiB-33).
+    refresh_selection();
 }
 
 void InspectorPanel::apply_track_fields() {
@@ -972,6 +1007,10 @@ void InspectorPanel::update_parameters_from_form() {
 void InspectorPanel::set_report(const QString& text) {
     report_->setText(text);
     transform_form_->setRowVisible(report_, !text.isEmpty());
+    // Screen readers announce the outcome of Preview and Apply (ux-panels-28).
+    report_->setAccessibleDescription(text);
+    QAccessibleEvent changed(report_, QAccessible::DescriptionChanged);
+    QAccessible::updateAccessibility(&changed);
 }
 
 void InspectorPanel::preview() { request_preview(false); }
@@ -1098,7 +1137,11 @@ void InspectorPanel::apply_preview() {
 }
 
 void InspectorPanel::cancel_preview() {
+    if (!pending_ && !apply_when_ready_)
+        return; // nothing to cancel: no message (ux-panels-26)
     pending_.reset(); // cancel leaves the document unchanged
+    apply_when_ready_ = false;
+    ++preview_serial_; // a preview still computing is dropped too
     set_report(tr("Cancelled"));
 }
 
@@ -1125,12 +1168,19 @@ void InspectorPanel::apply_last_quantize() {
     // Keyboard focus stays where it is; the user's chosen tool is restored afterwards.
     const int previous_tool = tool_->currentIndex();
     const QString previous_parameters = parameters_->toPlainText();
+    const int previous_amount = amount_->value();
     select_tool("quantize");
     if (!last_quantize_json_.isEmpty())
         parameters_->setPlainText(last_quantize_json_);
     request_preview(true); // parameters are read now; the result applies when it arrives
     if (previous_tool != tool_->currentIndex()) {
+        // The whole form comes back, not only the tool and its JSON: rows, amount and JSON agree,
+        // so touching a field never regenerates the JSON from quantize defaults (ux-panels-22).
         tool_->setCurrentIndex(previous_tool);
+        updating_ = true;
+        amount_->setValue(previous_amount);
+        updating_ = false;
+        update_tool_rows();
         parameters_->setPlainText(previous_parameters);
     }
 }

@@ -65,7 +65,7 @@ struct VerifyReport {
 /// Repair result.
 struct RepairReport {
     std::filesystem::path safety_backup;
-    bool full_backup = false;     ///< False when only the catalog could be saved (damaged objects).
+    bool full_backup = false;     ///< Always false now: repairs copy the catalog only (they never touch objects).
     std::size_t fts_rows = 0;
     std::size_t derived_rows_removed = 0;
 };

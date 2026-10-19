@@ -262,15 +262,20 @@ Result<TransformPreview> change_length(const DocumentData& document, const Targe
         std::ranges::stable_sort(members, [&](std::size_t a, std::size_t b) {
             return editor.values(a).start < editor.values(b).start;
         });
-        for (std::size_t index = 0; index < members.size(); ++index) {
+        // One backward pass: the next strictly later start, so a chord of c notes costs O(c),
+        // not O(c^2) (code-core-11).
+        std::optional<Tick> later;       // first start after the current group
+        std::optional<Tick> group_start; // start of the group being walked (equal starts)
+        std::optional<Tick> group_next;  // what that group's notes get
+        for (std::size_t index = members.size(); index-- > 0;) {
             const Tick start = editor.values(members[index]).start;
-            for (std::size_t later = index + 1; later < members.size(); ++later) {
-                const Tick candidate = editor.values(members[later]).start;
-                if (candidate > start) {
-                    next_onset[members[index]] = candidate;
-                    break;
-                }
+            if (!group_start || start != *group_start) {
+                later = group_start; // the group just left is the next later onset
+                group_start = start;
+                group_next = later;
             }
+            if (group_next)
+                next_onset[members[index]] = *group_next;
         }
     }
     for (const auto note : selected) {

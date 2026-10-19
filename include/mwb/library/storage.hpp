@@ -65,6 +65,11 @@ struct FileDigest {
 
 /// UTF-8 text of a path (generic separators).
 [[nodiscard]] std::string path_utf8(const std::filesystem::path& path);
+/// `path` relative to `root` when it lies inside it (or is it), comparing components the way the
+/// file system does: case-insensitively on Windows (the watcher, the user and the catalog may
+/// spell a folder differently), exactly elsewhere. Both are normalized first.
+[[nodiscard]] std::optional<std::filesystem::path> relative_inside(const std::filesystem::path& path,
+                                                                   const std::filesystem::path& root);
 /// Path from UTF-8 text (the inverse of path_utf8).
 [[nodiscard]] std::filesystem::path path_from_utf8_text(std::string_view text);
 

@@ -4,6 +4,7 @@
 #include "mwb/core/serialization.hpp"
 #include "mwb/core/utility.hpp"
 #include "mwb/music/json_fields.hpp"
+#include "mwb/music/progression.hpp"
 
 #include <array>
 #include <charconv>
@@ -538,7 +539,48 @@ Result<Recipe> make_recipe(const DocumentData& document, const TargetSelection& 
     return recipe;
 }
 
+namespace {
+
+/// Replays a stored "progression" recipe (insert_progression): its parameters hold the start,
+/// channel and the progression with its voice-leading options; its target is the track
+/// (code-core-15).
+Result<TransformPreview> replay_progression(const DocumentData& document, const Recipe& recipe, bool allow_changed_source) {
+    if (recipe.algorithm_version != voice_leading_algorithm_version)
+        return make_error(ErrorCode::unsupported, "unsupported voice-leading algorithm version");
+    const auto parameters = nlohmann::json::parse(recipe.parameters_json, nullptr, false);
+    const auto targets = nlohmann::json::parse(recipe.targets_json, nullptr, false);
+    if (!parameters.is_object() || !targets.is_object() || !parameters.contains("progression") ||
+        !targets.contains("track") || !targets["track"].is_string())
+        return make_error(ErrorCode::invalid_data, "progression recipe is incomplete");
+    Tick start = 0;
+    int channel = 0;
+    FieldReader reader(parameters, "progression recipe");
+    reader.integer("start", start);
+    reader.integer("channel", channel);
+    MWB_TRY(reader.status());
+    if (start < 0 || channel < 0 || channel > 15)
+        return make_error(ErrorCode::invalid_data, "progression recipe start or channel out of range");
+    auto progression = progression_from_json(parameters["progression"].dump());
+    if (!progression)
+        return std::unexpected(progression.error());
+    const auto parsed_track = Uuid::parse(targets["track"].get<std::string>());
+    if (!parsed_track)
+        return make_error(ErrorCode::invalid_data, "progression recipe names no valid track");
+    const TrackId track(*parsed_track);
+    const auto location = find_track(document, track);
+    if (!location)
+        return make_error(ErrorCode::not_found, "the recipe's track does not exist");
+    if (!allow_changed_source && semantic_hash(document.sequences[location->sequence]) != recipe.source_semantic_hash)
+        return make_error(ErrorCode::conflict, "the source sequence changed since the recipe was recorded");
+    return insert_progression(document, track, progression->first, progression->second, start,
+                              static_cast<std::uint8_t>(channel));
+}
+
+} // namespace
+
 Result<TransformPreview> replay_recipe(const DocumentData& document, const Recipe& recipe, bool allow_changed_source) {
+    if (recipe.tool_id == "progression")
+        return replay_progression(document, recipe, allow_changed_source);
     auto parameters = parameters_from_json(recipe.parameters_json);
     if (!parameters)
         return std::unexpected(parameters.error());

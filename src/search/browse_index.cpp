@@ -289,20 +289,40 @@ void BrowseIndex::clear() {
 Truth BrowseIndex::evaluate_text(const StoredRow& stored, const Predicate& predicate, TokenCache& cache) const {
     auto cached = cache.find(&predicate);
     if (cached == cache.end()) {
-        std::optional<std::vector<std::uint32_t>> resolved;
+        std::optional<ResolvedText> resolved;
         if (const auto query_tokens = ascii_fts_tokens(text_value(predicate))) {
             resolved.emplace();
             for (const auto& token : *query_tokens) {
                 const auto found = dictionary_.find(token);
-                resolved->push_back(found == dictionary_.end() ? std::numeric_limits<std::uint32_t>::max()
-                                                               : found->second);
+                resolved->ids.push_back(found == dictionary_.end() ? std::numeric_limits<std::uint32_t>::max()
+                                                                   : found->second);
+            }
+            if (predicate.prefix && !query_tokens->empty()) {
+                // Every known token starting with the typed one, like FTS5's "lea" *.
+                const auto& stem = query_tokens->back();
+                resolved->last_prefix.assign(dictionary_.size(), false);
+                for (const auto& [token, id] : dictionary_)
+                    if (token.starts_with(stem) && id < resolved->last_prefix.size())
+                        resolved->last_prefix[id] = true;
             }
         }
         cached = cache.emplace(&predicate, std::move(resolved)).first;
     }
     if (!cached->second)
         return Truth::unknown;
-    const auto& ids = *cached->second;
+    const auto& ids = cached->second->ids;
+    const auto& last_prefix = cached->second->last_prefix;
+    const bool prefix = predicate.prefix && !ids.empty();
+    const auto matches_at = [&](const std::vector<std::uint32_t>& tokens, std::size_t start) {
+        const std::size_t exact = prefix ? ids.size() - 1 : ids.size();
+        if (!std::equal(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(exact),
+                        tokens.begin() + static_cast<std::ptrdiff_t>(start)))
+            return false;
+        if (!prefix)
+            return true;
+        const auto last = tokens[start + exact];
+        return last < last_prefix.size() && last_prefix[last];
+    };
     std::vector<std::size_t> columns;
     switch (predicate.field) {
     case Field::title:
@@ -349,7 +369,7 @@ Truth BrowseIndex::evaluate_text(const StoredRow& stored, const Predicate& predi
         if (ids.empty() || tokens.size() < ids.size())
             continue;
         for (std::size_t start = 0; start + ids.size() <= tokens.size(); ++start)
-            if (std::equal(ids.begin(), ids.end(), tokens.begin() + static_cast<std::ptrdiff_t>(start)))
+            if (matches_at(tokens, start))
                 return Truth::yes;
     }
     return undecided ? Truth::unknown : Truth::no;

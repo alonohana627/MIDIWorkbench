@@ -286,6 +286,28 @@ TEST_SUITE("cli") {
         CHECK(analyzed.json["report"]["analyzed"].get<int>() == 1);
     }
 
+    TEST_CASE("flags after the subcommand, JSON for argument errors, consistent statuses (code-runtime-20/21/23/33)") {
+        test::TemporaryDirectory directory;
+        const auto source = write_phrase(directory.path(), "phrase.mid");
+        // A global flag after the subcommand is accepted.
+        const auto inspected = run({"inspect", path_text(source), "--warnings-as-errors"});
+        INFO(inspected.json.dump());
+        CHECK(inspected.code == cli::exit_success);
+        CHECK(inspected.json["status"] == (inspected.json["warnings"].empty() ? "ok" : "warning"));
+        // Argument errors still print versioned JSON on stdout.
+        const auto missing = run({"inspect"});
+        CHECK(missing.code == cli::exit_invalid_arguments);
+        CHECK(missing.json["status"] == "error");
+        CHECK(missing.json["schema_version"] == 1);
+        CHECK_FALSE(missing.json["errors"].empty());
+        // Absurd melody durations are refused instead of overflowing the onsets.
+        const auto library = directory.path() / "library";
+        REQUIRE(run({"library", "import", "--library", path_text(library), "--from", path_text(source)}).code ==
+                cli::exit_success);
+        CHECK(run({"library", "melody", "--library", path_text(library), "--notes", "C4:9000000000000000000 D4"}).code ==
+              cli::exit_invalid_arguments);
+    }
+
     TEST_CASE("capabilities lists dependencies and SQLite options") {
         const auto result = run({"capabilities", "--json"});
         REQUIRE(result.code == cli::exit_success);

@@ -12,6 +12,11 @@
 namespace mwb::music {
 
 namespace {
+/// Notes one generating command may create in total (the same bound as repeat, code-core-11).
+constexpr std::size_t created_note_budget = 1'000'000;
+} // namespace
+
+namespace {
 
 constexpr std::int64_t max_generated_steps = 65536;
 
@@ -215,6 +220,8 @@ Result<TransformPreview> arpeggiate(const DocumentData& document, const TargetSe
             values.pitch = pitches[choice];
             values.velocity = velocities[choice];
             values.channel = first.channel;
+            if (created.size() >= created_note_budget)
+                return make_error(ErrorCode::limit_exceeded, "arpeggiate would create more than 1,000,000 notes");
             created.push_back(editor.add(track, values));
             ++report.created;
         }
@@ -286,6 +293,8 @@ Result<TransformPreview> euclidean_rhythm(const DocumentData& document, const Ta
             values.velocity = std::ranges::find(parameters.accent_pulses, pulse) != parameters.accent_pulses.end()
                                   ? parameters.accent_velocity
                                   : parameters.velocity;
+            if (created.size() >= created_note_budget)
+                return make_error(ErrorCode::limit_exceeded, "the rhythm would create more than 1,000,000 notes");
             created.push_back(editor.add(*track, values));
             ++report.created;
             ++pulse;
@@ -350,6 +359,11 @@ Result<TransformPreview> apply_groove(const DocumentData& document, const Target
     if (groove.ppq <= 0 || groove.steps < 1 || groove.timing_offsets.size() != static_cast<std::size_t>(groove.steps) ||
         groove.velocity_offsets.size() != static_cast<std::size_t>(groove.steps))
         return make_error(ErrorCode::invalid_argument, "groove template is inconsistent");
+    // A groove moves notes within a few beats; offsets beyond 64 quarter notes are corrupt data,
+    // not timing (and could push notes toward int64 overflow, code-core-9).
+    for (const auto offset : groove.timing_offsets)
+        if (offset > std::int64_t{64} * groove.ppq || offset < -std::int64_t{64} * groove.ppq)
+            return make_error(ErrorCode::invalid_argument, "groove timing offsets exceed 64 quarter notes");
     if (!unit_fraction(parameters.strength) || !unit_fraction(parameters.velocity_strength))
         return make_error(ErrorCode::invalid_argument, "groove strengths must lie between 0 and 1");
     auto prepared = prepare_transform(document, selection, "groove_apply", true);
@@ -384,8 +398,12 @@ Result<TransformPreview> apply_groove(const DocumentData& document, const Target
             ++report.clipped;
         }
         if (!editor.is_unterminated(note)) {
-            if (parameters.preserve_duration)
-                after.end = before.end + (after.start - before.start);
+            if (parameters.preserve_duration) {
+                const auto end = checked_add(before.end, after.start - before.start);
+                if (!end)
+                    return make_error(ErrorCode::limit_exceeded, "groove moves a note beyond the time range");
+                after.end = *end;
+            }
             if (after.end <= after.start) {
                 after.end = after.start + 1;
                 ++report.clipped;
@@ -526,8 +544,7 @@ Result<TransformPreview> insert_progression(const DocumentData& document, TrackI
         return preview;
     const auto location = find_track(document, track);
     const Sequence& sequence = document.sequences[location->sequence];
-    Sequence before = sequence;
-    before.tracks.clear();
+    Sequence before = sequence_header(sequence); // header fields only, not a copy of every event
     Sequence after = before;
     Recipe recipe;
     recipe.id = RecipeId::generate();

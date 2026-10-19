@@ -128,7 +128,11 @@ private:
 
     /// Query text tokens resolved to dictionary ids once per call (nullopt: not ASCII-exact),
     /// not once per row.
-    using TokenCache = std::unordered_map<const Predicate*, std::optional<std::vector<std::uint32_t>>>;
+    struct ResolvedText {
+        std::vector<std::uint32_t> ids;
+        std::vector<bool> last_prefix; ///< Indexed by token id: matches the prefix (prefix terms only).
+    };
+    using TokenCache = std::unordered_map<const Predicate*, std::optional<ResolvedText>>;
 
     [[nodiscard]] Truth evaluate_row(const StoredRow& row, const Query& query, const SearchOptions& options,
                                      TokenCache& cache) const;

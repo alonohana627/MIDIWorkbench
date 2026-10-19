@@ -162,11 +162,6 @@ void PianoRollView::set_snap_mode(SnapMode mode) {
     update();
 }
 
-void PianoRollView::set_grid_override(std::optional<Rational> fraction) {
-    grid_override_ = fraction;
-    update();
-}
-
 Tick PianoRollView::visible_ticks() const {
     return std::max<Tick>(1, mapping_.x_to_tick(note_area().width()) - mapping_.origin_tick);
 }
@@ -178,7 +173,7 @@ int PianoRollView::visible_row_count() const {
 Grid PianoRollView::grid() const {
     const auto& sequence = controller_.active_sequence();
     const std::int32_t ppq = sequence.division.is_ppq() ? sequence.division.ppq : default_ppq;
-    return Grid::make(grid_override_.value_or(sequence.settings.snap), ppq);
+    return Grid::make(sequence.settings.snap, ppq);
 }
 
 void PianoRollView::update_playhead_area(std::optional<Tick> tick) {
@@ -1961,6 +1956,69 @@ void PianoRollView::select_same_channel() {
     const auto editable = [this](const NoteSpan& note) { return note_editable(note); };
     controller_.set_selection(
         select_matching<16>(controller_, [](const NoteSpan& note) { return note.channel & 0x0F; }, editable));
+}
+
+void PianoRollView::select_adjacent_note(int direction) {
+    std::vector<const NoteSpan*> notes;
+    for (const auto& note : controller_.notes().notes)
+        if (note_editable(note))
+            notes.push_back(&note);
+    if (notes.empty())
+        return;
+    const auto before = [](const NoteSpan* a, const NoteSpan* b) {
+        return a->start != b->start ? a->start < b->start : a->pitch < b->pitch;
+    };
+    std::ranges::sort(notes, before);
+    const NoteSpan* chosen = nullptr;
+    const auto& selection = controller_.selection();
+    const auto anchor = std::ranges::find_if(notes, [&](const NoteSpan* note) { return selection.contains(note->on_id); });
+    if (anchor != notes.end()) {
+        const auto index = static_cast<std::ptrdiff_t>(anchor - notes.begin()) + direction;
+        if (index < 0 || index >= static_cast<std::ptrdiff_t>(notes.size()))
+            return; // at the first or last note: the selection stays
+        chosen = notes[static_cast<std::size_t>(index)];
+    } else {
+        // Nothing selected: the first note at or after the edit cursor (or the last before it).
+        const Tick cursor = controller_.edit_cursor();
+        if (direction > 0) {
+            const auto found = std::ranges::find_if(notes, [&](const NoteSpan* note) { return note->start >= cursor; });
+            chosen = found != notes.end() ? *found : notes.back();
+        } else {
+            const auto found = std::ranges::find_if(notes | std::views::reverse,
+                                                    [&](const NoteSpan* note) { return note->start < cursor; });
+            chosen = found != (notes | std::views::reverse).end() ? *found : notes.front();
+        }
+    }
+    controller_.set_selection({chosen->on_id});
+    scroll_to_tick(chosen->start);
+    cursor_pitch_ = chosen->pitch;
+    emit audition_note_on(chosen->pitch, chosen->velocity);
+    QTimer::singleShot(150, this, [this, pitch = static_cast<int>(chosen->pitch)] { emit audition_note_off(pitch); });
+    update();
+}
+
+void PianoRollView::change_length_by_grid(int direction) {
+    const auto selected = controller_.selected_notes();
+    if (selected.empty())
+        return;
+    const Tick step = std::max<Tick>(1, grid().point(1) - grid().point(0));
+    std::vector<NoteUpdate> updates;
+    for (const auto& note : selected) {
+        if (!note_editable(note) || !note.off_id)
+            continue;
+        const Tick end = std::max(note.start + 1, note.end + direction * step);
+        if (end == note.end)
+            continue;
+        updates.push_back(NoteUpdate{note.on_id, note.start, end, note.pitch, note.velocity, note.channel, note.release_velocity});
+    }
+    if (updates.empty())
+        return;
+    auto changes = update_notes(controller_.document(), controller_.active_sequence().id, updates,
+                                direction > 0 ? "Lengthen notes" : "Shorten notes");
+    if (changes)
+        controller_.apply(*changes);
+    else
+        emit status_message(QString::fromStdString(changes.error().message));
 }
 
 void PianoRollView::select_same_duration() {

@@ -568,7 +568,9 @@ try
       return parse_result::incomplete;
     }
 
-    track.reserve(header_length / 3);
+    // MIDI Workbench: a capped estimate; a huge track declaring few events (one big SysEx) must
+    // not reserve gigabytes before the payload limits apply.
+    track.reserve(std::min<std::size_t>(header_length / 3, 65536));
 
     const uint8_t* const track_end = dataPtr + header_length;
 

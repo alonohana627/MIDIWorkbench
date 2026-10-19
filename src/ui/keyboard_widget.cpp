@@ -188,7 +188,13 @@ void KeyboardWidget::release_pointer_key() {
     const int pitch = *pointer_key_;
     pointer_key_.reset();
     set_key_state(pitch, KeySource::pointer, false);
-    emit note_off(pitch);
+    // Another live source (computer keyboard, MIDI input) still holding this key keeps its note
+    // sounding; its own release ends it (uiB-41).
+    // (Playback only lights the key; it does not own the audition note.)
+    constexpr auto live_inputs = static_cast<std::uint8_t>((1u << static_cast<unsigned>(KeySource::computer_keyboard)) |
+                                                          (1u << static_cast<unsigned>(KeySource::midi_input)));
+    if ((owners_[static_cast<std::size_t>(pitch)] & live_inputs) == 0)
+        emit note_off(pitch);
 }
 
 void KeyboardWidget::mousePressEvent(QMouseEvent* event) {

@@ -39,8 +39,6 @@ public:
     [[nodiscard]] int row_count() const;
     [[nodiscard]] int visible_row_count() const;
     [[nodiscard]] int visible_step_count() const;
-    /// Velocity used for new steps; Shift-click uses (or toggles) the accent velocity.
-    void set_velocities(int normal, int accent);
     /// Playhead for display; while following, the grid pages so it stays visible.
     void set_playhead(std::optional<Tick> tick);
     [[nodiscard]] std::optional<Tick> playhead() const { return playhead_; }
@@ -50,6 +48,9 @@ public:
 
 signals:
     void open_in_piano_roll(Tick tick, int pitch);
+    /// A step was set: the hit is heard (ux-editing-21); the note-off follows 150 ms later.
+    void audition_note_on(int pitch, int velocity);
+    void audition_note_off(int pitch);
     void status_message(const QString& text);
     /// Origin, top row or size changed (scroll bars follow).
     void view_changed();
@@ -108,8 +109,10 @@ private:
     bool follow_suspended_ = false;
     double wheel_rows_ = 0.0;
     double wheel_steps_ = 0.0;
-    int normal_velocity_ = 90;
+    /// New steps use the sequence's new-note velocity (the Inspector's "Velocity" for new notes,
+    /// uiB-19); Shift-click uses (or toggles) this accent velocity.
     int accent_velocity_ = 120;
+    [[nodiscard]] int normal_velocity() const;
     mutable std::vector<int> rows_cache_;
     mutable std::optional<std::tuple<std::uint64_t, std::size_t, std::optional<std::size_t>>> rows_key_;
     static constexpr int name_width = 150;

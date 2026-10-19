@@ -91,7 +91,8 @@
       ],
       "patches": [
         "0001-reader-smpte-unknown-chunks-f7-vlq-meta-lengths.patch",
-        "0002-writer-format-division-end-of-track.patch"
+        "0002-writer-format-division-end-of-track.patch",
+        "0003-reader-capped-track-reserve.patch"
       ],
       "files": {
         "include/libremidi/api-c.h": "53492affe3185dacfa04b9ce6255422b96a263472d21a87a88b6f7a2eed14df7",
@@ -251,7 +252,7 @@
         "include/libremidi/port_comparison.hpp": "638123619a3176e93b1c2a1223db9a236960afcff6ab2e5c741edd90034c83c4",
         "include/libremidi/port_information.hpp": "5f413185cb8d4f3032ef3aa529cdd19490df0e6d05cb0ed6d7c4bdeb9fe6d551",
         "include/libremidi/protocols/remote_control.hpp": "5dd9f632f093be9a961b645ba896487a24d90785255b6e9d1a0c27445ac402e2",
-        "include/libremidi/reader.cpp": "334255018a2dca0751150c6bd82aa27e4bcdb7586c03a71a2205db7aa2634257",
+        "include/libremidi/reader.cpp": "4bd6ef3afe2fc9c1f44010e654073be200a5f8d4d7d1f0461c1b266c8e1d6d86",
         "include/libremidi/reader.hpp": "b0fd19bdf8412f1a1b273b9e860181f8e95e98734d208e709bff51fc79b4595e",
         "include/libremidi/shared_context.hpp": "6556db6f6bf5fb14c50a88f769a268d7830f0cd6786f6331828b14acf5cfadde",
         "include/libremidi/system_error2.hpp": "a1d75d62e6fec6bb33ad8f33b8ba6d8cc3670ff6d0c79c3a5ce9ef78bb927f55",

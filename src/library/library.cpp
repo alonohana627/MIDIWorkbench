@@ -15,6 +15,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <shared_mutex>
 #include <atomic>
 #include <condition_variable>
@@ -251,7 +252,7 @@ struct Library::State {
     std::mutex writer_mutex;
     std::unique_ptr<SQLite::Database> writer;
     std::mutex readers_mutex;
-    std::condition_variable readers_available;
+    std::condition_variable_any readers_available; ///< Stop-token aware: a cancelled search stops waiting.
     std::vector<std::unique_ptr<SQLite::Database>> idle_readers;
     std::size_t open_readers = 0;
     std::mutex listener_mutex;
@@ -295,9 +296,19 @@ struct Library::State {
         std::unique_ptr<SQLite::Database> database_;
     };
 
-    Result<std::unique_ptr<Reader>> reader() {
+    /// Bounded wait for a read connection: a cancelled caller (a newer search generation) stops
+    /// waiting at once, and a pool busy for longer than the busy timeout reports `busy` instead of
+    /// blocking forever (code-library-14).
+    Result<std::unique_ptr<Reader>> reader(std::stop_token stop = {}) {
         std::unique_lock lock(readers_mutex);
-        readers_available.wait(lock, [&] { return !idle_readers.empty() || open_readers < options.read_connections; });
+        const bool free = readers_available.wait_for(lock, stop, std::chrono::milliseconds(options.busy_timeout_ms), [&] {
+            return !idle_readers.empty() || open_readers < options.read_connections;
+        });
+        if (!free) {
+            if (stop.stop_requested())
+                return make_error(ErrorCode::cancelled, "the search was cancelled while waiting for a connection");
+            return make_error(ErrorCode::busy, "every library read connection is busy; try again");
+        }
         if (!idle_readers.empty()) {
             auto database = std::move(idle_readers.back());
             idle_readers.pop_back();
@@ -314,6 +325,23 @@ struct Library::State {
         }
         return std::make_unique<Reader>(*this, std::move(*database));
     }
+
+    /// Passive WAL checkpoint after a burst of writes (spec 22.5, code-library-25): SQLite's
+    /// auto-checkpoint can be starved by long readers during big imports and analysis runs.
+    /// Passive never waits for readers; the frame counts are kept for diagnostics.
+    void checkpoint_wal() {
+        std::lock_guard lock(writer_mutex);
+        std::ignore = sqlite_support::guarded("wal checkpoint", [&]() -> Status {
+            Statement checkpoint(*writer, "PRAGMA wal_checkpoint(PASSIVE)");
+            if (checkpoint.executeStep()) {
+                last_wal_pages = checkpoint.getColumn(1).getInt64();
+                last_wal_checkpointed = checkpoint.getColumn(2).getInt64();
+            }
+            return ok();
+        });
+    }
+    std::int64_t last_wal_pages = 0;        ///< WAL frames after the last idle checkpoint.
+    std::int64_t last_wal_checkpointed = 0; ///< Of those, frames copied into the database.
 
     /// Runs `body` inside one IMMEDIATE transaction on the writer connection and notifies the
     /// change listener only after the commit (section 22.2 step 7).
@@ -847,6 +875,11 @@ Result<std::unique_ptr<Library>> Library::open(const std::filesystem::path& root
     if (!std::filesystem::is_regular_file(root / descriptor_file_name, error) ||
         !std::filesystem::is_regular_file(root / catalog_file_name, error))
         return make_error(ErrorCode::not_found, "the directory is not a MIDI Workbench library", path_utf8(root.filename()));
+    // A restore that failed (or was interrupted) leaves its files and this marker: such a
+    // directory is not a usable library (code-library-20).
+    if (!options.allow_incomplete && std::filesystem::exists(root / "INCOMPLETE", error))
+        return make_error(ErrorCode::invalid_data, "this library was not completely restored; restore it again",
+                          path_utf8(root.filename()));
     auto lock = WriterLock::acquire(root);
     if (!lock)
         return std::unexpected(std::move(lock).error());
@@ -870,6 +903,13 @@ Result<std::unique_ptr<Library>> Library::open(const std::filesystem::path& root
         descriptor["uuid"].get<std::string>() != state->uuid.to_string())
         return make_error(ErrorCode::invalid_data, "library.json does not describe this catalog");
     std::filesystem::create_directories(root / "staging", error);
+    // Jobs a crash left running are queued again (spec 28.1, code-library-24).
+    MWB_TRY(sqlite_support::guarded("requeue interrupted jobs", [&]() -> Status {
+        Statement requeue(*state->writer, "UPDATE job SET state = 'queued', updated_ms = ?1 WHERE state = 'running'");
+        requeue.bind(1, now_utc_ms());
+        requeue.exec();
+        return ok();
+    }));
     return std::unique_ptr<Library>(new Library(std::move(state)));
 }
 
@@ -965,10 +1005,16 @@ Result<ImportReport> Library::import_paths(const std::vector<std::filesystem::pa
             add_item(path_utf8(source.filename()), ImportOutcome::failed, std::nullopt, "the source does not exist");
             continue;
         }
+        // The library's own folder holds managed copies, never sources: importing it directly
+        // (not only while recursing from above) would import the objects (code-library-19).
+        if (relative_inside(absolute, std::filesystem::absolute(state.root, error))) {
+            add_item(path_utf8(source.filename()), ImportOutcome::failed, std::nullopt,
+                     "the library's own folder cannot be imported");
+            continue;
+        }
         if (options.root) {
             const auto given = std::filesystem::absolute(*options.root, error).lexically_normal();
-            const auto inside = absolute.lexically_relative(given);
-            if (inside.empty() || *inside.begin() == "..") {
+            if (!relative_inside(absolute, given)) {
                 add_item(path_utf8(source.filename()), ImportOutcome::failed, std::nullopt,
                          "the source is not inside the given source folder");
                 continue;
@@ -977,10 +1023,17 @@ Result<ImportReport> Library::import_paths(const std::vector<std::filesystem::pa
         }
         const auto root_display = path_utf8(root);
         auto root_id = state.write("register source root", [&](SQLite::Database& database) -> Result<std::int64_t> {
-            Statement find(database, "SELECT id FROM source_root WHERE display_path = ?1");
-            find.bind(1, root_display);
-            if (find.executeStep()) {
-                const auto existing = find.getColumn(0).getInt64();
+            // The same folder spelled differently (C:/Music, c:\music) is one source root
+            // (code-library-19): compared the way the file system compares paths.
+            std::optional<std::int64_t> found;
+            Statement find(database, "SELECT id, display_path FROM source_root");
+            while (!found && find.executeStep()) {
+                const auto known = relative_inside(root, path_from_utf8_text(find.getColumn(1).getString()));
+                if (known && known->empty())
+                    found = find.getColumn(0).getInt64();
+            }
+            if (found) {
+                const auto existing = *found;
                 if (options.watch) {
                     Statement watch(database, "UPDATE source_root SET watch_enabled = 1 WHERE id = ?1");
                     watch.bind(1, existing);
@@ -1005,7 +1058,8 @@ Result<ImportReport> Library::import_paths(const std::vector<std::filesystem::pa
         expected_files += files.size();
         for (const auto& file : files) {
             ++report.counts.discovered;
-            const auto relative = path_utf8(file.lexically_relative(root));
+            // Case-insensitive on Windows: a watched folder's hint may spell the folder differently.
+            const auto relative = path_utf8(relative_inside(file, root).value_or(file.lexically_relative(root)));
             if (stop.stop_requested()) {
                 add_item(relative, ImportOutcome::cancelled, std::nullopt, "import cancelled");
                 continue;
@@ -1040,6 +1094,21 @@ Result<ImportReport> Library::import_paths(const std::vector<std::filesystem::pa
                     break;
                 }
                 capture_failure = "the source changed while it was being read";
+                // A file another program is still writing usually settles soon: wait 100, 250,
+                // then 500 ms before the next attempt; cancellation ends the wait (code-library-18).
+                if (attempt < std::max<std::size_t>(1, options.max_capture_attempts)) {
+                    static constexpr std::array<int, 3> backoff_ms{100, 250, 500};
+                    std::mutex wait_mutex;
+                    std::condition_variable_any wait_signal;
+                    std::unique_lock wait_lock(wait_mutex);
+                    wait_signal.wait_for(wait_lock, stop,
+                                         std::chrono::milliseconds(backoff_ms[std::min<std::size_t>(attempt - 1, 2)]),
+                                         [] { return false; });
+                    if (stop.stop_requested()) {
+                        cancelled = true;
+                        break;
+                    }
+                }
             }
             if (cancelled) {
                 add_item(relative, ImportOutcome::cancelled, std::nullopt, "import cancelled");
@@ -1176,6 +1245,12 @@ Result<ImportReport> Library::import_paths(const std::vector<std::filesystem::pa
                                                                      captured->sha256, RevisionOrigin::import, "");
                     state.write_basic_analysis(database, asset_id, revision, parsed);
                     update_location(location_id, "present", true);
+                    // New bytes for a song in the trash bring it back, as equal bytes do above;
+                    // "imported" never means an invisible revision (code-library-17).
+                    Statement untrash(database, "UPDATE asset SET deleted_ms = NULL, metadata_generation = "
+                                                "metadata_generation + 1 WHERE id = ?1 AND deleted_ms IS NOT NULL");
+                    untrash.bind(1, asset_id);
+                    untrash.exec();
                     state.refresh_fts(database, asset_id);
                     state.record_change(database, "import.revision", {asset_id}, false);
                     return Outcome{unsupported ? ImportOutcome::unsupported : ImportOutcome::imported, asset_id};
@@ -1210,6 +1285,7 @@ Result<ImportReport> Library::import_paths(const std::vector<std::filesystem::pa
             report.items.back().candidate_revision_id = outcome->candidate;
         }
     }
+    state.checkpoint_wal(); // a large import leaves a large WAL: fold it in while idle (spec 22.5)
     return report;
 }
 
@@ -1388,11 +1464,22 @@ Status Library::set_rating(std::int64_t asset_id, int rating) {
 Status Library::set_key_override(std::int64_t asset_id, std::uint32_t sequence_no, int root, std::string mode) {
     if (root < 0 || root > 11)
         return make_error(ErrorCode::invalid_argument, "the key root is a pitch class 0-11");
+    // The same spelling rules as `key:` in search ("Minor", "m", "aeolian" -> minor), so an
+    // override is always found by the query that names it (code-library-15).
+    const auto normalized = search::normalize_key_mode(mode);
+    if (!normalized)
+        return make_error(ErrorCode::invalid_argument, "unknown key mode", mode);
+    mode = *normalized;
     auto& state = *state_;
     return state.write("asset.key_override", [&](SQLite::Database& database) -> Status {
         const auto head = state.head_revision(database, asset_id);
         if (!head)
             return make_error(ErrorCode::not_found, "the asset has no current revision");
+        Statement exists(database, "SELECT 1 FROM sequence_summary WHERE revision_id = ?1 AND sequence_no = ?2");
+        exists.bind(1, *head);
+        exists.bind(2, static_cast<std::int64_t>(sequence_no));
+        if (!exists.executeStep())
+            return make_error(ErrorCode::not_found, "the item has no such sequence");
         Statement insert(database, "INSERT OR REPLACE INTO asset_override(asset_id, sequence_no, field, schema_version, "
                                    "value_json, modified_ms) VALUES (?1, ?2, 'key', 1, ?3, ?4)");
         insert.bind(1, asset_id);
@@ -1467,7 +1554,12 @@ Status Library::remove_tag(std::int64_t asset_id, const std::string& name) {
         touch.bind(1, asset_id);
         touch.exec();
         state.refresh_fts(database, asset_id);
-        state.record_change(database, "tag.remove", {asset_id}, false, Json{{"tag", normalized}});
+        // A tag nobody uses any more leaves the tag list (code-library-37).
+        Statement unused(database, "DELETE FROM tag WHERE normalized_name = ?1 AND NOT EXISTS (SELECT 1 FROM asset_tag "
+                                   "WHERE asset_tag.tag_id = tag.id)");
+        unused.bind(1, normalized);
+        const bool removed = unused.exec() > 0;
+        state.record_change(database, "tag.remove", {asset_id}, removed, Json{{"tag", normalized}});
         return ok();
     });
 }
@@ -1601,19 +1693,29 @@ Status Library::move_in_collection(std::int64_t collection_id, std::int64_t asse
     auto& state = *state_;
     return state.write("collection.move", [&](SQLite::Database& database) -> Status {
         std::vector<std::int64_t> order;
-        Statement members(database, "SELECT asset_id FROM collection_asset WHERE collection_id = ?1 ORDER BY position, "
-                                    "asset_id");
+        std::map<std::int64_t, std::int64_t> current; // asset -> stored position
+        Statement members(database, "SELECT asset_id, position FROM collection_asset WHERE collection_id = ?1 ORDER BY "
+                                    "position, asset_id");
         members.bind(1, collection_id);
-        while (members.executeStep())
+        while (members.executeStep()) {
             order.push_back(members.getColumn(0).getInt64());
+            current[order.back()] = members.getColumn(1).getInt64();
+        }
         const auto found = std::ranges::find(order, asset_id);
         if (found == order.end())
             return make_error(ErrorCode::not_found, "the asset is not in the collection");
         order.erase(found);
         order.insert(order.begin() + static_cast<std::ptrdiff_t>(std::min(index, order.size())), asset_id);
+        // One prepared statement, and only rows whose position changes are written: moving one
+        // member of a 10,000-member collection touches the range between its old and new place,
+        // not every row (code-library-30).
+        Statement update(database, "UPDATE collection_asset SET position = ?1 WHERE collection_id = ?2 AND asset_id = ?3");
         for (std::size_t position = 0; position < order.size(); ++position) {
-            Statement update(database, "UPDATE collection_asset SET position = ?1 WHERE collection_id = ?2 AND asset_id = ?3");
-            update.bind(1, static_cast<std::int64_t>(position + 1));
+            const auto wanted = static_cast<std::int64_t>(position + 1);
+            if (current[order[position]] == wanted)
+                continue;
+            update.reset();
+            update.bind(1, wanted);
             update.bind(2, collection_id);
             update.bind(3, order[position]);
             update.exec();
@@ -2137,24 +2239,32 @@ Result<std::size_t> Library::mark_sources_missing(const std::filesystem::path& r
     std::error_code error;
     const auto root_display = path_utf8(std::filesystem::absolute(root, error).lexically_normal());
     return state.write("source.missing", [&](SQLite::Database& database) -> Result<std::size_t> {
-        Statement find(database, "SELECT id FROM source_root WHERE display_path = ?1");
-        find.bind(1, root_display);
-        if (!find.executeStep())
+        std::optional<std::int64_t> found;
+        std::string stored_display;
+        Statement find(database, "SELECT id, display_path FROM source_root");
+        while (!found && find.executeStep()) {
+            const auto known = relative_inside(path_from_utf8_text(root_display), path_from_utf8_text(find.getColumn(1).getString()));
+            if (known && known->empty()) {
+                found = find.getColumn(0).getInt64();
+                stored_display = find.getColumn(1).getString();
+            }
+        }
+        if (!found)
             return make_error(ErrorCode::not_found, "the folder is not a registered source", root_display);
-        const auto root_id = find.getColumn(0).getInt64();
+        const auto root_id = *found;
         Statement update(database, "UPDATE source_location SET state = 'missing', last_seen_ms = ?1 WHERE root_id = ?2 AND "
                                    "comparison_key = ?3 AND state <> 'missing' RETURNING asset_id");
         std::vector<std::int64_t> assets;
         for (const auto& file : files) {
             std::error_code file_error;
-            const auto relative = std::filesystem::absolute(file, file_error).lexically_normal().lexically_relative(
-                path_from_utf8_text(root_display));
-            if (relative.empty() || *relative.begin() == "..")
+            const auto relative =
+                relative_inside(std::filesystem::absolute(file, file_error), path_from_utf8_text(stored_display));
+            if (!relative || relative->empty())
                 continue; // not inside this root
             update.reset();
             update.bind(1, now_utc_ms());
             update.bind(2, root_id);
-            update.bind(3, filesystem_comparison_key(path_utf8(relative)));
+            update.bind(3, filesystem_comparison_key(path_utf8(*relative)));
             while (update.executeStep())
                 assets.push_back(update.getColumn(0).getInt64());
         }
@@ -2178,9 +2288,13 @@ Result<search::SearchOptions> Library::resolve_search_options(const search::Quer
     options.same_sequence = !across_sequences;
     options.collection_scope = scope;
     bool needs_collections = false;
+    std::vector<std::string> wanted;
     const std::function<void(const search::QueryNode&)> visit = [&](const search::QueryNode& node) {
-        if (node.kind == search::NodeKind::predicate && node.predicate.field == search::Field::collection)
+        if (node.kind == search::NodeKind::predicate && node.predicate.field == search::Field::collection) {
             needs_collections = true;
+            if (const auto* name = std::get_if<std::string>(&node.predicate.value))
+                wanted.push_back(fold_for_search(trim(*name)));
+        }
         for (const auto& child : node.children)
             visit(child);
     };
@@ -2190,9 +2304,19 @@ Result<search::SearchOptions> Library::resolve_search_options(const search::Quer
     auto collections = list_collections();
     if (!collections)
         return std::unexpected(std::move(collections).error());
-    for (const auto& collection : *collections)
+    std::set<std::string> smart;
+    for (const auto& collection : *collections) {
         if (!collection.smart)
             options.collections[fold_for_search(trim(collection.name))].push_back(collection.id);
+        else
+            smart.insert(fold_for_search(trim(collection.name)));
+    }
+    // A smart collection is a saved search, not a member list: say so instead of silently
+    // matching nothing (code-library-27).
+    for (const auto& name : wanted)
+        if (!options.collections.contains(name) && smart.contains(name))
+            return make_error(ErrorCode::invalid_argument,
+                              "\"" + name + "\" is a smart collection; collection: only names manual collections");
     return options;
 }
 
@@ -2200,6 +2324,8 @@ Result<search::CompiledSearch> Library::compile_search(const SearchRequest& requ
     auto query = search::parse_query(request.query_text);
     if (!query)
         return std::unexpected(query.error().to_error());
+    if (request.prefix_last_word)
+        search::mark_prefix_term(*query, request.query_text);
     auto options = resolve_search_options(*query, request.collection_scope, request.across_sequences);
     if (!options)
         return std::unexpected(std::move(options).error());
@@ -2212,6 +2338,8 @@ Result<SearchPage> Library::search(const SearchRequest& request, std::stop_token
     auto query = search::parse_query(request.query_text);
     if (!query)
         return std::unexpected(query.error().to_error());
+    if (request.prefix_last_word)
+        search::mark_prefix_term(*query, request.query_text);
     auto options = resolve_search_options(*query, request.collection_scope, request.across_sequences);
     if (!options)
         return std::unexpected(std::move(options).error());
@@ -2224,7 +2352,7 @@ Result<SearchPage> Library::search(const SearchRequest& request, std::stop_token
                                                request.page_size);
     if (!compiled)
         return std::unexpected(std::move(compiled).error());
-    auto reader = state_->reader();
+    auto reader = state_->reader(stop);
     if (!reader)
         return std::unexpected(std::move(reader).error());
     auto rows = sqlite_support::guarded("search", [&]() -> Result<std::vector<SearchRow>> {
@@ -2888,7 +3016,10 @@ Result<AnalyzeReport> Library::analyze(const AnalyzeOptions& options, std::stop_
                         failure = extracted.error().message;
                 }
                 if (options.features) {
-                    auto computed = compute_feature_vectors(*document);
+                    // Reuses the streams just extracted instead of extracting them again
+                    // (code-library-23); without the motif profile they are extracted here.
+                    auto computed = options.motif && failure.empty() ? compute_feature_vectors(*document, streams)
+                                                                     : compute_feature_vectors(*document);
                     if (computed)
                         features = std::move(*computed);
                     else
@@ -2978,6 +3109,8 @@ Result<AnalyzeReport> Library::analyze(const AnalyzeOptions& options, std::stop_
         if (report.cancelled || report.budget_reached)
             break;
     }
+    if (report.revisions_analyzed + report.revisions_failed > 0)
+        state.checkpoint_wal();
     return report;
 }
 
@@ -2997,7 +3130,7 @@ Result<std::size_t> Library::rebuild_derived() {
 }
 
 Result<search::ExactSearchResult> Library::motif_search(const search::ExactQuery& query, std::stop_token stop) {
-    auto reader = state_->reader();
+    auto reader = state_->reader(stop);
     if (!reader)
         return std::unexpected(std::move(reader).error());
     ProgressInterrupt interrupt(***reader, stop); // long SQL steps end when the search is cancelled
@@ -3010,7 +3143,7 @@ Result<search::ExactSearchResult> Library::motif_search(const search::ExactQuery
 
 Result<search::ApproximateSearchResult> Library::similar_search(const search::ApproximateQuery& query,
                                                                 std::stop_token stop) {
-    auto reader = state_->reader();
+    auto reader = state_->reader(stop);
     if (!reader)
         return std::unexpected(std::move(reader).error());
     ProgressInterrupt interrupt(***reader, stop);

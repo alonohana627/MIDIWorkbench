@@ -82,6 +82,12 @@ TEST_SUITE("ipc") {
         CHECK(*result == blob);
         ChunkAssembler reordered;
         CHECK_FALSE(reordered.add(chunks[1]));
+        // A later chunk may not change the declared size (code-runtime-32).
+        ChunkAssembler resized;
+        REQUIRE(resized.add(chunks[0]));
+        auto changed = chunks[1];
+        changed["size"] = changed["size"].get<std::uint64_t>() + 1;
+        CHECK_FALSE(resized.add(changed));
     }
 }
 

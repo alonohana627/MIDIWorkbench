@@ -141,9 +141,11 @@ Result<std::optional<std::vector<std::uint8_t>>> ChunkAssembler::add(const nlohm
             return invalid();
         transfer_ = transfer;
         total_ = total;
+        size_ = size;
         data_.reserve(static_cast<std::size_t>(size));
     }
-    if (transfer != *transfer_ || index != expected_index_ || total != total_)
+    // The size is pinned by the first chunk (code-runtime-32).
+    if (transfer != *transfer_ || index != expected_index_ || total != total_ || size != size_)
         return invalid();
     const auto& piece = chunk["bytes"].get_binary();
     if (data_.size() + piece.size() > size)
@@ -158,6 +160,7 @@ Result<std::optional<std::vector<std::uint8_t>>> ChunkAssembler::add(const nlohm
     transfer_.reset();
     expected_index_ = 0;
     total_ = 0;
+    size_ = 0;
     data_ = {};
     return std::optional<std::vector<std::uint8_t>>(std::move(finished));
 }

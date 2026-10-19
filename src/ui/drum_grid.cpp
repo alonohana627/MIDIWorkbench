@@ -8,6 +8,7 @@
 #include "mwb/ui/document_controller.hpp"
 #include "mwb/ui/piano_roll.hpp"
 
+#include <QTimer>
 #include <QApplication>
 #include <QHBoxLayout>
 #include <QKeyEvent>
@@ -111,9 +112,8 @@ void DrumGridView::set_top_row(int row) {
     update();
 }
 
-void DrumGridView::set_velocities(int normal, int accent) {
-    normal_velocity_ = std::clamp(normal, 1, 127);
-    accent_velocity_ = std::clamp(accent, 1, 127);
+int DrumGridView::normal_velocity() const {
+    return std::clamp<int>(controller_.active_sequence().settings.default_velocity, 1, 127);
 }
 
 void DrumGridView::set_follow_playhead(bool follow) {
@@ -413,7 +413,7 @@ bool DrumGridView::commit_stroke(const PaintStroke& stroke) {
         const Tick configured =
             Grid::make(sequence.settings.default_note_length, grid.ppq).point(1);
         const std::uint8_t channel = default_channel_for(controller_);
-        const int velocity = stroke.accent ? accent_velocity_ : normal_velocity_;
+        const int velocity = stroke.accent ? accent_velocity_ : normal_velocity();
         std::vector<NewNote> notes;
         for (const auto step : stroke.steps) {
             if (!notes_in_cell(stroke.pitch, step).notes.empty())
@@ -426,6 +426,11 @@ bool DrumGridView::commit_stroke(const PaintStroke& stroke) {
         if (notes.empty())
             return false;
         changes = insert_notes(controller_.document(), notes, several ? "Set drum steps" : "Set drum step");
+        if (changes) {
+            const int pitch = stroke.pitch;
+            emit audition_note_on(pitch, velocity);
+            QTimer::singleShot(150, this, [this, pitch] { emit audition_note_off(pitch); });
+        }
         break;
     }
     case PaintStroke::Mode::clear: {
@@ -449,7 +454,7 @@ bool DrumGridView::commit_stroke(const PaintStroke& stroke) {
         if (!position)
             return false;
         const auto& note = controller_.note_index().notes()[*position];
-        const int velocity = note.velocity >= accent_velocity_ ? normal_velocity_ : accent_velocity_;
+        const int velocity = note.velocity >= accent_velocity_ ? normal_velocity() : accent_velocity_;
         const NoteUpdate update{note.on_id, note.start, note.end, note.pitch, static_cast<std::uint8_t>(velocity),
                                 note.channel, note.release_velocity};
         changes = update_notes(controller_.document(), sequence.id, std::span(&update, 1), "Accent drum step");

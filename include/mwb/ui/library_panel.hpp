@@ -26,6 +26,7 @@
 
 class QLabel;
 class QLineEdit;
+class QProgressBar;
 class QPushButton;
 class QTableView;
 
@@ -214,6 +215,7 @@ private:
     QLabel* status_ = nullptr;
     QPushButton* import_button_ = nullptr;
     QPushButton* cancel_import_button_ = nullptr;
+    QProgressBar* import_progress_ = nullptr; ///< Shown only while importing (r5ui-17).
     QPushButton* trash_button_ = nullptr;
     QWidget* mode_bar_ = nullptr;         ///< "Melody results / Trash — Back to search".
     QLabel* mode_label_ = nullptr;

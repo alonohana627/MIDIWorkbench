@@ -92,6 +92,22 @@ TEST_SUITE("time") {
         }
     }
 
+    TEST_CASE("an equal-tick tempo back to the previous value is not a tempo change (code-core-24)") {
+        auto sequence = ppq_sequence(960);
+        add_event(sequence.tracks[0], events::tempo(0, 500000));
+        add_event(sequence.tracks[0], events::tempo(960, 400000));
+        add_event(sequence.tracks[0], events::tempo(960, 500000));
+        const auto map = TempoMap::build(sequence);
+        CHECK(map.change_count() == 0);
+        CHECK(map.tempo_at(2000) == 500000);
+    }
+
+    TEST_CASE("pitch names with absurd octaves are rejected, not wrapped (code-core-22)") {
+        CHECK_FALSE(parse_pitch("C357913941").has_value());
+        CHECK_FALSE(parse_pitch("C-21").has_value());
+        CHECK(parse_pitch("C4") == std::optional<std::uint8_t>(60));
+    }
+
     TEST_CASE("equal-tick tempo conflict keeps the last event and is flagged") {
         auto sequence = ppq_sequence(960);
         add_event(sequence.tracks[0], events::tempo(0, 500000));
@@ -112,6 +128,32 @@ TEST_SUITE("time") {
         CHECK(meter.position(3840 + 960).bar == 2);
     }
 
+    TEST_CASE("bars that are not a whole number of ticks are counted exactly (code-core-4)") {
+        // PPQ 1 in 7/8: a bar is 3.5 ticks. Tick 70 starts bar 21 (20 bars of 3.5 ticks).
+        const auto meter = MeterMap::constant(1, 7, 8);
+        const auto position = meter.position(70);
+        CHECK(position.bar == 20);
+        CHECK(position.beat == 0);
+        CHECK(position.tick_in_beat == 0);
+        CHECK(meter.format(70) == "21.1.000");
+        for (Tick tick = 0; tick < 400; ++tick) {
+            const auto at = meter.position(tick);
+            CAPTURE(tick);
+            CHECK(at.beat >= 0);
+            CHECK(at.tick_in_beat >= 0);
+            CHECK(meter.bar_start(at.bar) <= tick);
+            CHECK(meter.bar_start(at.bar + 1) > tick); // the tick belongs to exactly that bar
+        }
+        // A meter change after 5 such bars plus one tick: 5 whole bars and a partial one.
+        auto sequence = ppq_sequence(1);
+        add_event(sequence.tracks[0], events::time_signature(0, 7, 3));
+        add_event(sequence.tracks[0], events::time_signature(18, 4, 2));
+        const auto changed = MeterMap::build(sequence);
+        REQUIRE(changed.segments().size() == 2);
+        CHECK(changed.segments()[1].first_bar == 6);
+        CHECK(changed.segments()[1].previous_bar_partial);
+    }
+
     TEST_CASE("checked arithmetic rounds half away from zero and detects overflow") {
         CHECK(mul_div_round(3, 1, 2) == 2);
         CHECK(mul_div_round(-3, 1, 2) == -2);
@@ -126,6 +168,28 @@ TEST_SUITE("time") {
         CHECK(value->numerator == 3);
         CHECK(value->denominator == 4);
         CHECK_FALSE(Rational::parse("1/0"));
+    }
+}
+
+TEST_SUITE("time") {
+    TEST_CASE("the incremental SHA-256 builder gives the digest of the concatenated bytes") {
+        std::vector<std::uint8_t> all;
+        Sha256Builder builder;
+        for (std::uint32_t index = 0; index < 50'000; ++index) { // ~400 KiB of small updates
+            builder.update_u32(index);
+            builder.update_u8(static_cast<std::uint8_t>(index));
+            for (int shift = 0; shift < 32; shift += 8)
+                all.push_back(static_cast<std::uint8_t>(index >> shift));
+            all.push_back(static_cast<std::uint8_t>(index));
+        }
+        std::vector<std::uint8_t> large(200'000, 0x5A); // larger than the stage: passed through
+        builder.update(large);
+        all.insert(all.end(), large.begin(), large.end());
+        builder.update_string("tail");
+        all.insert(all.end(), {std::uint8_t{4}, 0, 0, 0, 0, 0, 0, 0}); // little-endian length
+        for (const char character : std::string("tail"))
+            all.push_back(static_cast<std::uint8_t>(character));
+        CHECK(builder.finish() == sha256(all));
     }
 }
 
@@ -458,6 +522,36 @@ TEST_SUITE("core") {
 }
 
 TEST_SUITE("changes") {
+    TEST_CASE("delete_notes removes each note-on with its own note-off and undoes exactly (code-core-19)") {
+        DocumentData document = make_blank_document();
+        const SequenceId sequence = document.sequences.front().id;
+        const TrackId track = document.sequences.front().tracks.front().id;
+        ChangeBuilder add(document, "add");
+        const EventId first = add.add_note(track, 0, 480, 0, 60, 100);
+        add.add_note(track, 240, 720, 0, 60, 90); // overlapping same key: FIFO pairing
+        const EventId third = add.add_note(track, 960, 1440, 1, 64, 80);
+        REQUIRE(apply_change_set(document, add.finish()));
+        const auto before = semantic_hash(document);
+        const std::vector<EventId> doomed{first, third};
+        auto changes = delete_notes(document, sequence, doomed);
+        REQUIRE(changes);
+        DocumentData after = document;
+        REQUIRE(apply_change_set(after, *changes));
+        const auto pairing = pair_notes(after.sequences.front());
+        REQUIRE(pairing.notes.size() == 1);
+        CHECK(pairing.notes[0].start == 240);
+        CHECK(pairing.notes[0].end == 720);
+        CHECK(pairing.orphan_ends.empty());
+        CHECK(after.sequences.front().tracks.front().events.size() ==
+              document.sequences.front().tracks.front().events.size() - 4); // two note-ons, two note-offs
+        REQUIRE(apply_change_set(after, invert(*changes)));
+        CHECK(semantic_hash(after) == before);
+        // Unknown identities delete nothing (never another note).
+        const std::vector<EventId> unknown{EventId::generate()};
+        auto nothing = delete_notes(document, sequence, unknown);
+        CHECK((!nothing || nothing->operations.empty()));
+    }
+
     // code-core-1: the end of an edited zero-length note must stay after its own start, or the
     // note-on becomes unterminated and the note-off an orphan.
     TEST_CASE("zero-length notes keep their note-off after the note-on through every edit") {

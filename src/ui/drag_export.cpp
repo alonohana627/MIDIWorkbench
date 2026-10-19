@@ -4,6 +4,7 @@
 #include "mwb/core/ids.hpp"
 #include "mwb/ui/document_controller.hpp"
 
+#include <cctype>
 #include <QApplication>
 #include <QDrag>
 #include <QMimeData>
@@ -32,6 +33,18 @@ std::string safe_file_stem(const std::string& title) {
         stem.pop_back();
     if (stem.empty())
         stem = "MIDI";
+    // Windows reserves CON, PRN, AUX, NUL, COM1-9 and LPT1-9 as names (also with an extension):
+    // a document titled so would make the drag file fail (ux-panels-45).
+    {
+        std::string base = stem.substr(0, stem.find('.'));
+        for (auto& character : base)
+            character = static_cast<char>(std::toupper(static_cast<unsigned char>(character)));
+        const bool device = base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" ||
+                            (base.size() == 4 && (base.starts_with("COM") || base.starts_with("LPT")) &&
+                             base[3] >= '1' && base[3] <= '9');
+        if (device)
+            stem.insert(base.size(), "_");
+    }
     if (stem.size() > 80) {
         std::size_t length = 80;
         // Never cut inside a UTF-8 sequence (a split character makes an invalid path).
@@ -66,7 +79,9 @@ void clean_drag_cache(const std::filesystem::path& cache) {
     for (const auto& entry : std::filesystem::directory_iterator(cache, error)) {
         if (!entry.is_directory(error) || entry.is_symlink(error))
             continue;
-        bool old = true;
+        // A folder made just now (a drag being prepared while this runs in the background) is
+        // never old, even before its file is written.
+        bool old = entry.last_write_time(error) <= limit;
         for (const auto& file : std::filesystem::directory_iterator(entry.path(), error))
             if (file.last_write_time(error) > limit)
                 old = false;
@@ -87,6 +102,7 @@ DragHandle::DragHandle(std::filesystem::path cache, QWidget* parent) : QWidget(p
     setToolTip(tr("Drag the document (or the selected notes) into a DAW or folder as a .mid file"));
     setAccessibleName(tr("Drag MIDI out"));
     setCursor(Qt::OpenHandCursor);
+    setAttribute(Qt::WA_Hover); // a hover fill says it can be grabbed (ux-visual-23)
 }
 
 void DragHandle::set_controller(DocumentController* controller) { controller_ = controller; }
@@ -99,8 +115,9 @@ QSize DragHandle::minimumSizeHint() const { return sizeHint(); } // never squeez
 
 void DragHandle::paintEvent(QPaintEvent*) {
     QPainter painter(this);
-    painter.setPen(palette().color(QPalette::Text));
-    painter.setBrush(palette().color(QPalette::Button));
+    // A quiet border (it is a handle, not the primary button) and a hover fill.
+    painter.setPen(palette().color(QPalette::Mid));
+    painter.setBrush(underMouse() ? palette().color(QPalette::Midlight) : palette().color(QPalette::Button));
     painter.drawRoundedRect(rect().adjusted(1, 1, -1, -1), 4, 4);
     painter.drawText(rect(), Qt::AlignCenter, tr("⇲ Drag MIDI"));
 }
@@ -134,6 +151,13 @@ midi::ExportOptions drag_export_options(const DocumentController& controller, st
 void DragHandle::mousePressEvent(QMouseEvent* event) {
     pressed_ = event->button() == Qt::LeftButton;
     press_ = event->position().toPoint();
+}
+
+void DragHandle::mouseReleaseEvent(QMouseEvent* event) {
+    // A click without a drag: say how the handle is used (ux-panels-45).
+    if (pressed_ && event->button() == Qt::LeftButton)
+        emit status_message(tr("Drag this onto a DAW track or a folder; from the keyboard use File > Export MIDI…"));
+    pressed_ = false;
 }
 
 void DragHandle::mouseMoveEvent(QMouseEvent* event) {

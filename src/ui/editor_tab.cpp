@@ -9,6 +9,10 @@
 #include <QComboBox>
 #include <QKeyEvent>
 #include <QHBoxLayout>
+#include <QApplication>
+#include <QPixmap>
+#include <QPainter>
+#include <QIcon>
 #include <QHeaderView>
 #include <QPushButton>
 #include <QSplitter>
@@ -101,7 +105,15 @@ TrackListWidget::TrackListWidget(DocumentController& controller, QWidget* parent
             return;
         const auto& track = tracks[static_cast<std::size_t>(item->row())];
         if (item->column() == column_name) {
-            const std::string name = item->text().toStdString();
+            const std::string name = item->text().trimmed().toStdString();
+            if (name.empty()) {
+                // A track always has a name (ux-panels-44): the old one comes back.
+                rebuilding_ = true;
+                item->setText(QString::fromStdString(track.name));
+                rebuilding_ = false;
+                emit status_message(tr("A track needs a name"));
+                return;
+            }
             if (name == track.name)
                 return;
             ChangeBuilder builder(controller_.document(), "Rename track");
@@ -154,28 +166,58 @@ void TrackListWidget::rebuild() {
     const int current_column = table_->currentColumn();
     table_->setRowCount(static_cast<int>(tracks.size()));
     const auto active = controller_.active_track_index();
+    // Items are updated in place, never recreated: a note drag (every edit fires this) costs a
+    // few comparisons, and the item whose itemChanged led here is never deleted under its own
+    // handler. A name being edited is left alone (uiB-35).
+    auto* focus = QApplication::focusWidget();
+    const bool editing_name = focus && table_->viewport()->isAncestorOf(focus) && table_->currentColumn() == column_name;
     for (std::size_t index = 0; index < tracks.size(); ++index) {
         const auto& track = tracks[index];
         const int row = static_cast<int>(index);
-        auto* name = new QTableWidgetItem(QString::fromStdString(track.name));
-        if (active && *active == index) { // the edited track reads bold even when another row is current
-            QFont bold = name->font();
-            bold.setBold(true);
-            name->setFont(bold);
+        auto* name = table_->item(row, column_name);
+        if (!name) {
+            name = new QTableWidgetItem;
+            table_->setItem(row, column_name, name);
         }
-        name->setData(Qt::DecorationRole, color_from_rgba(track.color_rgba));
-        name->setToolTip(track.is_drum ? tr("%1 (drum track)").arg(QString::fromStdString(track.name))
-                                       : QString::fromStdString(track.name));
-        table_->setItem(row, column_name, name);
-        const auto check = [&](int column, bool value, const QString& tip) {
-            auto* item = new QTableWidgetItem;
-            item->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled | Qt::ItemIsSelectable);
-            item->setCheckState(value ? Qt::Checked : Qt::Unchecked);
-            item->setToolTip(tip);
-            item->setData(Qt::AccessibleTextRole, tip); // screen readers say what the box does
-            table_->setItem(row, column, item);
-        };
         const QString track_name = QString::fromStdString(track.name);
+        if (name->text() != track_name && !(editing_name && table_->currentRow() == row))
+            name->setText(track_name);
+        QFont font = name->font();
+        const bool bold = active && *active == index; // the edited track reads bold even when another row is current
+        if (font.bold() != bold) {
+            font.setBold(bold);
+            name->setFont(font);
+        }
+        // The swatch has a border in the base color, so it stays visible on the selection
+        // highlight (ux-visual-29).
+        const QColor color = color_from_rgba(track.color_rgba);
+        if (name->data(Qt::UserRole + 7).value<QColor>() != color) {
+            QPixmap swatch(12, 12);
+            swatch.fill(table_->palette().color(QPalette::Base));
+            QPainter painter(&swatch);
+            painter.fillRect(QRect(1, 1, 10, 10), color);
+            painter.end();
+            name->setData(Qt::DecorationRole, QIcon(swatch));
+            name->setData(Qt::UserRole + 7, color);
+        }
+        const QString tip = track.is_drum ? tr("%1 (drum track)").arg(track_name) : track_name;
+        if (name->toolTip() != tip)
+            name->setToolTip(tip);
+        const auto check = [&](int column, bool value, const QString& check_tip) {
+            auto* item = table_->item(row, column);
+            if (!item) {
+                item = new QTableWidgetItem;
+                item->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+                table_->setItem(row, column, item);
+            }
+            const auto state = value ? Qt::Checked : Qt::Unchecked;
+            if (item->checkState() != state)
+                item->setCheckState(state);
+            if (item->toolTip() != check_tip) {
+                item->setToolTip(check_tip);
+                item->setData(Qt::AccessibleTextRole, check_tip); // screen readers say what the box does
+            }
+        };
         check(column_mute, track.muted, tr("Mute %1").arg(track_name));
         check(column_solo, track.solo, tr("Solo %1").arg(track_name));
     }
@@ -257,6 +299,7 @@ EditorTab::EditorTab(std::unique_ptr<DocumentController> controller, QWidget* pa
     : QWidget(parent), controller_(std::move(controller)) {
     controller_->setParent(nullptr);
     track_list_ = new TrackListWidget(*controller_, this);
+    connect(track_list_, &TrackListWidget::status_message, this, &EditorTab::status_message);
     piano_roll_ = new PianoRollPanel(*controller_, this);
     drum_grid_ = new DrumGridPanel(*controller_, this);
     center_ = new QStackedWidget(this);
@@ -309,6 +352,10 @@ EditorTab::EditorTab(std::unique_ptr<DocumentController> controller, QWidget* pa
             last_track_was_drum_ = drum;
             show_drum_grid(drum);
         }
+        // Lanes that follow the track show the active track's channel (ux-editing-31).
+        const auto channel = default_channel_for(*controller_);
+        for (auto* lane : lanes_)
+            lane->follow_track_channel(channel);
     };
     connect(controller_.get(), &DocumentController::view_state_changed, this, follow_track);
     connect(controller_.get(), &DocumentController::document_changed, this, follow_track);
@@ -323,8 +370,17 @@ EditorTab::~EditorTab() {
 }
 
 void EditorTab::show_drum_grid(bool show) {
+    const bool changed = showing_drum_grid() != show;
     center_->setCurrentWidget(show ? static_cast<QWidget*>(drum_grid_) : piano_roll_);
     lanes_container_->setVisible(!show); // lanes follow the piano roll's time axis, not the grid's
+    if (!changed)
+        return;
+    // The grid draws no selection: edit keys must never act on notes the user cannot see, and
+    // the keyboard goes to the view that is shown (ux-editing-22).
+    if (show)
+        controller_->set_selection({});
+    if (isVisible())
+        (show ? static_cast<QWidget*>(&drum_grid_->view()) : static_cast<QWidget*>(&piano_roll_->view()))->setFocus();
 }
 
 DrumGridView& EditorTab::drum_grid() { return drum_grid_->view(); }

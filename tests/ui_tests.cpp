@@ -2,6 +2,7 @@
 
 #include "mwb/core/note_edit.hpp"
 #include "mwb/app/environment.hpp"
+#include "mwb/core/random.hpp"
 #include "mwb/core/serialization.hpp"
 #include "mwb/document/native_format.hpp"
 #include "mwb/document/recovery.hpp"
@@ -26,6 +27,7 @@
 #include "mwb/ui/theme.hpp"
 
 #include <QApplication>
+#include <QPlainTextEdit>
 
 #include <chrono>
 #include <deque>
@@ -136,6 +138,24 @@ TEST_SUITE("editor_math") {
         const Tick before = mapping.x_to_tick(200);
         mapping.zoom_time_around(200, 2.0);
         CHECK(std::abs(mapping.x_to_tick(200) - before) <= 5);
+    }
+}
+
+TEST_SUITE("controller") {
+    TEST_CASE("an edit that pushes old undo steps out of the budget says so (code-document-17)") {
+        application();
+        auto session = std::make_unique<document::WorkingSession>(make_blank_document("Budget"),
+                                                                  document::SessionOrigin::new_document, std::nullopt, 4096);
+        DocumentController controller(std::move(session));
+        QSignalSpy trimmed(&controller, &DocumentController::history_trimmed);
+        for (int index = 0; index < 40 && trimmed.isEmpty(); ++index) {
+            const NewNote note{controller.active_track(), index * 480, index * 480 + 240, 60, 100, 0, 0};
+            auto changes = insert_notes(controller.document(), std::span(&note, 1));
+            REQUIRE(changes);
+            REQUIRE(controller.apply(*changes));
+        }
+        CHECK(trimmed.count() == 1);
+        CHECK(controller.can_undo()); // the newest step is always kept
     }
 }
 
@@ -2400,6 +2420,67 @@ TEST_SUITE("window") {
 // Reviewer probes, batch 5 (probe_batch5); the library screenshot probe runs only where the
 // reviewer's library exists and saves into the test's temporary workspace.
 
+namespace {
+
+/// The reviewer's 12-file test set (probe_batch5/mkset.py), generated in the test's own folder:
+/// varied tempos, a 3/4 waltz, a 76-character title, and the motif 0 2 4 5 7 5 4 2 in G plus the
+/// same motif transposed to E. Each probe builds its own library from it, so probes never share
+/// a library (and its writer lock) or depend on files outside the test (review_7 T3).
+std::filesystem::path write_probe_library_sources(const std::filesystem::path& directory) {
+    const auto folder = directory / "probe midi";
+    std::filesystem::create_directories(folder);
+    const std::vector<std::string> titles{
+        "Bass groove in D minor take 3 with a very long descriptive title for elision", "Lead hook", "Pad chords C major",
+        "Arp study 120", "Ballad melody", "Funk bass", "Waltz in 3-4", "Motif in G", "Motif in E (transposed)",
+        "Drum-free sketch", "Chorale", "Riff 7"};
+    const int motif[] = {0, 2, 4, 5, 7, 5, 4, 2};
+    DeterministicRandom random(7);
+    for (std::size_t index = 0; index < titles.size(); ++index) {
+        const auto& title = titles[index];
+        DocumentData document = make_blank_document(title);
+        auto& sequence = document.sequences.front();
+        const auto track = sequence.tracks.front().id;
+        ChangeBuilder builder(document, "probe set");
+        builder.insert(sequence.tracks.front().id,
+                       events::tempo(0, static_cast<std::uint32_t>(60'000'000 / (90 + static_cast<int>(index) * 7))));
+        builder.insert(sequence.tracks.front().id, events::time_signature(0, title.starts_with("Waltz") ? 3 : 4, 2));
+        if (title.starts_with("Motif")) {
+            const int base = title.find(" G") != std::string::npos ? 67 : 64;
+            for (int k = 0; k < 8; ++k)
+                builder.add_note(track, k * 240, k * 240 + 220, 0, static_cast<std::uint8_t>(base + motif[k]), 100);
+        } else {
+            const int base = 48 + static_cast<int>(index % 12);
+            const int steps[] = {0, 3, 5, 7, 10, 12};
+            for (int bar = 0; bar < 4; ++bar)
+                for (int step = 0; step < 8; ++step)
+                    if (random.bounded(4) != 0)
+                        builder.add_note(track, bar * 1920 + step * 240, bar * 1920 + step * 240 + 200, 0,
+                                         static_cast<std::uint8_t>(base + steps[random.bounded(6)]),
+                                         static_cast<std::uint8_t>(60 + random.bounded(51)));
+        }
+        REQUIRE(apply_change_set(document, builder.finish()));
+        const auto bytes = midi::export_midi(document, {});
+        REQUIRE(bytes);
+        std::ofstream file(folder / (title + ".mid"), std::ios::binary);
+        file.write(reinterpret_cast<const char*>(bytes->data()), static_cast<std::streamsize>(bytes->size()));
+    }
+    return folder;
+}
+
+/// Opens a fresh library in the test folder with the probe set imported and analyzed.
+void open_probe_library(LibraryPanel& library, const std::filesystem::path& directory) {
+    QSignalSpy messages(&library, &LibraryPanel::status_message);
+    library.open_library(directory / "Test Library", true, true, write_probe_library_sources(directory));
+    REQUIRE(wait_until([&] {
+        for (const auto& message : messages)
+            if (message.at(0).toString().startsWith("Imported"))
+                return true; // the import task analyzes before it reports
+        return false;
+    }, 20000));
+}
+
+} // namespace
+
 TEST_SUITE("reviewer_probe6") {
     TEST_CASE("probe6: where the focus is at startup") {
         WindowFixture fixture;
@@ -2413,11 +2494,7 @@ TEST_SUITE("reviewer_probe6") {
         WindowFixture fixture;
         auto* library = fixture.window->findChild<LibraryPanel*>();
         REQUIRE(library);
-        const std::filesystem::path reviewer_library = std::filesystem::path("C:/Users/user/AppData/Local/Temp/claude/C--Users-user-SoundStaff/e1a24cfc-98ee-406f-b798-a61ae3fd6517/scratchpad/lib5/Test Library");
-        std::error_code exists_error;
-        if (!std::filesystem::exists(reviewer_library / "library.sqlite", exists_error))
-            return; // the reviewer's CLI-made library exists only on the review machine
-        library->open_library(reviewer_library, false, true);
+        open_probe_library(*library, fixture.directory.path());
         auto* table = library->findChild<QTableView*>();
         REQUIRE(table);
         REQUIRE(wait_until([&] { return table->model()->rowCount() >= 12; }, 8000));
@@ -2519,11 +2596,7 @@ TEST_SUITE("reviewer_probe7") {
         WindowFixture fixture;
         auto* library = fixture.window->findChild<LibraryPanel*>();
         REQUIRE(library);
-        const std::filesystem::path reviewer_library = std::filesystem::path("C:/Users/user/AppData/Local/Temp/claude/C--Users-user-SoundStaff/e1a24cfc-98ee-406f-b798-a61ae3fd6517/scratchpad/lib5/Test Library");
-        std::error_code exists_error;
-        if (!std::filesystem::exists(reviewer_library / "library.sqlite", exists_error))
-            return; // the reviewer's CLI-made library exists only on the review machine
-        library->open_library(reviewer_library, false, true);
+        open_probe_library(*library, fixture.directory.path());
         auto* table = library->findChild<QTableView*>();
         REQUIRE(table);
         REQUIRE(wait_until([&] { return table->model()->rowCount() >= 12; }, 8000));
@@ -2789,6 +2862,17 @@ TEST_SUITE("window") {
     }
 }
 
+namespace {
+int tabs_titled(MainWindow& window, const std::string& title) {
+    int count = 0;
+    if (auto* tabs = window.findChild<QTabWidget*>())
+        for (int index = 0; index < tabs->count(); ++index)
+            if (auto* tab = qobject_cast<EditorTab*>(tabs->widget(index)); tab && tab->controller().document().title == title)
+                ++count;
+    return count;
+}
+} // namespace
+
 TEST_SUITE("window") {
     TEST_CASE("crashed work is offered: Recover opens it as a new document, Discard deletes it after asking (code-uiA-12)") {
         WindowFixture fixture;
@@ -2818,9 +2902,26 @@ TEST_SUITE("window") {
             });
         };
         const auto recovered_session = crash("Crashed song", 3);
+        // A session saved after its last edit holds nothing the file lacks: it is not offered,
+        // and its data is removed (code-document-16).
+        Uuid saved_session;
+        {
+            document::WorkingSession session(make_blank_document("Saved song"), document::SessionOrigin::opened_file);
+            auto created = document::RecoveryJournal::create(recovery, session.document(),
+                                                             document::SourceReference{"Saved song", {}, {}, {}});
+            REQUIRE(created);
+            std::shared_ptr<document::RecoveryJournal> journal = std::move(*created);
+            std::ignore = document::connect_recovery(session, journal);
+            ChangeBuilder builder(session.document(), "note");
+            builder.add_note(session.document().sequences.front().tracks.front().id, 0, 480, 0, 60, 100);
+            REQUIRE(session.apply(builder.finish()));
+            journal->mark_saved(1234, session.generation());
+            REQUIRE(journal->flush(true));
+            saved_session = journal->session_id();
+        } // crash after the save
         auto sessions = document::list_recoverable_sessions(recovery);
         REQUIRE(sessions);
-        REQUIRE(sessions->size() == 1);
+        REQUIRE(sessions->size() == 2);
         pick("Recover Checked", false);
         fixture.window->present_recovery(*sessions);
         REQUIRE(wait_until([&] {
@@ -2831,6 +2932,11 @@ TEST_SUITE("window") {
         CHECK(note_count(tab->controller().document()) == 3);
         CHECK(tab->controller().is_dirty());          // a new unsaved document, never the saved file
         CHECK(tab->controller().file_path().empty());
+        CHECK(tabs_titled(*fixture.window, "Saved song") == 0);
+        CHECK(wait_until([&] {
+            auto listed = document::list_recoverable_sessions(recovery);
+            return listed && std::ranges::none_of(*listed, [&](const auto& item) { return item.session_id == saved_session; });
+        }, 5000));
         // Its evidence is replaced by the new document's own journal.
         CHECK(wait_until([&] {
             auto listed = document::list_recoverable_sessions(recovery);
@@ -2868,5 +2974,258 @@ TEST_SUITE("library_ui") {
         CHECK(table->model()->rowCount() == 3);
         CHECK(table->currentIndex().row() == 1);
         CHECK(table->currentIndex().data().toString() == current);
+    }
+}
+
+TEST_SUITE("window") {
+    TEST_CASE("an open document is shown again instead of opened twice (code-uiA-28)") {
+        WindowFixture fixture;
+        const auto path = fixture.directory.path() / "once.mwb";
+        REQUIRE(document::save_native(make_blank_document("Once"), path));
+        auto* tabs = fixture.window->findChild<QTabWidget*>();
+        REQUIRE(fixture.window->open_path(path));
+        REQUIRE(wait_until([&] {
+            auto* tab = fixture.window->current_tab();
+            return tab && tab->controller().file_path() == path;
+        }, 5000));
+        const int count = tabs->count();
+        fixture.window->new_from_template("blank"); // another tab is current now
+        QTest::qWait(100);
+        REQUIRE(fixture.window->open_path(fixture.directory.path() / ".." / fixture.directory.path().filename() / "once.mwb"));
+        QTest::qWait(300);
+        CHECK(tabs->count() == count + 1); // only the blank was added
+        CHECK(fixture.window->current_tab()->controller().file_path() == path);
+    }
+}
+
+TEST_SUITE("keyboard") {
+    TEST_CASE("releasing the mouse leaves a note another live input still holds (uiB-41)") {
+        application();
+        KeyboardWidget keyboard;
+        keyboard.resize(700, 80);
+        keyboard.show();
+        QTest::qWait(20);
+        QSignalSpy on(&keyboard, &KeyboardWidget::note_on);
+        QSignalSpy off(&keyboard, &KeyboardWidget::note_off);
+        const QPoint point(100, keyboard.height() - 6); // the lower half of a white key
+        QTest::mousePress(&keyboard, Qt::LeftButton, Qt::NoModifier, point);
+        REQUIRE(on.count() == 1);
+        const int pitch = on.at(0).at(0).toInt();
+        keyboard.set_key_state(pitch, KeySource::computer_keyboard, true); // also held on the computer keyboard
+        QTest::mouseRelease(&keyboard, Qt::LeftButton, Qt::NoModifier, point);
+        CHECK(off.isEmpty()); // still sounding for the computer keyboard
+        keyboard.set_key_state(pitch, KeySource::computer_keyboard, false);
+        keyboard.set_key_state(pitch, KeySource::playback, true); // playback only lights the key
+        QTest::mousePress(&keyboard, Qt::LeftButton, Qt::NoModifier, point);
+        QTest::mouseRelease(&keyboard, Qt::LeftButton, Qt::NoModifier, point);
+        REQUIRE(off.count() == 1);
+        CHECK(off.at(0).at(0).toInt() == pitch);
+    }
+}
+
+TEST_SUITE("inspector") {
+    TEST_CASE("a mixed-velocity selection shows \"mixed\" and can be set to the first note's value (uiB-33)") {
+        auto controller = make_controller();
+        const std::array<NewNote, 2> notes{NewNote{controller->active_track(), 0, 480, 60, 80, 0, 0},
+                                          NewNote{controller->active_track(), 480, 960, 62, 100, 0, 0}};
+        auto changes = insert_notes(controller->document(), notes);
+        REQUIRE(changes);
+        REQUIRE(controller->apply(*changes));
+        std::set<EventId> all;
+        for (const auto& note : controller->notes().notes)
+            all.insert(note.on_id);
+        controller->set_selection(all);
+        InspectorPanel inspector;
+        inspector.set_controller(controller.get());
+        inspector.show();
+        QTest::qWait(20);
+        QSpinBox* velocity = nullptr;
+        for (auto* box : inspector.findChildren<QSpinBox*>())
+            if (box->specialValueText() == "mixed")
+                velocity = box;
+        REQUIRE(velocity);
+        CHECK(velocity->value() == 0); // shown as "mixed"
+        velocity->setValue(80);         // the first note's velocity
+        emit velocity->editingFinished();
+        QTest::qWait(20);
+        for (const auto& note : controller->notes().notes)
+            CHECK(note.velocity == 80);
+        CHECK(velocity->value() == 80); // all the same now
+    }
+}
+
+TEST_SUITE("track_list") {
+    TEST_CASE("note edits update the track list in place, without recreating its items (uiB-35)") {
+        auto controller = make_controller();
+        TrackListWidget list(*controller);
+        list.show();
+        auto* table = list.findChild<QTableWidget*>();
+        REQUIRE(table);
+        auto* name = table->item(0, 0);
+        auto* mute = table->item(0, 1);
+        REQUIRE(name);
+        const NewNote note{controller->active_track(), 0, 480, 60, 100, 0, 0};
+        auto changes = insert_notes(controller->document(), std::span(&note, 1));
+        REQUIRE(changes);
+        REQUIRE(controller->apply(*changes));
+        CHECK(table->item(0, 0) == name); // the same items, updated where something changed
+        CHECK(table->item(0, 1) == mute);
+        // A rename through the table still works and shows the new name.
+        name->setText("Lead");
+        CHECK(controller->active_sequence().tracks.front().name == "Lead");
+        CHECK(table->item(0, 0)->text() == "Lead");
+    }
+}
+
+TEST_SUITE("drum_grid") {
+    TEST_CASE("new drum steps use the sequence's new-note velocity (uiB-19)") {
+        auto controller = make_controller();
+        {
+            ChangeBuilder builder(controller->document(), "velocity");
+            Sequence updated = sequence_header(controller->active_sequence());
+            updated.settings.default_velocity = 77;
+            builder.set_sequence_properties(updated.id, updated);
+            REQUIRE(controller->apply(builder.finish()));
+        }
+        DrumGridView grid(*controller);
+        grid.resize(800, 400);
+        grid.show();
+        grid.setFocus();
+        QTest::qWait(20);
+        QSignalSpy heard(&grid, &DrumGridView::audition_note_on);
+        QSignalSpy released(&grid, &DrumGridView::audition_note_off);
+        QTest::keyClick(&grid, Qt::Key_Return); // toggles the cell under the cursor
+        const auto notes = controller->notes().notes;
+        REQUIRE(notes.size() == 1);
+        CHECK(notes.front().velocity == 77);
+        CHECK(heard.count() == 1); // the new hit is heard (ux-editing-21)
+        CHECK(wait_until([&] { return released.count() == 1; }, 1000));
+    }
+}
+
+TEST_SUITE("window") {
+    TEST_CASE("keyboard: Alt+Left/Right step through notes, Shift+Left/Right change their length (ux-editing-26)") {
+        WindowFixture fixture;
+        auto* tab = fixture.window->current_tab();
+        REQUIRE(tab);
+        auto& controller = tab->controller();
+        const std::array<NewNote, 3> notes{NewNote{controller.active_track(), 0, 240, 60, 100, 0, 0},
+                                          NewNote{controller.active_track(), 480, 720, 64, 100, 0, 0},
+                                          NewNote{controller.active_track(), 960, 1200, 67, 100, 0, 0}};
+        auto changes = insert_notes(controller.document(), notes);
+        REQUIRE(changes);
+        REQUIRE(controller.apply(*changes));
+        controller.set_edit_cursor(0);
+        tab->piano_roll().setFocus();
+        const auto selected_start = [&] {
+            const auto selected = controller.selected_notes();
+            return selected.size() == 1 ? selected.front().start : Tick{-1};
+        };
+        fixture.key(Qt::Key_Right, Qt::AltModifier);
+        CHECK(selected_start() == 0);
+        fixture.key(Qt::Key_Right, Qt::AltModifier);
+        CHECK(selected_start() == 480);
+        fixture.key(Qt::Key_Left, Qt::AltModifier);
+        CHECK(selected_start() == 0);
+        const auto length = [&] { return controller.selected_notes().front().duration(); };
+        const Tick before = length();
+        fixture.key(Qt::Key_Right, Qt::ShiftModifier);
+        CHECK(length() > before);
+        fixture.key(Qt::Key_Left, Qt::ShiftModifier);
+        CHECK(length() == before);
+        for (int index = 0; index < 20; ++index)
+            fixture.key(Qt::Key_Left, Qt::ShiftModifier);
+        CHECK(length() >= 1); // never below one tick
+    }
+}
+
+TEST_SUITE("inspector") {
+    TEST_CASE("the transform form keeps its values across tab switches and after Q (ux-panels-22/23)") {
+        auto first = make_controller();
+        auto second = make_controller();
+        const NewNote note{first->active_track(), 0, 480, 60, 100, 0, 0};
+        auto changes = insert_notes(first->document(), std::span(&note, 1));
+        REQUIRE(changes);
+        REQUIRE(first->apply(*changes));
+        InspectorPanel inspector;
+        inspector.set_controller(first.get());
+        inspector.show();
+        inspector.focus_tool("transpose");
+        QSpinBox* amount = nullptr;
+        for (auto* box : inspector.findChildren<QSpinBox*>())
+            if (box->minimum() == -100000)
+                amount = box;
+        REQUIRE(amount);
+        amount->setValue(7); // the user's value
+        auto* json = inspector.findChild<QPlainTextEdit*>();
+        REQUIRE(json);
+        const QString parameters = json->toPlainText();
+        inspector.set_controller(second.get()); // another tab
+        inspector.set_controller(first.get());  // and back
+        CHECK(amount->value() == 7);
+        std::set<EventId> all;
+        for (const auto& existing : first->notes().notes)
+            all.insert(existing.on_id);
+        first->set_selection(all);
+        inspector.apply_last_quantize(); // Q from the Transpose tool
+        QTest::qWait(300);
+        CHECK(amount->value() == 7);
+        CHECK(json->toPlainText() == parameters); // form and JSON agree again
+    }
+}
+
+TEST_SUITE("track_list") {
+    TEST_CASE("a track cannot be renamed to nothing; drag files avoid reserved device names (ux-panels-44/45)") {
+        auto controller = make_controller();
+        TrackListWidget list(*controller);
+        list.show();
+        auto* table = list.findChild<QTableWidget*>();
+        REQUIRE(table);
+        const auto before = controller->active_sequence().tracks.front().name;
+        table->item(0, 0)->setText("   ");
+        CHECK(controller->active_sequence().tracks.front().name == before);
+        CHECK(table->item(0, 0)->text() == QString::fromStdString(before));
+        CHECK_FALSE(controller->can_undo());
+
+        test::TemporaryDirectory directory;
+        const std::vector<std::uint8_t> bytes{'M', 'T', 'h', 'd'};
+        for (const auto* title : {"CON", "com1", "Nul.v2"}) {
+            CAPTURE(title);
+            auto written = write_drag_file(directory.path(), title, bytes);
+            REQUIRE_MESSAGE(written, (written ? "" : written.error().describe()));
+            CHECK(std::filesystem::exists(*written));
+            CHECK(written->stem().string().find('_') != std::string::npos);
+        }
+    }
+}
+
+TEST_SUITE("window") {
+    TEST_CASE("Space plays while a number field has the focus (ux-panels-20)") {
+        WindowFixture fixture;
+        auto* tempo = fixture.find<QDoubleSpinBox>([](QDoubleSpinBox* box) { return box->accessibleName() == "Tempo"; });
+        REQUIRE(tempo);
+        tempo->setFocus();
+        QTest::qWait(20);
+        const double before = tempo->value();
+        fixture.key(Qt::Key_Space);
+        CHECK(wait_until([&] { return fixture.transport() == TransportDisplay::State::playing; }, 3000));
+        CHECK(tempo->value() == before); // the field did not take the key
+        fixture.key(Qt::Key_Space);
+        CHECK(wait_until([&] { return fixture.transport() == TransportDisplay::State::stopped; }, 3000));
+    }
+}
+
+TEST_SUITE("window") {
+    TEST_CASE("the window title names the current document and its unsaved state (ux-visual-21)") {
+        WindowFixture fixture;
+        auto* tab = fixture.window->current_tab();
+        REQUIRE(tab);
+        const QString title = QString::fromStdString(tab->controller().document().title);
+        CHECK(fixture.window->windowTitle().contains(title));
+        CHECK_FALSE(fixture.window->isWindowModified());
+        edit_current(*fixture.window, 60);
+        CHECK(fixture.window->isWindowModified());
+        auto* tabs = fixture.window->findChild<QTabWidget*>();
+        CHECK(tabs->tabToolTip(tabs->currentIndex()).contains(title));
     }
 }

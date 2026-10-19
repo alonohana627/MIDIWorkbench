@@ -79,6 +79,10 @@ TempoMap TempoMap::build(const Sequence& sequence) {
         auto& last = map.segments_.back();
         if (meta.tick == last.tick) {
             last.microseconds_per_quarter = value; // Last event at an equal tick wins.
+            // Back to the previous tempo: the segment is redundant, so change_count() does not
+            // report a change that does not exist (code-core-24).
+            if (map.segments_.size() > 1 && map.segments_[map.segments_.size() - 2].microseconds_per_quarter == value)
+                map.segments_.pop_back();
             continue;
         }
         if (value == last.microseconds_per_quarter)
@@ -188,10 +192,13 @@ MeterMap MeterMap::build(const Sequence& sequence) {
             last.denominator = denominator;
             continue;
         }
-        const Tick bar_length = map.ticks_per_bar(last);
+        // Exact rational bar length (num * 4 * ppq / den ticks), never the floored tick count:
+        // with PPQ 1 and 7/8 a floored bar of 3 ticks put tick 70 in bar 23 (code-core-4).
         const Tick offset = meta.tick - last.tick;
-        const std::int64_t whole_bars = bar_length > 0 ? offset / bar_length : 0;
-        const bool partial = bar_length > 0 && offset % bar_length != 0;
+        const auto scaled = static_cast<__int128>(offset) * last.denominator;
+        const auto bar_units = static_cast<__int128>(last.numerator) * 4 * map.ppq_;
+        const auto whole_bars = static_cast<std::int64_t>(bar_units > 0 ? scaled / bar_units : 0);
+        const bool partial = bar_units > 0 && scaled % bar_units != 0;
         MeterSegment next{meta.tick, numerator, denominator, last.first_bar + whole_bars + (partial ? 1 : 0), partial};
         map.segments_.push_back(next);
     }
@@ -234,14 +241,14 @@ BarBeatTick MeterMap::position(Tick tick) const {
     if (bar_length <= 0 || beat_length <= 0)
         return BarBeatTick{segment.first_bar, 0, tick - segment.tick};
     const Tick offset = tick - segment.tick;
-    std::int64_t bar_in_segment = offset / bar_length;
-    // Recompute against the exact rational bar start to avoid drift for unusual divisions.
-    Tick start = bar_start(segment.first_bar + bar_in_segment);
-    if (start > tick && bar_in_segment > 0) {
-        --bar_in_segment;
-        start = bar_start(segment.first_bar + bar_in_segment);
-    }
-    const Tick in_bar = tick - start;
+    // The last bar whose start (bar_start(), which floors n * num * 4 * ppq / den) is at or before
+    // the tick: n * units <= (offset + 1) * den - 1. Computed from the exact rational bar length, so
+    // it always agrees with bar_start() and the tick in the bar is never negative (code-core-4).
+    const auto units = static_cast<__int128>(segment.numerator) * 4 * ppq_;
+    const auto bar_in_segment =
+        static_cast<std::int64_t>(((static_cast<__int128>(offset) + 1) * segment.denominator - 1) / units);
+    const Tick start = bar_start(segment.first_bar + bar_in_segment);
+    const Tick in_bar = std::max<Tick>(0, tick - start);
     return BarBeatTick{segment.first_bar + bar_in_segment, in_bar / beat_length, in_bar % beat_length};
 }
 

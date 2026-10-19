@@ -444,11 +444,13 @@ std::string fts_string_literal(std::string_view folded_text) {
 
 std::string fts_expression(const Predicate& predicate) {
     const auto& text = std::get<std::string>(predicate.value);
+    // FTS5 prefix query: the phrase's last token matches as a prefix (uses the prefix indexes).
+    const std::string phrase = fts_string_literal(text) + (predicate.prefix ? " *" : "");
     switch (predicate.field) {
     case Field::title:
-        return "title : " + fts_string_literal(text);
+        return "title : " + phrase;
     case Field::source:
-        return "source_names : " + fts_string_literal(text);
+        return "source_names : " + phrase;
     case Field::any_text:
     case Field::text:
     case Field::tag:
@@ -476,7 +478,7 @@ std::string fts_expression(const Predicate& predicate) {
     case Field::status:
         break;
     }
-    return fts_string_literal(text);
+    return phrase;
 }
 
 bool supports_relevance(const Query& query) { return !relevance_terms(query).empty(); }

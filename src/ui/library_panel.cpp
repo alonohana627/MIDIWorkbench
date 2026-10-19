@@ -4,6 +4,7 @@
 
 #include "mwb/core/pitch.hpp"
 #include "mwb/library/library.hpp"
+#include "mwb/library/storage.hpp"
 #include "mwb/midi/codec.hpp"
 #include "mwb/ui/drag_export.hpp"
 
@@ -14,6 +15,7 @@
 #include <QDialogButtonBox>
 #include <QFileDialog>
 #include <QListWidget>
+#include <QLocale>
 #include <QMessageBox>
 #include <QHBoxLayout>
 #include <QScrollBar>
@@ -31,6 +33,7 @@
 #include <QCoreApplication>
 #include <QMetaObject>
 #include <QPointer>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QSettings>
 #include <QStandardPaths>
@@ -61,6 +64,7 @@ PageResult load_page(library::Library& library, const std::string& query, std::o
     PageResult result;
     library::SearchRequest request;
     request.query_text = query;
+    request.prefix_last_word = true; // "lea" already finds "lead" while typing (code-library-28)
     request.after = std::move(after);
     auto page = library.search(request, stop);
     if (!page) {
@@ -294,6 +298,11 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
     cancel_import_button_ = new QPushButton(tr("Cancel Import"), this);
     cancel_import_button_->setToolTip(tr("Stop the running import; files already imported stay"));
     cancel_import_button_->hide();
+    import_progress_ = new QProgressBar(this);
+    import_progress_->setAccessibleName(tr("Import progress"));
+    import_progress_->setTextVisible(true);
+    import_progress_->setFormat(tr("%v of %m files"));
+    import_progress_->hide();
     search_ = new QLineEdit(this);
     search_->setPlaceholderText(tr("Search: tag:bass bpm:120..130 key:\"A minor\" text:\"lead\""));
     search_->setClearButtonEnabled(true);
@@ -321,6 +330,7 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
     auto* buttons = new QHBoxLayout;
     buttons->addWidget(open_button);
     buttons->addWidget(import_button_);
+    buttons->addWidget(import_progress_, 1);
     buttons->addWidget(cancel_import_button_);
     buttons->addWidget(trash_button_);
     buttons->addWidget(refresh_button);
@@ -460,7 +470,19 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
         });
         menu.addAction(tr("Remove Tag…"), this, [this] {
             bool accepted = false;
-            const QString tag = QInputDialog::getText(this, tr("Remove tag"), tr("Tag"), QLineEdit::Normal, {}, &accepted);
+            // The tags the selected items have, to pick from instead of retyping (ux-panels-33).
+            QStringList present;
+            for (const auto asset : selected_assets())
+                if (const int position = model_->position_of(asset); position >= 0)
+                    if (const auto* row = model_->row_at(position))
+                        for (const auto& tag : row->tags.split(", ", Qt::SkipEmptyParts))
+                            if (!present.contains(tag, Qt::CaseInsensitive))
+                                present << tag;
+            if (present.isEmpty()) {
+                emit status_message(tr("The selected items have no tags"));
+                return;
+            }
+            const QString tag = QInputDialog::getItem(this, tr("Remove tag"), tr("Tag"), present, 0, false, &accepted);
             if (accepted && !tag.trimmed().isEmpty())
                 run_metadata_task([tag = tag.trimmed().toStdString()](library::Library& library, std::int64_t asset) {
                     return library.remove_tag(asset, tag);
@@ -751,8 +773,10 @@ void LibraryPanel::open_library(const std::filesystem::path& root, bool create, 
                         tr("Library unavailable: %1").arg(QString::fromStdString((*opened).error().describe()));
                     guard->status_->setText(message);
                     guard->empty_status_->setText(message);
-                    if (interactive)
-                        emit guard->status_message(message);
+                    // Also said when the library remembered from last time is gone (unplugged
+                    // drive, moved folder): the dock may be hidden (ux-panels-34).
+                    emit guard->status_message(interactive ? message
+                                                           : message + tr(" — use Open Library… to locate it"));
                     return;
                 }
                 guard->library_ = std::shared_ptr<library::Library>(std::move(**opened));
@@ -805,6 +829,8 @@ void LibraryPanel::import_path(const std::filesystem::path& source) {
     import_stop_ = std::make_shared<std::stop_source>();
     import_button_->setEnabled(false);
     cancel_import_button_->show();
+    import_progress_->setRange(0, 0); // busy until the first file count arrives
+    import_progress_->show();
     import_thread_->post([guard, library, source, parser = import_parser_ ? import_parser_ : parser_,
                          cancel = import_stop_](std::stop_token thread_stop) {
         // Cancel button or panel shutdown, whichever comes first.
@@ -823,8 +849,11 @@ void LibraryPanel::import_path(const std::filesystem::path& source) {
             QMetaObject::invokeMethod(
                 qApp,
                 [guard, done, found] {
-                    if (guard)
-                        guard->status_->setText(tr("Importing: %1 of %2 files… (browsing stays available)").arg(done).arg(found));
+                    if (!guard)
+                        return;
+                    guard->status_->setText(tr("Importing: %1 of %2 files… (browsing stays available)").arg(done).arg(found));
+                    guard->import_progress_->setRange(0, static_cast<int>(std::max<std::size_t>(found, 1)));
+                    guard->import_progress_->setValue(static_cast<int>(done));
                 },
                 Qt::QueuedConnection);
         };
@@ -836,6 +865,22 @@ void LibraryPanel::import_path(const std::filesystem::path& source) {
             // as the import, never this process (section 28.2).
             library::AnalyzeOptions analyze;
             analyze.parser = parser;
+            // The analysis phase reports its own progress instead of a frozen "Importing: N of N"
+            // (ux-panels-31).
+            auto last_analysis_report = std::make_shared<std::chrono::steady_clock::time_point>();
+            analyze.progress = [guard, last_analysis_report](std::size_t done) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now - *last_analysis_report < std::chrono::milliseconds(200))
+                    return;
+                *last_analysis_report = now;
+                QMetaObject::invokeMethod(
+                    qApp,
+                    [guard, done] {
+                        if (guard)
+                            guard->status_->setText(tr("Indexing for melody search: %1 item(s)… (browsing stays available)").arg(done));
+                    },
+                    Qt::QueuedConnection);
+            };
             if (auto analyzed = library->analyze(analyze, stop))
                 analysis = *analyzed;
         }
@@ -864,6 +909,7 @@ void LibraryPanel::import_path(const std::filesystem::path& source) {
                     return;
                 guard->import_button_->setEnabled(true);
                 guard->cancel_import_button_->hide();
+                guard->import_progress_->hide();
                 guard->status_->setText(text);
                 emit guard->status_message(text);
                 guard->refresh_results();
@@ -956,9 +1002,9 @@ void LibraryPanel::apply_watch_hints() {
     const auto root_of = [this](const std::filesystem::path& path) -> std::optional<std::filesystem::path> {
         std::optional<std::filesystem::path> best;
         for (const auto& root : watched_roots_) {
-            const auto relative = path.lexically_normal().lexically_relative(root);
-            if (!relative.empty() && *relative.begin() != ".." &&
-                (!best || root.native().size() > best->native().size()))
+            // Case-insensitive and normalized on Windows: the watcher may report a folder spelled
+            // differently from the stored one (review_7).
+            if (library::relative_inside(path, root) && (!best || root.native().size() > best->native().size()))
                 best = root;
         }
         return best;
@@ -1163,6 +1209,15 @@ void LibraryPanel::fetch_more() {
                     guard->deliver_results(generation, std::move(page->rows), page->error, page->next, true);
             },
             Qt::QueuedConnection);
+    }, [guard] {
+        // A thrown error ends this page load; scrolling can ask again (code-uiA-23).
+        QMetaObject::invokeMethod(
+            qApp,
+            [guard] {
+                if (guard)
+                    guard->fetching_more_ = false;
+            },
+            Qt::QueuedConnection);
     });
 }
 
@@ -1273,7 +1328,7 @@ void LibraryPanel::search_melody(std::vector<std::pair<Tick, std::uint8_t>> onse
 void LibraryPanel::save_document(std::shared_ptr<const DocumentData> document, std::optional<std::int64_t> asset_id,
                                  std::optional<std::int64_t> expected_head, QString title, bool phrase, QObject* origin) {
     if (!library_) {
-        emit status_message(tr("Open a library first (Library… in the library panel)"));
+        emit status_message(tr("Open a library first (Open Library… in the library panel)"));
         return;
     }
     QPointer<LibraryPanel> guard(this);
@@ -1360,19 +1415,57 @@ void LibraryPanel::present_revisions(std::int64_t asset_id, const QString& title
     auto* list = new QListWidget(&dialog);
     for (const auto& revision : *revisions) {
         const QString origin = QString::fromUtf8(library::revision_origin_name(revision.origin).data());
-        auto* item = new QListWidgetItem(tr("#%1  %2  %3  %4 bytes%5%6")
+        // Local date format and the revision's own label ("source change candidate", a save
+        // label) so a revision can be recognized (ux-panels-32).
+        const QString when = QLocale().toString(QDateTime::fromMSecsSinceEpoch(revision.created_ms), QLocale::ShortFormat);
+        const QString label = revision.label.empty() ? QString() : QStringLiteral("  \u201C%1\u201D").arg(QString::fromStdString(revision.label));
+        auto* item = new QListWidgetItem(tr("#%1  %2  %3%4  %5 bytes%6%7")
                                              .arg(revision.ordinal)
-                                             .arg(QDateTime::fromMSecsSinceEpoch(revision.created_ms).toString())
+                                             .arg(when)
                                              .arg(origin)
+                                             .arg(label)
                                              .arg(revision.byte_count)
                                              .arg(revision.pinned ? tr("  pinned") : QString())
                                              .arg(head && *head == revision.id ? tr("  (current)") : QString()),
                                          list);
         item->setData(Qt::UserRole, QVariant::fromValue<qlonglong>(revision.id));
+        item->setData(Qt::UserRole + 1, revision.pinned);
     }
     layout->addWidget(list);
     auto* buttons = new QDialogButtonBox(&dialog);
     auto* restore = buttons->addButton(tr("Restore as New Head"), QDialogButtonBox::AcceptRole);
+    // Pinning keeps a revision from ever being cleaned up (spec 24.3).
+    auto* pin = buttons->addButton(tr("Pin / Unpin"), QDialogButtonBox::ActionRole);
+    connect(pin, &QPushButton::clicked, &dialog, [this, list] {
+        auto* item = list->currentItem();
+        if (!item || !library_)
+            return;
+        const auto revision_id = item->data(Qt::UserRole).toLongLong();
+        const bool pinned = !item->data(Qt::UserRole + 1).toBool();
+        // Shown at once; written on the write thread like every catalog change (section 19.4).
+        item->setData(Qt::UserRole + 1, pinned);
+        QString text = item->text().remove(tr("  pinned"));
+        if (pinned) {
+            const qsizetype current = text.indexOf(tr("  (current)"));
+            text.insert(current < 0 ? text.size() : current, tr("  pinned"));
+        }
+        item->setText(text);
+        QPointer<LibraryPanel> guard(this);
+        auto library = library_;
+        write_thread_->post([guard, library, revision_id, pinned](std::stop_token) {
+            auto changed = library->set_revision_pinned(revision_id, pinned);
+            if (changed)
+                return;
+            const QString message = QString::fromStdString(changed.error().describe());
+            QMetaObject::invokeMethod(
+                qApp,
+                [guard, message] {
+                    if (guard)
+                        emit guard->status_message(tr("Not pinned: %1").arg(message));
+                },
+                Qt::QueuedConnection);
+        });
+    });
     buttons->addButton(QDialogButtonBox::Close);
     layout->addWidget(buttons);
     connect(restore, &QPushButton::clicked, &dialog, &QDialog::accept);
@@ -1641,6 +1734,15 @@ void LibraryPanel::poll_changes() {
                     guard->status_->setText(
                         tr("%n new or changed item(s) are not in this list yet; press Refresh to show them", nullptr,
                            static_cast<int>(unseen)));
+            },
+            Qt::QueuedConnection);
+    }, [guard] {
+        // A thrown storage error ends this poll, not polling for good (code-uiA-23).
+        QMetaObject::invokeMethod(
+            qApp,
+            [guard] {
+                if (guard)
+                    guard->polling_changes_ = false;
             },
             Qt::QueuedConnection);
     });

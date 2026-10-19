@@ -51,8 +51,10 @@ CommandOutput command_library_import(const CommandOptions& options) {
         output.exit_code = exit_partial;
         output.json["status"] = "partial";
     }
-    if (counts.cancelled > 0)
+    if (counts.cancelled > 0) {
         output.exit_code = exit_cancelled;
+        output.json["status"] = "cancelled"; // status agrees with the exit code (code-runtime-33)
+    }
     return output;
 }
 
@@ -115,7 +117,9 @@ CommandOutput command_library_melody(const CommandOptions& options) {
             word = word.substr(0, colon);
         }
         const auto pitch = parse_pitch(word);
-        if (!pitch || duration <= 0)
+        // A melody note is at most 1,000,000 ticks (over 1,000 quarter notes): 256 of them can
+        // never overflow the onset sum (code-runtime-23).
+        if (!pitch || duration <= 0 || duration > 1'000'000)
             return failure("library melody", Error{ErrorCode::invalid_argument, "cannot read the note " + word, {}, {}});
         notes.push_back(search::QueryNote{onset, duration, *pitch, 100});
         onset += duration;

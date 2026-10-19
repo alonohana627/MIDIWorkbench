@@ -5,6 +5,7 @@
 #include "mwb/core/tempo_map.hpp"
 #include "mwb/midi/codec.hpp"
 
+#include <algorithm>
 #include <map>
 #include <MidiFile.h>
 
@@ -146,6 +147,51 @@ TEST_SUITE("import") {
         auto two = import(type2.build());
         REQUIRE(two);
         CHECK(two->document.sequences.size() == 2);
+    }
+
+    TEST_CASE("import limits: an oversized SysEx is refused and a cancelled import stops (code-core-19)") {
+        // One SysEx of max_payload_bytes + 1 bytes (F0, VLQ length, data, F7).
+        midi::ParseLimits limits;
+        limits.max_payload_bytes = 4096;
+        Bytes sysex = {0x00, 0xF0};
+        const std::uint32_t length = static_cast<std::uint32_t>(limits.max_payload_bytes + 1);
+        sysex.push_back(static_cast<std::uint8_t>(0x80 | ((length >> 7) & 0x7F)));
+        sysex.push_back(static_cast<std::uint8_t>(length & 0x7F));
+        sysex.insert(sysex.end(), length - 1, 0x10);
+        sysex.push_back(0xF7);
+        SmfBuilder big;
+        big.tracks.push_back(concat({sysex, end_of_track}));
+        auto refused = midi::import_midi(big.build(), "big.mid", limits);
+        REQUIRE_FALSE(refused);
+        CHECK(refused.error().code == ErrorCode::limit_exceeded);
+        // The same file within the limit imports.
+        limits.max_payload_bytes = length + 16;
+        CHECK(midi::import_midi(big.build(), "big.mid", limits).has_value());
+
+        std::stop_source stop;
+        stop.request_stop();
+        auto cancelled = midi::import_midi(simple_type1(), "x.mid", {}, stop.get_token());
+        REQUIRE_FALSE(cancelled);
+        CHECK(cancelled.error().code == ErrorCode::cancelled);
+    }
+
+    TEST_CASE("a type-0 file with several tracks is flagged, and odd file names never fail the import (code-core-23)") {
+        SmfBuilder type0;
+        type0.format = 0;
+        type0.tracks.push_back(concat({{0x00, 0x90, 0x3C, 0x64}, {0x60, 0x80, 0x3C, 0x00}, end_of_track}));
+        type0.tracks.push_back(concat({{0x00, 0x90, 0x40, 0x64}, {0x60, 0x80, 0x40, 0x00}, end_of_track}));
+        auto several = import(type0.build());
+        REQUIRE(several);
+        CHECK(std::ranges::any_of(several->report.diagnostics,
+                                  [](const Diagnostic& diagnostic) { return diagnostic.code == "smf.type0_tracks"; }));
+        // A name that is not UTF-8 (Windows-1252 "Café") and one with folders and two dots.
+        const auto bytes = simple_type1();
+        auto latin = midi::import_midi(bytes, std::string("Caf\xE9.mid"));
+        REQUIRE(latin);
+        CHECK(latin->document.title == "Caf\xC3\xA9");
+        auto nested = midi::import_midi(bytes, "folder\\sub/song.v2.mid");
+        REQUIRE(nested);
+        CHECK(nested->document.title == "song.v2");
     }
 
     TEST_CASE("PPQ values are preserved exactly") {

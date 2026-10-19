@@ -52,9 +52,8 @@ public:
     /// Absolute, relative or off (section 7.3); Alt during a drag still bypasses snapping.
     void set_snap_mode(SnapMode mode);
     [[nodiscard]] SnapMode snap_mode() const { return snap_mode_; }
-    /// Grid used for snapping (from the sequence settings unless overridden).
+    /// Grid used for snapping (from the sequence settings).
     [[nodiscard]] Grid grid() const;
-    void set_grid_override(std::optional<Rational> fraction);
     [[nodiscard]] const ViewMapping& mapping() const { return mapping_; }
     /// Playhead position for display (sampled from the transport at 30-60 Hz). While following,
     /// the view pages so the playhead stays visible.
@@ -92,6 +91,11 @@ public:
     void select_same_pitch_class();
     void select_same_channel();
     void select_same_duration();
+    /// Keyboard selection (ux-editing-26): the previous (-1) or next (+1) editable note by
+    /// (start, pitch) from the selected note, or from the edit cursor; it is shown and heard.
+    void select_adjacent_note(int direction);
+    /// Lengthens (+1) or shortens (-1) the selected notes by one grid step (never below one tick).
+    void change_length_by_grid(int direction);
     void select_out_of_scale();
     /// Loop Selection: sets the loop to the grid-aligned extent of the selected notes.
     void loop_selection();
@@ -211,7 +215,6 @@ private:
     EditTool tool_ = EditTool::select;
     NoteColorMode color_mode_ = NoteColorMode::track;
     SnapMode snap_mode_ = SnapMode::absolute;
-    std::optional<Rational> grid_override_;
     std::optional<Tick> playhead_;
     bool follow_playhead_ = true;
     bool follow_suspended_ = false;

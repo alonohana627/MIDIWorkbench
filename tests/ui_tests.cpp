@@ -1817,7 +1817,7 @@ TEST_SUITE("window") {
         bar->select_button()->click();
         CHECK_FALSE(controller.selection().empty());
         if (const QByteArray shot = qgetenv("MWB_TEST_SHOT"); !shot.isEmpty()) {
-            apply_theme(Theme::dark);
+            apply_theme(theme_from_name(qEnvironmentVariable("MWB_TEST_THEME", QStringLiteral("dark"))));
             controller.set_selection({});
             QTest::qWait(50);
             fixture.window->grab().save(QString::fromLocal8Bit(shot));
@@ -1869,7 +1869,7 @@ TEST_SUITE("window") {
         CHECK(QApplication::font().pointSizeF() == doctest::Approx(normal));
     }
 
-    TEST_CASE("with the scale on, scale rows are light, rows outside are dark and the root row is accented") {
+    TEST_CASE("with the scale on, scale rows are green, rows outside are gray and the root row is a stronger green") {
         WindowFixture fixture;
         auto* tab = fixture.window->current_tab();
         auto* bar = fixture.window->findChild<ScaleBar*>();
@@ -1884,11 +1884,13 @@ TEST_SUITE("window") {
             return image.pixelColor(PianoRollView::keyboard_width + 300,
                                     PianoRollView::ruler_height + static_cast<int>(mapping.pitch_to_y(pitch) + mapping.row_height / 2));
         };
-        const auto lightness = [](const QColor& color) { return color.lightnessF(); };
-        // D and E (in C major) against C# and D# (outside): a clear step, not a faint tint.
-        CHECK(lightness(row_color(62)) > lightness(row_color(61)) + 0.08);
-        CHECK(lightness(row_color(64)) > lightness(row_color(63)) + 0.08);
-        CHECK(row_color(60) != row_color(62)); // the root row carries the accent
+        // Scale rows are clearly green; rows outside are gray (hatched), never green.
+        const auto green = [](const QColor& color) { return color.green() - std::max(color.red(), color.blue()); };
+        for (const int pitch : {60, 62, 64, 65, 67})
+            CHECK(green(row_color(pitch)) >= 25);
+        for (const int pitch : {61, 63, 66})
+            CHECK(green(row_color(pitch)) < 10);
+        CHECK(row_color(60) != row_color(62)); // the root row is a stronger green
     }
 }
 

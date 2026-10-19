@@ -41,13 +41,22 @@ constexpr std::size_t simple_note_threshold = 4000;
 constexpr int scrollbar_resolution = 100000;
 constexpr std::size_t zoom_history_limit = 50;
 
-/// Row fill while the scale is shown: scale rows clearly lighter than rows outside it.
-QColor scale_row_color(const RollColors& colors, bool in_scale) {
+/// Row colors while the scale is shown. Scale membership is the only thing rows show then:
+/// scale rows are green (a hue no note color mode uses by default), the root rows a stronger
+/// green, and rows outside the scale dark gray with hatching, so the pattern reads at a glance.
+struct ScaleRowColors {
+    QColor in;
+    QColor root;
+    QColor out;
+    QColor hatch;
+};
+
+ScaleRowColors scale_row_colors(const RollColors& colors) {
     if (colors.high_contrast)
-        return in_scale ? QColor("#3A3A3A") : QColor("#000000");
+        return {QColor("#00703C"), QColor("#00B860"), QColor("#000000"), QColor("#4A4A4A")};
     if (colors.dark)
-        return in_scale ? QColor("#363A42") : QColor("#101114");
-    return in_scale ? QColor("#FFFFFF") : QColor("#CDD1D8");
+        return {QColor("#1F6B45"), QColor("#2FA066"), QColor("#0C0D0F"), QColor("#262A30")};
+    return {QColor("#B4E6C6"), QColor("#3CAA6E"), QColor("#A9AFB8"), QColor("#8E959F")};
 }
 
 bool is_black_key(int pitch) {
@@ -559,16 +568,17 @@ void PianoRollView::paint_rows(QPainter& painter, const QRectF& area) {
     const QColor black = colors.black_row;
     // With the scale on, rows read by scale membership instead of key color: scale rows are
     // light, rows outside the scale are dark, and the root rows carry the accent.
-    const QColor in_row = scale_row_color(colors, true);
-    const QColor out_row = scale_row_color(colors, false);
-    QColor root_tint = palette().color(QPalette::Highlight);
-    root_tint.setAlpha(colors.high_contrast ? 120 : 80);
+    const ScaleRowColors scale = scale_row_colors(colors);
+    const QBrush hatch(scale.hatch, Qt::BDiagPattern);
     for (const int pitch : visible_rows(area.height())) {
         const QRectF row(0, row_y(pitch), area.width(), mapping_.row_height);
         if (highlight) {
-            painter.fillRect(row, in_scale(pitch) ? in_row : out_row);
-            if (in_scale(pitch) && is_root(pitch))
-                painter.fillRect(row, root_tint);
+            if (!in_scale(pitch)) {
+                painter.fillRect(row, scale.out);
+                painter.fillRect(row, hatch);
+            } else {
+                painter.fillRect(row, is_root(pitch) ? scale.root : scale.in);
+            }
         } else {
             painter.fillRect(row, is_black_key(pitch) ? black : white);
         }
@@ -912,15 +922,28 @@ void PianoRollView::paint_keyboard(QPainter& painter) {
         const double edge_left = black ? key_left + black_width : key_left;
         painter.drawLine(QPointF(edge_left, y + mapping_.row_height - 0.5), QPointF(key.right(), y + mapping_.row_height - 0.5));
         if (sequence.settings.highlight_scale) {
+            const ScaleRowColors scale = scale_row_colors(colors);
             if (!in_scale(pitch)) {
-                // Keys outside the scale are shaded, so the scale's keys stand out as a pattern.
+                // Keys outside the scale are grayed out, so the scale's keys stand out as a pattern.
                 QColor shade = colors.ruler_background;
-                shade.setAlpha(colors.high_contrast ? 200 : 170);
+                shade.setAlpha(colors.high_contrast ? 210 : 185);
                 painter.fillRect(key, shade);
             } else {
-                // A bar in the accent color on every scale key, a wide one on the root.
-                const double bar = is_root(pitch) ? 10.0 : 4.0;
-                painter.fillRect(QRectF(key.right() - bar, y, bar, mapping_.row_height - 1), palette().color(QPalette::Highlight));
+                // Scale keys: a green strip matching their rows (stronger on the root) and the
+                // note name, so the scale can be read off the keyboard.
+                const double strip = std::round(key_width * 0.42);
+                const QRectF tag(key.right() - strip, y, strip, mapping_.row_height - 1);
+                painter.fillRect(tag, is_root(pitch) ? scale.root : scale.in);
+                if (mapping_.row_height >= 9) {
+                    painter.setPen(colors.dark || colors.high_contrast ? QColor(Qt::white) : QColor("#10301E"));
+                    QFont name_font = painter.font();
+                    name_font.setBold(is_root(pitch));
+                    painter.setFont(name_font);
+                    painter.drawText(tag, Qt::AlignCenter,
+                                     QString::fromStdString(pitch_class_name(pitch % 12)));
+                    name_font.setBold(false);
+                    painter.setFont(name_font);
+                }
             }
         }
         if (pitch % 12 == 0 && mapping_.row_height >= 7) {

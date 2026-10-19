@@ -446,7 +446,7 @@ void RecordingController::journal_full_chunks() {
         const auto slice = raw.subspan(journaled_chunks_ * app::take_chunk_messages, app::take_chunk_messages);
         document::CaptureChunk chunk;
         chunk.take = recorder_->take_id();
-        chunk.track = controller_->active_track();
+        chunk.track = recorder_->track(); // the take's track, even if another track was selected since
         chunk.ordinal = static_cast<std::int32_t>(journaled_chunks_);
         chunk.start_tick = record_start_;
         chunk.first_time_ns = std::max<std::int64_t>(0, slice.front().time_ns);

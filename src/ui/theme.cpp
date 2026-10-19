@@ -86,6 +86,29 @@ public:
         QProxyStyle::drawPrimitive(element, option, painter, widget);
     }
 
+    void drawComplexControl(ComplexControl control, const QStyleOptionComplex* option, QPainter* painter,
+                            const QWidget* widget) const override {
+        QProxyStyle::drawComplexControl(control, option, painter, widget);
+        // Spin boxes keep Fusion's arrow buttons (a style-sheet border would remove them) and get
+        // the same 3:1 field edge as line edits and combos, drawn over Fusion's faint frame
+        // (ux-visual-2). Focus keeps the highlight color.
+        if (control == CC_SpinBox && g_resolved != Theme::high_contrast) {
+            const auto* spin = qstyleoption_cast<const QStyleOptionSpinBox*>(option);
+            if (!spin || !spin->frame)
+                return;
+            const bool focused = (option->state & State_HasFocus) != 0;
+            const bool enabled = (option->state & State_Enabled) != 0;
+            painter->save();
+            painter->setRenderHint(QPainter::Antialiasing);
+            painter->setPen(QPen(focused ? option->palette.color(QPalette::Highlight)
+                                         : enabled ? control_edge() : option->palette.color(QPalette::Disabled, QPalette::WindowText),
+                                 1.0));
+            painter->setBrush(Qt::NoBrush);
+            painter->drawRoundedRect(QRectF(option->rect).adjusted(0.5, 0.5, -0.5, -0.5), 2.0, 2.0);
+            painter->restore();
+        }
+    }
+
     QIcon standardIcon(StandardPixmap icon, const QStyleOption* option, const QWidget* widget) const override {
         // Fusion's toolbar overflow glyph is a few grey pixels; users must see that more controls exist.
         if (icon == SP_ToolBarHorizontalExtensionButton || icon == SP_ToolBarVerticalExtensionButton)

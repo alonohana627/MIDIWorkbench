@@ -88,6 +88,7 @@ protected:
     void dragEnterEvent(QDragEnterEvent* event) override;
     void dropEvent(QDropEvent* event) override;
     void changeEvent(QEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
 
 private:
     QAction* add_command(const QString& id, const QString& text, const QKeySequence& shortcut,
@@ -211,6 +212,8 @@ private:
     /// activates it when it is a button or a check cell, a mouse-focused control leaves Space to Play.
     QPointer<QWidget> keyboard_focus_;
     QLabel* step_label_ = nullptr; ///< "STEP" while step recording is armed.
+    QAction* snap_label_action_ = nullptr; ///< " Snap " caption; hidden in the compact toolbar.
+    bool compact_toolbar_ = false;
     QAction* snap_off_action_ = nullptr;
     QAction* snap_relative_action_ = nullptr;
     QAction* follow_action_ = nullptr;

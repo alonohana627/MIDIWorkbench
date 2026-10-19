@@ -376,7 +376,22 @@ void AudioEngine::render(float* interleaved_stereo, std::uint32_t frame_count) n
     // Clock seqlock write (wait-free for the render thread).
     const playback::SchedulerClock scheduler_clock = scheduler_.clock();
     clock_sequence_.fetch_add(1, std::memory_order_acq_rel);
-    clock_steady_ns_.store(start_ns, std::memory_order_relaxed);
+    // Callback start times jitter: a late wake-up (timer resolution, a busy machine) and the
+    // catch-up burst after it start callbacks later than their frames, though the device plays
+    // the frames at its rate. The published clock follows the frame count at the sample rate,
+    // takes the earliest observation (a callback never starts before its frames are due) and
+    // drifts slowly toward later ones, so mapping an input time to a tick does not jump by a
+    // period between callbacks (review_2 T2). A gap of more than 200 ms restarts the estimate.
+    const std::int64_t predicted =
+        clock_reference_ns_ + static_cast<std::int64_t>(static_cast<__int128>(start_frame - clock_reference_frame_) *
+                                                        1'000'000'000 / std::max<std::uint32_t>(sample_rate_, 1));
+    std::int64_t frame_time = start_ns;
+    if (clock_reference_valid_ && start_ns >= predicted && start_ns - predicted < 200'000'000)
+        frame_time = predicted + (start_ns - predicted) / 64;
+    clock_reference_ns_ = frame_time;
+    clock_reference_frame_ = start_frame;
+    clock_reference_valid_ = true;
+    clock_steady_ns_.store(frame_time, std::memory_order_relaxed);
     clock_absolute_.store(start_frame, std::memory_order_relaxed);
     clock_anchor_.store(scheduler_clock.anchor, std::memory_order_relaxed);
     clock_iteration_.store(scheduler_clock.iteration, std::memory_order_relaxed);

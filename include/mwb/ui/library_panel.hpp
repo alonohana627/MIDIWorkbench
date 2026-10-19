@@ -105,6 +105,8 @@ public:
     /// Opens (or creates) the library at `root` without blocking the GUI.
     void open_library(const std::filesystem::path& root, bool create);
     [[nodiscard]] bool is_open() const { return library_ != nullptr; }
+    /// Moves the chosen result to the trash after a confirmation (context menu, Delete key).
+    void trash_selected();
 
 signals:
     void open_requested(DocumentData document, qint64 asset_id, qint64 revision_id);
@@ -113,6 +115,10 @@ signals:
     void status_message(const QString& text);
     /// A library was opened or created (the main window then shows the panel).
     void opened();
+
+protected:
+    /// Delete/Backspace on the results move the item to the trash (never notes in the editor).
+    bool eventFilter(QObject* watched, QEvent* event) override;
 
 private:
     void choose_library();

@@ -907,3 +907,31 @@ TEST_SUITE("scheduler") {
         CHECK(std::abs(linear_tick_at(*snapshot, scheduler.clock(), 48000) - 3840) <= 1);
     }
 }
+
+TEST_SUITE("scheduler") {
+    TEST_CASE("the transport clock is continuous across the end of a count-in") {
+        DocumentData document = make_blank_document();
+        add_note(document, first_track(document), 0, 96000, 60);
+        PlaybackOptions options;
+        options.sample_rate = 48000;
+        const auto snapshot = compile(document, options);
+        Scheduler scheduler;
+        NullSink ignore;
+        REQUIRE(scheduler.set_snapshot(snapshot.get(), ignore));
+        scheduler.start(0, ignore, 0, 1); // one bar of 4/4 at 120 BPM: the song starts at frame 96000
+        Tick previous = linear_tick_at(*snapshot, scheduler.clock(), 94900);
+        for (std::int64_t frame = 95000; frame <= 97000; frame += 100) {
+            const Tick tick = linear_tick_at(*snapshot, scheduler.clock(), frame);
+            CHECK(tick >= previous);
+            CHECK(tick - previous <= 5); // 100 frames at 120 BPM, PPQ 960 are 4 ticks
+            previous = tick;
+        }
+        // Processing blocks through the count-in end does not move the clock's anchor.
+        const auto before = scheduler.clock();
+        for (int block = 0; block < 400; ++block)
+            std::ignore = scheduler.process_block(480, ignore); // 4 s: past the count-in
+        CHECK_FALSE(scheduler.in_count_in());
+        CHECK(scheduler.clock().anchor == before.anchor);
+        CHECK(linear_tick_at(*snapshot, scheduler.clock(), 96000) == 0);
+    }
+}

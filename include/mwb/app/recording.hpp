@@ -88,6 +88,8 @@ public:
     /// Identity the finished take will carry, fixed when recording starts so capture chunks
     /// journaled during the take and the final TakeInsert refer to the same take.
     [[nodiscard]] const TakeId& take_id() const { return take_id_; }
+    /// Track the take records into (fixed when recording starts).
+    [[nodiscard]] TrackId track() const { return track_; }
 
 private:
     TrackId track_;

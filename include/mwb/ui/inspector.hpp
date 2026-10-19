@@ -1,9 +1,13 @@
 #pragma once
 
+#include "mwb/ui/task_thread.hpp"
+
 #include <QPointer>
 #include <QWidget>
 
 #include <array>
+#include <cstdint>
+#include <memory>
 #include <optional>
 
 class QCheckBox;
@@ -66,6 +70,14 @@ private:
     void update_position_suffixes();
     void update_parameters_from_form();
     void preview();
+    /// Computes the preview on the transform thread (section 20.1: expensive transforms never run
+    /// on the GUI thread); `apply_when_ready` applies it as soon as it arrives (Apply, Q).
+    void request_preview(bool apply_when_ready);
+    void preview_ready(std::shared_ptr<music::TransformPreview> result, const QString& error, std::uint64_t generation,
+                       std::uint64_t serial);
+    void apply_pending();
+    /// Sets the transform report; an empty report hides its row (no dead space, ux-visual-15).
+    void set_report(const QString& text);
     void apply_preview();
     void cancel_preview();
     void insert_chord();
@@ -127,10 +139,13 @@ private:
     QLabel* report_ = nullptr;
     std::unique_ptr<music::TransformPreview> pending_;
     std::uint64_t pending_generation_ = 0;
+    std::uint64_t preview_serial_ = 0;   ///< Newest preview request; older results are dropped.
+    bool apply_when_ready_ = false;
     QString last_quantize_json_;
     bool updating_ = false;
     /// Values shown at the last refresh (start, length, pitch, velocity, channel).
     std::array<int, 5> shown_{};
+    TaskThread transform_thread_;        ///< Last member: joined first on destruction.
 };
 
 } // namespace mwb::ui

@@ -178,6 +178,10 @@ private:
     bool end_reached_in_callback_ = false;
     std::int64_t output_latency_ns_ = 0;
     std::uint64_t runs_ = 0;   ///< Render thread only; published through the clock.
+    /// Render thread only: the smoothed time of the last callback's first frame (see render()).
+    std::int64_t clock_reference_ns_ = 0;
+    std::int64_t clock_reference_frame_ = 0;
+    bool clock_reference_valid_ = false;
     /// Recently published snapshots (owner thread) so transport_tick_at() can map through the
     /// snapshot the render thread reports, also just after a newer one was published.
     std::deque<std::shared_ptr<const playback::PlaybackSnapshot>> recent_;

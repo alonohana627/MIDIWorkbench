@@ -6,6 +6,8 @@
 #include "mwb/ui/drum_grid.hpp"
 
 #include <QCheckBox>
+#include <QComboBox>
+#include <QKeyEvent>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QPushButton>
@@ -32,7 +34,17 @@ QColor color_from_rgba(std::uint32_t rgba) {
 
 TrackListWidget::TrackListWidget(DocumentController& controller, QWidget* parent)
     : QWidget(parent), controller_(controller) {
+    // Type-2 files hold several sequences (spec 12: "a type-2 import displays a sequence
+    // selector"); the selector is shown only when there is more than one.
+    sequence_ = new QComboBox(this);
+    sequence_->setAccessibleName(tr("Sequence"));
+    sequence_->setToolTip(tr("This file holds several independent sequences; choose the one to show and edit"));
+    connect(sequence_, &QComboBox::activated, this, [this](int index) {
+        if (!rebuilding_ && index >= 0)
+            controller_.set_active_sequence(static_cast<std::size_t>(index));
+    });
     table_ = new QTableWidget(this);
+    table_->installEventFilter(this);
     table_->setColumnCount(column_count);
     table_->setHorizontalHeaderLabels({tr("Track"), tr("M"), tr("S")});
     table_->horizontalHeader()->setSectionResizeMode(column_name, QHeaderView::Stretch);
@@ -67,12 +79,15 @@ TrackListWidget::TrackListWidget(DocumentController& controller, QWidget* parent
     buttons->addStretch(1);
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
+    layout->addWidget(sequence_);
     layout->addWidget(table_, 1);
     layout->addLayout(buttons);
     connect(&controller_, &DocumentController::document_changed, this, &TrackListWidget::rebuild);
     connect(&controller_, &DocumentController::view_state_changed, this, &TrackListWidget::rebuild);
-    connect(table_, &QTableWidget::currentCellChanged, this, [this](int row, int, int, int) {
-        if (rebuilding_ || row < 0)
+    connect(table_, &QTableWidget::currentCellChanged, this, [this](int row, int column, int, int) {
+        // Only the name column chooses the active (edited and recorded) track: clicking another
+        // track's M or S mutes or solos it without switching the editor (ux-panels-6).
+        if (rebuilding_ || row < 0 || column != column_name)
             return;
         const auto& tracks = controller_.active_sequence().tracks;
         if (static_cast<std::size_t>(row) < tracks.size())
@@ -102,8 +117,30 @@ TrackListWidget::TrackListWidget(DocumentController& controller, QWidget* parent
 }
 
 
+bool TrackListWidget::eventFilter(QObject* watched, QEvent* event) {
+    if (watched == table_ && event->type() == QEvent::KeyPress) {
+        const auto* key = static_cast<QKeyEvent*>(event);
+        if ((key->key() == Qt::Key_Delete || key->key() == Qt::Key_Backspace) && key->modifiers() == Qt::NoModifier) {
+            delete_active_track(); // undoable; the last track is kept (a rename editor has its own focus)
+            return true;
+        }
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
 void TrackListWidget::rebuild() {
     rebuilding_ = true;
+    {
+        const auto& sequences = controller_.document().sequences;
+        sequence_->clear();
+        for (std::size_t index = 0; index < sequences.size(); ++index) {
+            const auto& name = sequences[index].name;
+            sequence_->addItem(name.empty() ? tr("Sequence %1").arg(index + 1)
+                                            : tr("Sequence %1: %2").arg(index + 1).arg(QString::fromStdString(name)));
+        }
+        sequence_->setCurrentIndex(static_cast<int>(controller_.active_sequence_index()));
+        sequence_->setVisible(sequences.size() > 1);
+    }
     const auto& tracks = controller_.active_sequence().tracks;
     if (delete_button_) {
         delete_button_->setEnabled(tracks.size() > 1); // a sequence keeps at least one track
@@ -116,6 +153,11 @@ void TrackListWidget::rebuild() {
         const auto& track = tracks[index];
         const int row = static_cast<int>(index);
         auto* name = new QTableWidgetItem(QString::fromStdString(track.name));
+        if (active && *active == index) { // the edited track reads bold even when another row is current
+            QFont bold = name->font();
+            bold.setBold(true);
+            name->setFont(bold);
+        }
         name->setData(Qt::DecorationRole, color_from_rgba(track.color_rgba));
         name->setToolTip(track.is_drum ? tr("%1 (drum track)").arg(QString::fromStdString(track.name))
                                        : QString::fromStdString(track.name));
@@ -244,6 +286,8 @@ EditorTab::EditorTab(std::unique_ptr<DocumentController> controller, QWidget* pa
     layout->addWidget(horizontal);
 
     add_lane(LaneTarget{LaneTarget::Kind::velocity, 0, 0});
+    // Tab goes from the track list (and its buttons) straight to the editor surface.
+    QWidget::setTabOrder(track_list_, &piano_roll_->view());
     connect(&piano_roll_->view(), &PianoRollView::mapping_changed, this, &EditorTab::sync_lanes);
     connect(controller_.get(), &DocumentController::document_changed, this, &EditorTab::sync_lanes);
     connect(&drum_grid_->view(), &DrumGridView::status_message, this, &EditorTab::status_message);

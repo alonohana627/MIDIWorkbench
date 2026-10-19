@@ -123,7 +123,14 @@ public:
     explicit ExternalMidiRouter(platform::AudioEngine& engine) : engine_(engine) {
         thread_ = std::jthread([this](std::stop_token stop) { run(stop); });
     }
-    ~ExternalMidiRouter() {
+    ~ExternalMidiRouter() { shutdown(); }
+
+    /// Stops forwarding and sends what the (closed) engine still queued. Called while the engine
+    /// is alive; afterwards the router never touches the engine again, so another thread may
+    /// still hold (and finally destroy) it. Idempotent.
+    void shutdown() {
+        if (std::exchange(shut_down_, true))
+            return;
         thread_.request_stop();
         if (thread_.joinable())
             thread_.join();
@@ -207,6 +214,7 @@ private:
     std::unique_ptr<platform::IMidiBackend> backend_;
     std::map<std::string, std::unique_ptr<platform::IMidiOutput>> outputs_;
     std::map<std::uint64_t, platform::IMidiOutput*> routes_;
+    bool shut_down_ = false; ///< Owner (GUI) thread only.
     std::jthread thread_;
 };
 
@@ -278,11 +286,17 @@ public:
                 // the snapshot is then delivered on the GUI thread, which owns the engine's publish side.
                 QString problems;
                 // `self` is valid here: the service destroys (and joins) the compiler first. The
-                // router lock is held so a device reopen cannot destroy the router meanwhile.
+                // router is copied under the lock and used without it, so a slow MIDI driver open
+                // never blocks the GUI; a router replaced meanwhile was shut down first and no
+                // longer uses the engine.
                 if (snapshot) {
-                    std::lock_guard lock(self->router_mutex_);
-                    if (self->router_)
-                        problems = self->router_->update_routes(*snapshot);
+                    std::shared_ptr<ExternalMidiRouter> router;
+                    {
+                        std::lock_guard lock(self->router_mutex_);
+                        router = self->router_;
+                    }
+                    if (router)
+                        problems = router->update_routes(*snapshot);
                 }
                 QMetaObject::invokeMethod(
                     qApp, // context outlives the task; the lambda checks the guard
@@ -624,10 +638,14 @@ private:
     void close_device() {
         if (engine_)
             engine_->close();
+        std::shared_ptr<ExternalMidiRouter> router;
         {
             std::lock_guard lock(router_mutex_);
-            router_.reset();
+            router = std::move(router_);
         }
+        if (router)
+            router->shutdown(); // drains the engine's queue now, while the engine still exists
+        router.reset();
         std::lock_guard lock(live_mutex_);
         engine_.reset();
         output_.reset();

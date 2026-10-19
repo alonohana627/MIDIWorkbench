@@ -29,6 +29,10 @@ class TrackListWidget : public QWidget {
 public:
     explicit TrackListWidget(DocumentController& controller, QWidget* parent = nullptr);
 
+protected:
+    /// Delete/Backspace in the track table delete the active track (not notes in the editor).
+    bool eventFilter(QObject* watched, QEvent* event) override;
+
 private:
     void rebuild();
     void set_track_flag(TrackId track, int column, bool value);
@@ -38,6 +42,7 @@ private:
     void move_active_track(int direction);
 
     DocumentController& controller_;
+    QComboBox* sequence_ = nullptr; ///< Sequence selector, shown for multi-sequence (type 2) documents.
     QTableWidget* table_ = nullptr;
     bool rebuilding_ = false;
     QWidget* delete_button_ = nullptr;

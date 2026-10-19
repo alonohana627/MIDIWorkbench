@@ -352,17 +352,7 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
                     return library.set_role(asset, role);
                 });
         });
-        menu.addAction(tr("Move to Trash…"), this, [this] {
-            const LibraryRow* row = model_->row_at(table_->currentIndex().row());
-            if (!row ||
-                QMessageBox::question(this, tr("Move to Trash"),
-                                      tr("Move \"%1\" to the trash? Re-importing the file brings it back.").arg(row->title)) !=
-                    QMessageBox::Yes)
-                return;
-            run_metadata_task([](library::Library& library, std::int64_t asset) {
-                return library.trash(std::vector<std::int64_t>{asset}); // a metadata state; restorable
-            }, true);
-        });
+        menu.addAction(tr("Move to Trash…"), this, &LibraryPanel::trash_selected);
         auto* rating_menu = menu.addMenu(tr("Rating"));
         const LibraryRow* current = model_->row_at(table_->currentIndex().row());
         for (int rating = 0; rating <= 5; ++rating) {
@@ -373,6 +363,7 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
         }
         menu.exec(table_->viewport()->mapToGlobal(point));
     });
+    table_->installEventFilter(this);
     // Reached with Tab, pressed with Return or Space; a click leaves the focus in the editor.
     for (auto* button : findChildren<QPushButton*>())
         button->setFocusPolicy(Qt::TabFocus);
@@ -392,6 +383,28 @@ LibraryPanel::~LibraryPanel() {
     read_thread_.reset();
     browse_thread_.reset();
     write_thread_.reset(); // drains
+}
+
+void LibraryPanel::trash_selected() {
+    const LibraryRow* row = model_->row_at(table_->currentIndex().row());
+    if (!row || QMessageBox::question(this, tr("Move to Trash"),
+                                      tr("Move \"%1\" to the trash? Re-importing the file brings it back.").arg(row->title)) !=
+                    QMessageBox::Yes)
+        return;
+    run_metadata_task([](library::Library& library, std::int64_t asset) {
+        return library.trash(std::vector<std::int64_t>{asset}); // a metadata state; restorable
+    }, true);
+}
+
+bool LibraryPanel::eventFilter(QObject* watched, QEvent* event) {
+    if (watched == table_ && event->type() == QEvent::KeyPress) {
+        const auto* key = static_cast<QKeyEvent*>(event);
+        if ((key->key() == Qt::Key_Delete || key->key() == Qt::Key_Backspace) && key->modifiers() == Qt::NoModifier) {
+            trash_selected();
+            return true;
+        }
+    }
+    return QWidget::eventFilter(watched, event);
 }
 
 void LibraryPanel::focus_search() {

@@ -10,6 +10,7 @@
 #include "mwb/ui/clipboard.hpp"
 #include "mwb/ui/document_controller.hpp"
 #include "mwb/ui/drag_export.hpp"
+#include "mwb/ui/drum_grid.hpp"
 #include "mwb/ui/editor_math.hpp"
 #include "mwb/ui/keyboard_widget.hpp"
 #include "mwb/ui/controller_lane.hpp"
@@ -21,21 +22,28 @@
 #include "mwb/ui/playback_service.hpp"
 #include "mwb/ui/recording_controller.hpp"
 #include "mwb/ui/tempo_field.hpp"
+#include "mwb/ui/theme.hpp"
 
 #include <QApplication>
 
 #include <chrono>
+#include <cmath>
 #include <mutex>
 #include <QAction>
 #include <QCheckBox>
+#include <QDoubleSpinBox>
 #include <QComboBox>
 #include <QKeyEvent>
 #include <QWheelEvent>
 #include <QLabel>
 #include <QPushButton>
 #include <QSettings>
+#include <QSpinBox>
+#include <QStyleOption>
 #include <QTableView>
+#include <QTabWidget>
 #include <QTableWidget>
+#include <QToolBar>
 #include <QToolButton>
 #include <QLineEdit>
 #include <QMimeData>
@@ -641,14 +649,20 @@ TEST_SUITE("recording") {
             CHECK(*during < 0); // the count-in lies before the take start
         }
         REQUIRE(wait_until([&] { return playback->display().state == TransportDisplay::State::recording; }, 3000));
+        // Recording follows the rendered block; what is heard lags by the output latency, so wait
+        // until the heard position has passed the take start (review_2 T2).
+        REQUIRE(wait_until([&] {
+            const auto heard = playback->transport_tick_at(steady_ns());
+            return heard && *heard >= 0;
+        }, 2000));
         const std::int64_t now = steady_ns();
         const auto first = playback->transport_tick_at(now);
         const auto later = playback->transport_tick_at(now + 250'000'000); // 250 ms later
         REQUIRE(first);
         REQUIRE(later);
-        CHECK(*first >= 0);
-        // 250 ms at 120 bpm and 4x speed is two beats: 1920 ticks at PPQ 960.
-        CHECK(std::abs((*later - *first) - 1920) <= 2);
+        // 250 ms at 120 bpm and 4x speed is two beats: 1920 ticks at PPQ 960. The two reads may
+        // straddle a callback; the smoothed engine clock keeps that within a few ticks.
+        CHECK(std::abs((*later - *first) - 1920) <= 20);
         playback->stop(0);
         CHECK(playback->display().state == TransportDisplay::State::stopped);
         CHECK_FALSE(playback->transport_tick_at(steady_ns()));
@@ -1197,13 +1211,19 @@ TEST_SUITE("window") {
         auto* tab = fixture.window->current_tab();
         auto* label = fixture.window->findChild<QLabel*>("transport.position");
         REQUIRE(label);
+        // A song long enough to keep playing (a blank song ends at once: review_2 T1).
+        const NewNote note{tab->controller().active_track(), 0, 3840 * 32, 60, 100, 0, 0};
+        auto changes = insert_notes(tab->controller().document(), std::span(&note, 1));
+        REQUIRE(changes);
+        REQUIRE(tab->controller().apply(*changes));
         tab->piano_roll().setFocus();
         fixture.key(Qt::Key_Space);
         REQUIRE(wait_until([&] { return label->text().contains("Play"); }, 3000));
         emit tab->piano_roll().seek_requested(8 * 3840); // what a click on bar 9 of the ruler sends
         REQUIRE(wait_until([&] { return label->text().startsWith("9.") || label->text().startsWith("10."); }, 3000));
+        CHECK(label->text().contains("Play")); // still playing, from the clicked bar
         fixture.key(Qt::Key_Space); // Space now stops back at the clicked position
-        QTest::qWait(100);
+        REQUIRE(wait_until([&] { return label->text().contains("Stop"); }, 2000));
         CHECK(label->text().startsWith("9.1.000"));
     }
 }
@@ -1510,5 +1530,570 @@ TEST_SUITE("window") {
         fixture.key(Qt::Key_Space);
         REQUIRE(wait_until([&] { return tab->piano_roll().sounding_pitches().empty(); }, 2000));
         CHECK_FALSE(tab->keyboard().key_held(62, KeySource::playback));
+    }
+}
+
+// Reviewer probes, batch 2 (probe_batch2); the stray closing braces of the file and the
+// reviewer-local demo.mid path were adjusted.
+
+TEST_SUITE("reviewer_probe2") {
+    TEST_CASE("probe2: closing the window with several tabs and an open take does not crash") {
+        WindowFixture fixture;
+        fixture.window->new_from_template("blank");
+        fixture.window->new_from_template("blank");
+        QTest::qWait(300);
+        auto* tabs = fixture.window->findChild<QTabWidget*>();
+        REQUIRE(tabs);
+        MESSAGE("tabs " << tabs->count());
+        tabs->setCurrentIndex(0);
+        QTest::qWait(50);
+        fixture.key(Qt::Key_R); // a take is running when the window goes
+        QTest::qWait(200);
+        fixture.window.reset();
+        CHECK(true);
+    }
+    TEST_CASE("probe2: punch-in in pass 2, play only in pass 3, stop in pass 4 keeps pass 3") {
+        auto controller = make_controller();
+        FakePlayback playback;
+        playback.loop_range = TimeRange{0, 1920};
+        playback.play(500);
+        playback.clock = 2 * 1920 + 500; // engine clock at the punch
+        RecordingController recording(playback);
+        recording.set_target(controller.get(), nullptr);
+        recording.toggle_recording();
+        live(recording, playback, 3 * 1920 + 100, 64, true);
+        live(recording, playback, 3 * 1920 + 300, 64, false);
+        playback.clock = 4 * 1920 + 50;
+        recording.toggle_recording();
+        REQUIRE(controller->notes().notes.size() == 1);
+        CHECK(controller->notes().notes[0].start == 100);
+    }
+}
+
+TEST_SUITE("reviewer_probe3") {
+    TEST_CASE("probe3: ruler seek trace") {
+        WindowFixture fixture;
+        auto* tab = fixture.window->current_tab();
+        auto* label = fixture.window->findChild<QLabel*>("transport.position");
+        REQUIRE(label);
+        tab->piano_roll().setFocus();
+        fixture.key(Qt::Key_Space);
+        REQUIRE(wait_until([&] { return label->text().contains("Play"); }, 3000));
+        MESSAGE("after play: " << label->text().toStdString());
+        emit tab->piano_roll().seek_requested(8 * 3840);
+        for (int i = 0; i < 10; ++i) {
+            QTest::qWait(100);
+            MESSAGE(i << ": " << label->text().toStdString());
+        }
+        fixture.key(Qt::Key_Space);
+        for (int i = 0; i < 4; ++i) {
+            QTest::qWait(100);
+            MESSAGE("stopped " << i << ": " << label->text().toStdString() << " cursor " << tab->controller().edit_cursor());
+        }
+    }
+}
+
+TEST_SUITE("reviewer_probe4") {
+    TEST_CASE("probe4: ruler seek while playing a real song") {
+        WindowFixture fixture;
+        REQUIRE(fixture.window->open_path(std::filesystem::path(__FILE__).parent_path().parent_path() / "docs" / "images" / "demo.mid"));
+        QTest::qWait(500);
+        auto* tab = fixture.window->current_tab();
+        auto* label = fixture.window->findChild<QLabel*>("transport.position");
+        REQUIRE(label);
+        tab->piano_roll().setFocus();
+        fixture.key(Qt::Key_Space);
+        REQUIRE(wait_until([&] { return label->text().contains("Play"); }, 3000));
+        QTest::qWait(200);
+        emit tab->piano_roll().seek_requested(2 * 3840); // bar 3
+        QTest::qWait(150);
+        MESSAGE("after seek: " << label->text().toStdString());
+        CHECK((label->text().startsWith("3.") && label->text().contains("Play")));
+        fixture.key(Qt::Key_Space);
+        QTest::qWait(150);
+        MESSAGE("after stop: " << label->text().toStdString());
+        CHECK(label->text().startsWith("3.1.000"));
+    }
+}
+
+TEST_SUITE("window") {
+    TEST_CASE("Drag MIDI, the readout, the BPM field and the panel toggles stay visible at laptop widths") {
+        WindowFixture fixture;
+        auto* drag = fixture.window->findChild<DragHandle*>();
+        auto* readout = fixture.window->findChild<QLabel*>("transport.position");
+        auto* tempo = fixture.window->findChild<TempoField*>();
+        auto* panels = fixture.window->findChild<QToolBar*>("toolbar.panels");
+        REQUIRE(drag);
+        REQUIRE(readout);
+        REQUIRE(tempo);
+        REQUIRE(panels);
+        for (const int width : {1400, 1366, 1280}) {
+            fixture.window->resize(width, 800);
+            QTest::qWait(100);
+            INFO("window width " << width);
+            // An overflowed toolbar widget is hidden (it moves into the >> popup).
+            CHECK(drag->isVisible());
+            CHECK(readout->isVisible());
+            CHECK(tempo->isVisible());
+            CHECK(drag->mapTo(fixture.window.get(), QPoint(drag->width(), 0)).x() <= fixture.window->width());
+            CHECK(panels->isVisible());
+            for (auto* action : panels->actions())
+                CHECK(panels->widgetForAction(action)->isVisible());
+        }
+    }
+}
+
+// Reviewer probes, batch 3 (probe_batch3).
+
+TEST_SUITE("reviewer_probe3") {
+    TEST_CASE("probe3: drum grid of the playing tab gets the playhead and follows it") {
+        WindowFixture fixture;
+        auto* tab = fixture.window->current_tab();
+        auto& controller = tab->controller();
+        const NewNote note{controller.active_track(), 0, 960 * 256, 62, 100, 0, 0};
+        auto changes = insert_notes(controller.document(), std::span(&note, 1));
+        REQUIRE(changes);
+        REQUIRE(controller.apply(*changes));
+        tab->piano_roll().setFocus();
+        fixture.key(Qt::Key_Space);
+        REQUIRE(wait_until([&] { return tab->drum_grid().playhead().has_value() && *tab->drum_grid().playhead() > 0; }, 3000));
+        fixture.key(Qt::Key_Space);
+        REQUIRE(wait_until([&] { return !tab->drum_grid().playhead().has_value(); }, 2000));
+    }
+    TEST_CASE("probe3: changing the meter numerator keeps the clock bytes and an x/64 denominator") {
+        auto controller = make_controller();
+        ChangeBuilder builder(controller->document(), "setup");
+        const TrackId track = controller->active_track();
+        for (const auto& event : controller->active_sequence().tracks.front().events)
+            if (event.tick == 0 && event.is_meta(meta_type::time_signature))
+                builder.remove(track, event.id);
+        Event meter = events::time_signature(0, 3, 6);
+        meter.payload = Payload(std::vector<std::uint8_t>{3, 6, 12, 4});
+        std::ignore = builder.insert(track, meter, OrderPlacement::before_existing);
+        REQUIRE(controller->apply(builder.finish()));
+        InspectorPanel inspector;
+        inspector.set_controller(controller.get());
+        inspector.show();
+        QSpinBox* numerator = nullptr;
+        for (auto* box : inspector.findChildren<QSpinBox*>())
+            if (box->value() == 3 && box->maximum() == 255)
+                numerator = box;
+        REQUIRE(numerator);
+        numerator->setFocus();
+        numerator->stepBy(2); // 5/64
+        QTest::qWait(600);
+        bool found = false;
+        for (const auto& event : controller->active_sequence().tracks.front().events)
+            if (event.tick == 0 && event.is_meta(meta_type::time_signature)) {
+                const auto bytes = event.payload.bytes();
+                MESSAGE("bytes " << int(bytes[0]) << " " << int(bytes[1]) << " " << int(bytes[2]) << " " << int(bytes[3]));
+                found = bytes.size() == 4 && bytes[0] == 5 && bytes[1] == 6 && bytes[2] == 12 && bytes[3] == 4;
+            }
+        CHECK(found);
+        CHECK(controller->undo_text().contains("meter", Qt::CaseInsensitive));
+        numerator->clearFocus();
+        inspector.hide();
+    }
+    TEST_CASE("probe3: inspector tempo with a later tempo change edits bar 1 only") {
+        auto controller = make_controller();
+        ChangeBuilder builder(controller->document(), "add tempo change");
+        std::ignore = builder.insert(controller->active_track(), events::tempo(3840, 600000));
+        REQUIRE(controller->apply(builder.finish()));
+        InspectorPanel inspector;
+        inspector.set_controller(controller.get());
+        inspector.show();
+        QDoubleSpinBox* tempo = nullptr;
+        for (auto* box : inspector.findChildren<QDoubleSpinBox*>())
+            if (box->suffix().contains("BPM"))
+                tempo = box;
+        REQUIRE(tempo);
+        tempo->setValue(90.0);
+        emit tempo->editingFinished();
+        CHECK(controller->tempo_map().tempo_at(0) == 666667);
+        CHECK(controller->tempo_map().tempo_at(3840) == 600000);
+    }
+}
+
+TEST_SUITE("inspector") {
+    TEST_CASE("a meter change keeps the loop the same number of bars") {
+        auto controller = make_controller();
+        InspectorPanel inspector;
+        inspector.set_controller(controller.get());
+        QSpinBox* loop = nullptr;
+        QSpinBox* numerator = nullptr;
+        for (auto* box : inspector.findChildren<QSpinBox*>()) {
+            if (box->suffix().contains("bars"))
+                loop = box;
+            if (box->maximum() == 255 && box->minimum() == 1)
+                numerator = box;
+        }
+        REQUIRE(loop);
+        REQUIRE(numerator);
+        loop->setValue(4);
+        emit loop->editingFinished();
+        const auto loop_length = [&] {
+            const auto& sequence = controller->active_sequence();
+            for (const auto& region : sequence.regions)
+                if (sequence.settings.loop_region && region.id == *sequence.settings.loop_region)
+                    return region.end_tick - region.start_tick;
+            return Tick{0};
+        };
+        CHECK(loop_length() == 4 * 3840);
+        numerator->setValue(3);
+        emit numerator->editingFinished();
+        CHECK(loop_length() == 4 * 2880); // still 4 bars, now of 3/4
+        CHECK(loop->value() == 4);
+        REQUIRE(controller->undo()); // meter and loop come back together
+        CHECK(loop_length() == 4 * 3840);
+    }
+}
+
+namespace {
+
+double relative_luminance(const QColor& color) {
+    const auto channel = [](double value) {
+        value /= 255.0;
+        return value <= 0.03928 ? value / 12.92 : std::pow((value + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * channel(color.red()) + 0.7152 * channel(color.green()) + 0.0722 * channel(color.blue());
+}
+
+double contrast(const QColor& a, const QColor& b) {
+    const double high = std::max(relative_luminance(a), relative_luminance(b));
+    const double low = std::min(relative_luminance(a), relative_luminance(b));
+    return (high + 0.05) / (low + 0.05);
+}
+
+} // namespace
+
+TEST_SUITE("theme") {
+    TEST_CASE("dark and light spin boxes have a 3:1 frame and keep their arrow buttons") {
+        application();
+        for (const Theme theme : {Theme::dark, Theme::light}) {
+            apply_theme(theme);
+            QWidget panel;
+            auto* spin = new QSpinBox(&panel);
+            spin->setGeometry(10, 10, 120, 26);
+            auto* other = new QLineEdit(&panel); // takes the focus: the unfocused frame is measured
+            other->setGeometry(10, 50, 120, 26);
+            panel.resize(140, 86);
+            panel.show();
+            other->setFocus();
+            QTest::qWait(30);
+            REQUIRE_FALSE(spin->hasFocus());
+            const QImage image = spin->grab().toImage();
+            const QColor window = panel.palette().color(QPalette::Window);
+            // The left edge, halfway down: the frame line.
+            const QColor edge = image.pixelColor(0, image.height() / 2);
+            INFO("theme " << static_cast<int>(theme) << " edge " << edge.name().toStdString() << " window "
+                          << window.name().toStdString());
+            CHECK(contrast(edge, window) >= 3.0);
+            // Fusion's up/down buttons are still there (a style-sheet border would remove them).
+            QStyleOptionSpinBox option;
+            option.initFrom(spin);
+            option.subControls = QStyle::SC_SpinBoxUp | QStyle::SC_SpinBoxDown;
+            CHECK(spin->style()->subControlRect(QStyle::CC_SpinBox, &option, QStyle::SC_SpinBoxUp, spin).width() > 0);
+        }
+        apply_theme(Theme::light);
+    }
+}
+
+namespace {
+
+/// A piano roll over a controller holding `notes`, shown at a fixed size.
+struct RollFixture {
+    std::unique_ptr<DocumentController> controller = make_controller();
+    std::unique_ptr<PianoRollView> view;
+
+    /// Notes as (start, end, pitch) on the controller's active track.
+    explicit RollFixture(const std::vector<std::tuple<Tick, Tick, int>>& specs) {
+        std::vector<NewNote> notes;
+        for (const auto& [start, end, pitch] : specs)
+            notes.push_back(NewNote{controller->active_track(), start, end, static_cast<std::uint8_t>(pitch), 100, 0, 0});
+        if (!notes.empty()) {
+            auto changes = insert_notes(controller->document(), notes);
+            REQUIRE(changes);
+            REQUIRE(controller->apply(*changes));
+        }
+        view = std::make_unique<PianoRollView>(*controller);
+        view->resize(900, 500);
+        view->show();
+        QTest::qWait(20);
+    }
+
+    [[nodiscard]] QPoint at(Tick tick, int pitch) const {
+        const auto& mapping = view->mapping();
+        return {PianoRollView::keyboard_width + static_cast<int>(std::lround(mapping.tick_to_x(tick))),
+                PianoRollView::ruler_height + static_cast<int>(mapping.pitch_to_y(pitch)) + 4};
+    }
+    [[nodiscard]] int pixels(Tick ticks) const {
+        return static_cast<int>(std::lround(static_cast<double>(ticks) / view->mapping().ticks_per_pixel));
+    }
+    void drag(QPoint from, QPoint to, Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+        QTest::mousePress(view.get(), Qt::LeftButton, modifiers, from);
+        // QTest::mouseMove carries no modifiers; Shift and Alt act during the move.
+        for (const QPoint point : {from + (to - from) / 4, from + (to - from) / 2, to}) {
+            QMouseEvent move(QEvent::MouseMove, QPointF(point), view->mapToGlobal(QPointF(point)), Qt::NoButton,
+                             Qt::LeftButton, modifiers);
+            QApplication::sendEvent(view.get(), &move);
+        }
+        QTest::mouseRelease(view.get(), Qt::LeftButton, modifiers, to);
+    }
+    [[nodiscard]] std::vector<NoteSpan> notes() const { return controller->notes().notes; }
+};
+
+
+} // namespace
+
+TEST_SUITE("gestures") {
+    TEST_CASE("dragging a note's end resizes it on the grid as one undo entry") {
+        RollFixture roll({{960, 1920, 64}});
+        const auto before = semantic_hash(roll.controller->document());
+        const QPoint end = roll.at(1920, 64) + QPoint(-2, 0);
+        roll.drag(end, end + QPoint(roll.pixels(480), 0));
+        REQUIRE(roll.notes().size() == 1);
+        CHECK(roll.notes()[0].start == 960);
+        CHECK(roll.notes()[0].end == 2400);
+        REQUIRE(roll.controller->undo());
+        CHECK(semantic_hash(roll.controller->document()) == before); // exactly one entry
+    }
+
+    TEST_CASE("a rubber band selects the notes it touches; Ctrl adds to the selection") {
+        RollFixture roll({{0, 480, 60}, {960, 1440, 62},
+                          {3840, 4320, 64}});
+        // Empty space above the first two notes, dragged down across them.
+        roll.drag(roll.at(0, 66) + QPoint(2, 0), roll.at(1440, 59) + QPoint(10, 0));
+        CHECK(roll.controller->selection().size() == 2);
+        roll.drag(roll.at(3700, 66), roll.at(4400, 63), Qt::ControlModifier);
+        CHECK(roll.controller->selection().size() == 3);
+        CHECK(roll.controller->undo_text() == QString("Insert notes")); // selection is not an edit
+    }
+
+    TEST_CASE("Ctrl-click toggles one note in or out of the selection") {
+        RollFixture roll({{0, 960, 60}, {1920, 2880, 67}});
+        const auto first = roll.notes()[0].on_id;
+        const auto second = roll.notes()[1].on_id;
+        QTest::mouseClick(roll.view.get(), Qt::LeftButton, Qt::NoModifier, roll.at(200, 60));
+        CHECK(roll.controller->selection() == std::set<EventId>{first});
+        QTest::mouseClick(roll.view.get(), Qt::LeftButton, Qt::ControlModifier, roll.at(2100, 67));
+        CHECK(roll.controller->selection() == std::set<EventId>{first, second});
+        QTest::mouseClick(roll.view.get(), Qt::LeftButton, Qt::ControlModifier, roll.at(200, 60));
+        CHECK(roll.controller->selection() == std::set<EventId>{second});
+    }
+
+    TEST_CASE("the erase and split tools change exactly the clicked note") {
+        RollFixture roll({{0, 1920, 60}, {0, 1920, 64}});
+        roll.view->set_tool(EditTool::split);
+        QTest::mouseClick(roll.view.get(), Qt::LeftButton, Qt::NoModifier, roll.at(960, 60));
+        auto notes = roll.notes();
+        REQUIRE(notes.size() == 3);
+        CHECK(std::ranges::count_if(notes, [](const NoteSpan& note) { return note.pitch == 60; }) == 2);
+        roll.view->set_tool(EditTool::erase);
+        QTest::mouseClick(roll.view.get(), Qt::LeftButton, Qt::NoModifier, roll.at(500, 64));
+        notes = roll.notes();
+        REQUIRE(notes.size() == 2);
+        CHECK(std::ranges::none_of(notes, [](const NoteSpan& note) { return note.pitch == 64; }));
+        REQUIRE(roll.controller->undo()); // the erase is one entry
+        CHECK(roll.notes().size() == 3);
+    }
+
+    TEST_CASE("Shift locks a drag to pitch; Alt moves off the grid") {
+        RollFixture roll({{960, 1920, 60}});
+        const QPoint body = roll.at(1100, 60);
+        roll.drag(body, body + QPoint(roll.pixels(300), -static_cast<int>(roll.view->mapping().row_height * 3)),
+                  Qt::ShiftModifier);
+        REQUIRE(roll.notes().size() == 1);
+        CHECK(roll.notes()[0].start == 960); // horizontal jitter ignored
+        CHECK(roll.notes()[0].pitch == 63);
+        const QPoint moved = roll.at(1100, 63);
+        roll.drag(moved, moved + QPoint(roll.pixels(330), 0), Qt::AltModifier); // past the drag threshold
+        const Tick start = roll.notes()[0].start;
+        CHECK(start != 960);
+        CHECK(start % 240 != 0); // not snapped to the 1/16 grid
+    }
+
+    TEST_CASE("a draw-tool drag sets the length on the grid; a click keeps the default") {
+        RollFixture roll({});
+        roll.view->set_tool(EditTool::draw);
+        roll.drag(roll.at(0, 60) + QPoint(2, 0), roll.at(960, 60) - QPoint(2, 0)); // inside the cell ending at 960
+        REQUIRE(roll.notes().size() == 1);
+        CHECK(roll.notes()[0].end - roll.notes()[0].start == 960);
+        QTest::mouseClick(roll.view.get(), Qt::LeftButton, Qt::NoModifier, roll.at(1920, 62) + QPoint(2, 0));
+        REQUIRE(roll.notes().size() == 2);
+        CHECK(roll.notes()[1].end - roll.notes()[1].start == 240); // default 1/16 at PPQ 960
+    }
+}
+
+namespace {
+
+/// Position of `target` in the Tab chain after `from` (only widgets Tab can reach), or -1.
+int tab_distance(QWidget* from, QWidget* target) {
+    int steps = 0;
+    for (QWidget* widget = from->nextInFocusChain(); widget && widget != from; widget = widget->nextInFocusChain()) {
+        if (!(widget->focusPolicy() & Qt::TabFocus) || !widget->isVisibleTo(from->window()))
+            continue;
+        ++steps;
+        if (widget == target)
+            return steps;
+    }
+    return -1;
+}
+
+template <typename Widget>
+Widget* find_by(QWidget& root, const std::function<bool(Widget*)>& match) {
+    for (auto* widget : root.findChildren<Widget*>())
+        if (match(widget))
+            return widget;
+    return nullptr;
+}
+
+} // namespace
+
+TEST_SUITE("inspector") {
+    TEST_CASE("Apply runs off the GUI thread and reports what it applied, not a stale preview") {
+        auto controller = make_controller();
+        std::vector<NewNote> notes = {{controller->active_track(), 13, 253, 60, 100, 0, 0},
+                                      {controller->active_track(), 487, 700, 64, 100, 0, 0}};
+        REQUIRE(controller->apply(*insert_notes(controller->document(), notes)));
+        std::set<EventId> all;
+        for (const auto& note : controller->notes().notes)
+            all.insert(note.on_id);
+        controller->set_selection(all);
+        InspectorPanel inspector;
+        inspector.set_controller(controller.get());
+        inspector.show();
+        auto* apply = find_by<QPushButton>(inspector, [](QPushButton* button) { return button->text() == "Apply"; });
+        REQUIRE(apply);
+        const auto generation = controller->generation();
+        apply->click();
+        CHECK(controller->generation() == generation); // the transform is computed in the background
+        REQUIRE(wait_until([&] { return controller->generation() != generation; }, 3000));
+        CHECK(controller->notes().notes[0].start % 240 == 0); // quantized
+        QTest::qWait(50);
+        auto* report = find_by<QLabel>(inspector, [](QLabel* label) { return label->text().startsWith("Applied"); });
+        CHECK(report != nullptr);
+        CHECK(find_by<QLabel>(inspector, [](QLabel* label) { return label->text().contains("preview again"); }) == nullptr);
+    }
+
+    TEST_CASE("Rotate phrase works from the quick form, inside the selection's extent") {
+        auto controller = make_controller();
+        std::vector<NewNote> notes = {{controller->active_track(), 0, 240, 60, 100, 0, 0},
+                                      {controller->active_track(), 720, 960, 64, 100, 0, 0}};
+        REQUIRE(controller->apply(*insert_notes(controller->document(), notes)));
+        std::set<EventId> all;
+        for (const auto& note : controller->notes().notes)
+            all.insert(note.on_id);
+        controller->set_selection(all);
+        InspectorPanel inspector;
+        inspector.set_controller(controller.get());
+        auto* tool = find_by<QComboBox>(inspector, [](QComboBox* combo) { return combo->findData("rotate") >= 0; });
+        REQUIRE(tool);
+        tool->setCurrentIndex(tool->findData("rotate"));
+        emit tool->activated(tool->currentIndex());
+        auto* apply = find_by<QPushButton>(inspector, [](QPushButton* button) { return button->text() == "Apply"; });
+        REQUIRE(apply);
+        const auto generation = controller->generation();
+        apply->click();
+        REQUIRE(wait_until([&] { return controller->generation() != generation; }, 3000));
+        // Default shift 240 ticks inside [0, 960): 0 -> 240 and 720 -> 960 wraps to 0.
+        std::vector<Tick> starts;
+        for (const auto& note : controller->notes().notes)
+            starts.push_back(note.start);
+        std::ranges::sort(starts);
+        CHECK(starts == std::vector<Tick>{0, 240});
+    }
+
+    TEST_CASE("Tab walks the inspector in screen order") {
+        auto controller = make_controller();
+        InspectorPanel inspector;
+        inspector.set_controller(controller.get());
+        inspector.show();
+        auto* advanced = find_by<QCheckBox>(inspector, [](QCheckBox* box) { return box->text().startsWith("Show all"); });
+        auto* preview = find_by<QPushButton>(inspector, [](QPushButton* button) { return button->text() == "Preview"; });
+        auto* song = find_by<QToolButton>(inspector, [](QToolButton* button) { return button->text() == "Song"; });
+        auto* tempo = find_by<QDoubleSpinBox>(inspector, [](QDoubleSpinBox* box) { return box->suffix() == " BPM"; });
+        REQUIRE(advanced);
+        REQUIRE(preview);
+        REQUIRE(song);
+        REQUIRE(tempo);
+        CHECK(tab_distance(advanced, preview) > 0);
+        CHECK(tab_distance(advanced, preview) < tab_distance(advanced, song)); // Transform before Song
+        CHECK(tab_distance(song, tempo) == 1);                                  // header right before its fields
+    }
+}
+
+TEST_SUITE("track_list") {
+    TEST_CASE("Mute on another track does not switch the edited track; Delete deletes the active track") {
+        auto controller = make_controller();
+        ChangeBuilder builder(controller->document(), "second track");
+        Track second;
+        second.id = TrackId::generate();
+        second.name = "Second";
+        builder.append(TrackInsert{controller->active_sequence().id, 1, second});
+        REQUIRE(controller->apply(builder.finish()));
+        const TrackId first = controller->active_sequence().tracks[0].id;
+        controller->set_active_track(first);
+        TrackListWidget list(*controller);
+        list.show();
+        auto* table = list.findChild<QTableWidget*>();
+        REQUIRE(table);
+        table->setCurrentCell(1, 1); // the M cell of the second track
+        CHECK(controller->active_track() == first);
+        table->setCurrentCell(1, 0); // its name: now it is the edited track
+        CHECK(controller->active_track() == second.id);
+        table->setFocus();
+        QTest::keyClick(table, Qt::Key_Delete);
+        REQUIRE(controller->active_sequence().tracks.size() == 1);
+        CHECK(controller->active_sequence().tracks[0].id == first);
+    }
+
+    TEST_CASE("a multi-sequence document shows a sequence selector") {
+        DocumentData document = make_blank_document("Two sequences");
+        Sequence other = document.sequences.front();
+        other.id = SequenceId::generate();
+        other.name = "Verse";
+        for (auto& track : other.tracks) {
+            track.id = TrackId::generate();
+            for (auto& event : track.events)
+                event.id = EventId::generate();
+        }
+        document.sequences.push_back(other);
+        application();
+        auto session = std::make_unique<document::WorkingSession>(document, document::SessionOrigin::new_document);
+        DocumentController controller(std::move(session));
+        TrackListWidget list(controller);
+        list.show();
+        auto* selector = list.findChild<QComboBox*>();
+        REQUIRE(selector);
+        CHECK(selector->isVisible());
+        REQUIRE(selector->count() == 2);
+        CHECK(selector->itemText(1).contains("Verse"));
+        selector->setCurrentIndex(1);
+        emit selector->activated(1);
+        CHECK(controller.active_sequence_index() == 1);
+    }
+}
+
+TEST_SUITE("window") {
+    TEST_CASE("Delete in the track list deletes the track, not the selected notes") {
+        WindowFixture fixture;
+        auto* tab = fixture.window->current_tab();
+        auto& controller = tab->controller();
+        const NewNote note{controller.active_track(), 0, 480, 60, 100, 0, 0};
+        REQUIRE(controller.apply(*insert_notes(controller.document(), std::span(&note, 1))));
+        ChangeBuilder builder(controller.document(), "second track");
+        Track second;
+        second.id = TrackId::generate();
+        second.name = "Second";
+        builder.append(TrackInsert{controller.active_sequence().id, 1, second});
+        REQUIRE(controller.apply(builder.finish()));
+        controller.set_selection({controller.notes().notes[0].on_id});
+        auto* table = tab->track_list().findChild<QTableWidget*>();
+        REQUIRE(table);
+        table->setCurrentCell(1, 0); // the second (empty) track is active
+        table->setFocus(Qt::MouseFocusReason);
+        fixture.key(Qt::Key_Delete);
+        CHECK(controller.active_sequence().tracks.size() == 1);
+        CHECK(controller.notes().notes.size() == 1); // the selected note is still there
     }
 }

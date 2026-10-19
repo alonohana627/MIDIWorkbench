@@ -10,6 +10,8 @@
 #include "mwb/ui/editor_math.hpp"
 
 #include <QAbstractButton>
+#include <QCoreApplication>
+#include <QMetaObject>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QFormLayout>
@@ -46,6 +48,22 @@ constexpr ToolEntry tool_entries[] = {
 };
 
 const char* const presets[] = {"classic", "saw-pad", "square-lead", "electric-piano", "bass"};
+
+/// Focusable widgets in layout (screen) order, so Tab walks the panel top to bottom: each
+/// section header before its fields, Show all parameters before Preview (ux-visual-7).
+void collect_focus_chain(QLayout* layout, std::vector<QWidget*>& chain) {
+    for (int index = 0; index < layout->count(); ++index) {
+        QLayoutItem* item = layout->itemAt(index);
+        if (QWidget* widget = item->widget()) {
+            if ((widget->focusPolicy() & Qt::TabFocus) && !qobject_cast<QLabel*>(widget))
+                chain.push_back(widget);
+            if (widget->layout())
+                collect_focus_chain(widget->layout(), chain);
+        } else if (QLayout* child = item->layout()) {
+            collect_focus_chain(child, chain);
+        }
+    }
+}
 
 QSpinBox* spin(int low, int high, int value, QWidget* parent) {
     auto* box = new QSpinBox(parent);
@@ -89,8 +107,11 @@ std::optional<music::TransformParameters> parameters_for(const QString& tool, in
         parameters.ticks = std::max(1, amount);
         return parameters;
     }
-    if (tool == "time_stretch")
-        return TimeStretchParameters{};
+    if (tool == "time_stretch") {
+        TimeStretchParameters parameters;
+        parameters.factor = Rational{std::clamp(amount, 1, 10000), 100}; // percent, exact
+        return parameters;
+    }
     if (tool == "reverse")
         return ReverseParameters{};
     if (tool == "invert_pitch") {
@@ -390,6 +411,7 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     connect(advanced_, &QCheckBox::toggled, this, [this](bool on) { transform_form_->setRowVisible(parameters_, on); });
     transform_form->addRow(buttons);
     transform_form->addRow(report_);
+    transform_form->setRowVisible(report_, false); // shown when there is something to report
     connect(tool_, &QComboBox::activated, this, &InspectorPanel::load_tool_defaults);
     update_tool_rows();
     for (auto* box : {amount_, strength_, seed_})
@@ -405,6 +427,7 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     const auto collapsible = [column](QGroupBox* box, const QString& key, bool expanded_by_default) {
         const QString title = box->title();
         box->setTitle(QString());
+        box->setObjectName("sectionBody"); // no title gap under the header (theme: QGroupBox#sectionBody)
         auto* header = new QToolButton(box->parentWidget());
         header->setText(title);
         header->setCheckable(true);
@@ -457,17 +480,31 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     // single-key commands keep working after clicking Apply or a check box (round 5 UI).
     for (auto* button : content->findChildren<QAbstractButton*>())
         button->setFocusPolicy(Qt::TabFocus);
+    std::vector<QWidget*> chain;
+    collect_focus_chain(column, chain);
+    for (std::size_t index = 1; index < chain.size(); ++index)
+        QWidget::setTabOrder(chain[index - 1], chain[index]);
+    scroll->setFocusPolicy(Qt::NoFocus); // the scroll area itself is not a stop
     setEnabled(false);
 }
 
-InspectorPanel::~InspectorPanel() = default;
+InspectorPanel::~InspectorPanel() {
+    // Destroying a widget hides its children, and a focused field then emits editingFinished into
+    // this half-destroyed panel (review_3): silence every field before the base destructor runs.
+    song_commit_->stop();
+    for (auto* widget : findChildren<QWidget*>())
+        widget->blockSignals(true);
+    disconnect(this, nullptr, nullptr, nullptr);
+}
 
 void InspectorPanel::set_controller(DocumentController* controller) {
     if (controller_)
         disconnect(controller_, nullptr, this, nullptr);
     controller_ = controller;
     pending_.reset();
-    report_->clear();
+    ++preview_serial_; // a preview computed for the previous document is dropped
+    apply_when_ready_ = false;
+    set_report(QString());
     setEnabled(controller != nullptr);
     if (!controller)
         return;
@@ -563,7 +600,7 @@ void InspectorPanel::refresh() {
     refresh_selection();
     if (pending_ && pending_generation_ != controller_->generation()) {
         pending_.reset(); // a stale preview is never applied
-        report_->setText(tr("The document changed; preview again."));
+        set_report(tr("The document changed; preview again."));
     }
 }
 
@@ -742,6 +779,21 @@ void InspectorPanel::apply_meter() {
         std::ignore = builder.insert(sequence.tracks.front().id,
                                      events::time_signature(0, static_cast<std::uint8_t>(numerator), power),
                                      OrderPlacement::before_existing);
+    // A loop of N bars stays N bars in the new meter (review_3), in the same undo entry.
+    if (sequence.settings.loop_region && sequence.division.is_ppq()) {
+        const Tick old_bar = std::max<Tick>(1, controller_->meter_map().ticks_per_bar(controller_->meter_map().segment_at(0)));
+        const Tick new_bar = std::max<Tick>(1, static_cast<Tick>(numerator) * 4 * sequence.division.ppq / (Tick{1} << power));
+        Sequence updated = sequence_header(sequence); // properties only, no events
+        bool changed = false;
+        for (auto& region : updated.regions)
+            if (region.id == *sequence.settings.loop_region && (region.end_tick - region.start_tick) % old_bar == 0) {
+                const Tick bars = (region.end_tick - region.start_tick) / old_bar;
+                region.end_tick = region.start_tick + bars * new_bar;
+                changed = true;
+            }
+        if (changed)
+            builder.set_sequence_properties(sequence.id, updated);
+    }
     auto changes = builder.finish();
     if (!changes.empty())
         controller_->apply(changes);
@@ -845,6 +897,10 @@ void InspectorPanel::load_tool_defaults() {
         amount_->setValue(60);
     else if (tool == "euclidean")
         amount_->setValue(5);
+    else if (tool == "time_stretch")
+        amount_->setValue(200);
+    else if (tool == "rotate")
+        amount_->setValue(240);
     else
         amount_->setValue(0);
     updating_ = false;
@@ -864,9 +920,9 @@ void InspectorPanel::update_tool_rows() {
     static constexpr Rows rows[] = {
         {"quantize", "", true, false, "Grid"},           {"humanize", "Timing ± (ticks)", false, true, ""},
         {"transpose", "Semitones", false, false, ""},     {"velocity", "Velocity (1-127)", false, false, ""},
-        {"length", "Length (ticks)", false, false, ""},   {"time_stretch", "", false, false, ""},
+        {"length", "Length (ticks)", false, false, ""},   {"time_stretch", "Factor (%)", false, false, ""},
         {"reverse", "", false, false, ""},                {"invert_pitch", "Axis pitch (0-127)", false, false, ""},
-        {"rotate", "Shift (notes)", false, false, ""},    {"repeat", "Copies", false, false, ""},
+        {"rotate", "Shift (ticks)", false, false, ""},    {"repeat", "Copies", false, false, ""},
         {"strum", "Spread (ticks)", false, true, ""},     {"arpeggiate", "", false, true, "Rate"},
         {"euclidean", "Pulses", false, false, "Step"},    {"remove_duplicates", "", false, false, ""},
         {"resolve_overlaps", "", false, false, ""},       {"join", "Max gap (ticks)", false, false, ""},
@@ -910,15 +966,22 @@ void InspectorPanel::update_parameters_from_form() {
     if (parameters)
         parameters_->setPlainText(QString::fromStdString(music::parameters_to_json(*parameters)));
     pending_.reset();
-    report_->clear();
+    set_report(QString());
 }
 
-void InspectorPanel::preview() {
+void InspectorPanel::set_report(const QString& text) {
+    report_->setText(text);
+    transform_form_->setRowVisible(report_, !text.isEmpty());
+}
+
+void InspectorPanel::preview() { request_preview(false); }
+
+void InspectorPanel::request_preview(bool apply_when_ready) {
     if (!controller_)
         return;
     auto parameters = music::parameters_from_json(parameters_->toPlainText().toStdString());
     if (!parameters) {
-        report_->setText(tr("Parameters are invalid: %1").arg(QString::fromStdString(parameters.error().message)));
+        set_report(tr("Parameters are invalid: %1").arg(QString::fromStdString(parameters.error().message)));
         return;
     }
     music::TargetSelection selection;
@@ -926,10 +989,67 @@ void InspectorPanel::preview() {
     selection.tracks = {controller_->active_track()};
     for (const auto& id : controller_->selection())
         selection.notes.push_back(id);
-    auto result = music::preview_transform(controller_->document(), selection, *parameters);
+    // The quick form fills what depends on where the user is (ux-panels-3): Rotate needs its range
+    // (the grid-aligned extent of the selection, or of the active track's notes), Euclidean starts
+    // at the edit cursor. The JSON editor's own values are kept.
+    if (!advanced_->isChecked()) {
+        if (auto* rotate = std::get_if<music::RotateParameters>(&*parameters); rotate && rotate->range.length() <= 0) {
+            auto notes = controller_->selected_notes();
+            if (notes.empty())
+                for (const auto& note : controller_->notes().notes)
+                    if (note.on_track == controller_->active_track_index().value_or(0))
+                        notes.push_back(note);
+            const auto& sequence = controller_->active_sequence();
+            const auto grid = Grid::make(sequence.settings.snap, sequence.division.is_ppq() ? sequence.division.ppq : default_ppq);
+            if (!notes.empty())
+                rotate->range = grid_aligned_extent(notes, grid);
+        }
+        if (auto* euclidean = std::get_if<music::EuclideanParameters>(&*parameters); euclidean && euclidean->start == 0)
+            euclidean->start = controller_->edit_cursor();
+    }
+    if (tool_->currentData().toString() == "quantize")
+        last_quantize_json_ = parameters_->toPlainText();
+    pending_.reset();
+    apply_when_ready_ = apply_when_ready;
+    const std::uint64_t serial = ++preview_serial_;
+    const std::uint64_t generation = controller_->generation();
+    // One immutable copy for the worker; the GUI keeps editing meanwhile and a result for an
+    // older generation is reported as stale, never applied.
+    auto document = std::make_shared<const DocumentData>(controller_->document());
+    set_report(tr("Previewing…"));
+    std::ignore = transform_thread_.post([guard = QPointer<InspectorPanel>(this), document, selection,
+                                          parameters = std::move(*parameters), generation, serial](std::stop_token) {
+        std::shared_ptr<music::TransformPreview> result;
+        QString error;
+        try {
+            if (auto computed = music::preview_transform(*document, selection, parameters))
+                result = std::make_shared<music::TransformPreview>(std::move(*computed));
+            else
+                error = QString::fromStdString(computed.error().describe());
+        } catch (const std::exception& failure) {
+            error = tr("The preview failed: %1").arg(QString::fromLocal8Bit(failure.what()));
+        }
+        QMetaObject::invokeMethod(
+            qApp,
+            [guard, result, error, generation, serial] {
+                if (guard)
+                    guard->preview_ready(result, error, generation, serial);
+            },
+            Qt::QueuedConnection);
+    });
+}
+
+void InspectorPanel::preview_ready(std::shared_ptr<music::TransformPreview> result, const QString& error,
+                                   std::uint64_t generation, std::uint64_t serial) {
+    if (serial != preview_serial_ || !controller_)
+        return; // superseded by a newer request or another document
+    const bool apply = std::exchange(apply_when_ready_, false);
+    if (generation != controller_->generation()) {
+        set_report(tr("The document changed; preview again."));
+        return;
+    }
     if (!result) {
-        report_->setText(QString::fromStdString(result.error().describe()));
-        pending_.reset();
+        set_report(error);
         return;
     }
     const auto& report = result->report;
@@ -943,29 +1063,43 @@ void InspectorPanel::preview() {
         lines << tr("Largest move: %1 ticks").arg(report.max_movement);
     for (const auto& message : report.messages)
         lines << QString::fromStdString(message);
-    report_->setText(lines.join('\n'));
+    set_report(lines.join('\n'));
     pending_ = std::make_unique<music::TransformPreview>(std::move(*result));
-    pending_generation_ = controller_->generation();
-    if (tool_->currentData().toString() == "quantize")
-        last_quantize_json_ = parameters_->toPlainText();
+    pending_generation_ = generation;
+    if (apply)
+        apply_pending();
+}
+
+void InspectorPanel::apply_pending() {
+    if (!controller_ || !pending_ || pending_generation_ != controller_->generation())
+        return;
+    // Taken out before applying: applying changes the generation and refreshes the panel, which
+    // must not find (and report as stale) the preview that was just applied (ux-panels-2).
+    const auto applied = std::move(pending_);
+    const auto created = applied->created_notes;
+    const QString summary = report_->text().section('\n', 0, 0);
+    QString error;
+    if (!controller_->apply(applied->changes, &error)) {
+        set_report(tr("Not applied: %1").arg(error));
+        return;
+    }
+    set_report(tr("Applied: %1").arg(summary));
+    if (!created.empty())
+        controller_->set_selection(std::set<EventId>(created.begin(), created.end()));
 }
 
 void InspectorPanel::apply_preview() {
     if (!controller_)
         return;
-    if (!pending_ || pending_generation_ != controller_->generation())
-        preview();
-    if (!pending_)
-        return;
-    const auto created = pending_->created_notes;
-    if (controller_->apply(pending_->changes) && !created.empty())
-        controller_->set_selection(std::set<EventId>(created.begin(), created.end()));
-    pending_.reset();
+    if (pending_ && pending_generation_ == controller_->generation())
+        apply_pending();
+    else
+        request_preview(true); // applied when the preview arrives
 }
 
 void InspectorPanel::cancel_preview() {
     pending_.reset(); // cancel leaves the document unchanged
-    report_->setText(tr("Cancelled"));
+    set_report(tr("Cancelled"));
 }
 
 void InspectorPanel::select_tool(const QString& tool_id) {
@@ -994,8 +1128,7 @@ void InspectorPanel::apply_last_quantize() {
     select_tool("quantize");
     if (!last_quantize_json_.isEmpty())
         parameters_->setPlainText(last_quantize_json_);
-    preview();
-    apply_preview();
+    request_preview(true); // parameters are read now; the result applies when it arrives
     if (previous_tool != tool_->currentIndex()) {
         tool_->setCurrentIndex(previous_tool);
         parameters_->setPlainText(previous_parameters);

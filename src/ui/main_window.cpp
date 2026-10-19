@@ -56,6 +56,7 @@
 #include <QLineEdit>
 #include <QToolButton>
 #include <QKeyEvent>
+#include <QResizeEvent>
 #include <QLabel>
 #include <QListWidget>
 #include <QMenuBar>
@@ -150,6 +151,7 @@ MainWindow::MainWindow(StartupOptions options, app::DataDirectories directories,
     tabs_->setTabsClosable(true);
     tabs_->setMovable(true);
     tabs_->setDocumentMode(true);
+    tabs_->setFocusPolicy(Qt::NoFocus); // its tab bar keeps its own focus; the widget is no dead stop
     tabs_->setAccessibleName(tr("Open documents"));
     setCentralWidget(tabs_);
     // The output opens in the background (the window never waits for a device); the chosen
@@ -903,7 +905,7 @@ void MainWindow::build_toolbar() {
         transport_bar_->addAction(command(id));
     auto* snap_label = new QLabel(tr(" Snap "), this);
     snap_label->setForegroundRole(QPalette::PlaceholderText);
-    transport_bar_->addWidget(snap_label);
+    snap_label_action_ = transport_bar_->addWidget(snap_label);
     snap_combo_ = new QComboBox(this);
     snap_combo_->setAccessibleName(tr("Snap"));
     snap_combo_->setToolTip(tr("Grid used for drawing, moving and resizing notes"));
@@ -914,6 +916,9 @@ void MainWindow::build_toolbar() {
     snap_combo_->insertSeparator(snap_combo_->count());
     snap_combo_->addItem(tr("Off"), QString::fromLatin1(snap_off_value));
     snap_combo_->setMinimumWidth(96);
+    // Long labels ("1/16 quintuplet") must not widen the toolbar; the list shows them in full.
+    snap_combo_->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    snap_combo_->setMinimumContentsLength(8);
     transport_bar_->addWidget(snap_combo_);
     connect(snap_combo_, &QComboBox::activated, this, [this] {
         auto* tab = current_tab();
@@ -951,13 +956,11 @@ void MainWindow::build_toolbar() {
     add("transport.step_record", IconId::step_record);
     add("transport.loop", IconId::loop);
     add("transport.metronome", IconId::metronome);
-    auto* tempo_label = new QLabel(tr(" Speed × "), this);
-    tempo_label->setForegroundRole(QPalette::PlaceholderText);
-    transport_bar_->addWidget(tempo_label);
     tempo_multiplier_ = new QDoubleSpinBox(this);
     tempo_multiplier_->setRange(0.25, 4.0);
     tempo_multiplier_->setSingleStep(0.05);
     tempo_multiplier_->setValue(1.0);
+    tempo_multiplier_->setPrefix(tr("× ")); // compact: the tooltip and accessible name say what it is
     tempo_multiplier_->setAccessibleName(tr("Playback tempo multiplier"));
     tempo_multiplier_->setToolTip(tr("Playback speed (does not edit the document; set the song tempo in the Inspector)"));
     transport_bar_->addWidget(tempo_multiplier_);
@@ -989,15 +992,23 @@ void MainWindow::build_toolbar() {
     drag_handle_ = new DragHandle(directories_.drag_cache, this);
     connect(drag_handle_, &DragHandle::status_message, this, [this](const QString& text) { statusBar()->showMessage(text, 6000); });
     transport_bar_->addWidget(drag_handle_);
-    transport_bar_->addSeparator();
+    // The panel toggles sit at the right end of the document tab row, where they stay visible
+    // however narrow the window is (the transport toolbar no longer fits them at 1400 px).
+    auto* panels = new QToolBar(tr("Panels"), this);
+    panels->setObjectName("toolbar.panels");
+    panels->setIconSize(QSize(16, 16));
+    panels->setMovable(false);
     for (auto [dock, icon, key] : {std::tuple{library_dock_, IconId::library, Qt::Key_1},
                                    std::tuple{inspector_dock_, IconId::inspector, Qt::Key_2}}) {
         QAction* toggle = dock->toggleViewAction();
         toggle->setIcon(make_icon(icon));
         toggle->setProperty("mwb_icon", static_cast<int>(icon));
         toggle->setShortcut(QKeySequence(Qt::CTRL | key));
-        transport_bar_->addAction(toggle);
+        panels->addAction(toggle);
+        if (auto* button = qobject_cast<QToolButton*>(panels->widgetForAction(toggle)))
+            button->setAccessibleName(tr("%1 panel").arg(dock->windowTitle()));
     }
+    tabs_->setCornerWidget(panels, Qt::TopRightCorner);
     events_dock_->toggleViewAction()->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_3));
     // Panel toggles are commands too, so the command palette finds them.
     for (auto [dock, id] : {std::pair{library_dock_, "view.panel_library"}, std::pair{inspector_dock_, "view.panel_inspector"},
@@ -2214,6 +2225,15 @@ std::optional<bool> MainWindow::route_control_key(QKeyEvent& key, QWidget& focus
     const int code = key.key();
     if (modifiers != Qt::NoModifier)
         return std::nullopt; // modified shortcuts (Ctrl+Space, Ctrl+Z, ...) work everywhere
+    // Delete/Backspace act on the focused panel's own content (C2, ux-panels-5): the library
+    // trashes the chosen item, the track list deletes the active track; only the editors (roll,
+    // lanes, drum grid, event list) reach the window's Delete Notes.
+    if (override && (code == Qt::Key_Delete || code == Qt::Key_Backspace))
+        for (QWidget* widget = &focus; widget; widget = widget->parentWidget())
+            if (widget == library_ || qobject_cast<TrackListWidget*>(widget)) {
+                key.accept();
+                return false;
+            }
     auto* button = qobject_cast<QAbstractButton*>(&focus);
     auto* view = qobject_cast<QAbstractItemView*>(&focus);
     auto* combo = qobject_cast<QComboBox*>(&focus);
@@ -2280,6 +2300,22 @@ void MainWindow::keyReleaseEvent(QKeyEvent* event) {
     if (computer_keyboard_->handle_key(event, false))
         return;
     QMainWindow::keyReleaseEvent(event);
+}
+
+void MainWindow::resizeEvent(QResizeEvent* event) {
+    QMainWindow::resizeEvent(event);
+    // Narrow windows (below about 1300 px) get a compact toolbar so Drag MIDI and the readout stay
+    // visible: the Play button shows only its icon and the "Snap" caption goes (the combo keeps
+    // its accessible name and tooltip) (ux-visual-6).
+    const bool compact = width() < 1300;
+    if (compact == compact_toolbar_ || !transport_bar_)
+        return;
+    compact_toolbar_ = compact;
+    if (snap_label_action_)
+        snap_label_action_->setVisible(!compact);
+    if (auto* play = command("transport.play_stop"))
+        if (auto* button = qobject_cast<QToolButton*>(transport_bar_->widgetForAction(play)))
+            button->setToolButtonStyle(compact ? Qt::ToolButtonIconOnly : Qt::ToolButtonTextBesideIcon);
 }
 
 void MainWindow::changeEvent(QEvent* event) {

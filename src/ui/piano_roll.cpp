@@ -534,7 +534,8 @@ void PianoRollView::paintEvent(QPaintEvent*) {
         QFont hint_font = font();
         hint_font.setPointSizeF(hint_font.pointSizeF() + 1);
         painter.setFont(hint_font);
-        painter.drawText(local, Qt::AlignCenter, empty_hint());
+        // Wrapped inside the visible grid, so a narrow roll (library dock open) never clips it.
+        painter.drawText(local.adjusted(12, 0, -12, 0), Qt::AlignCenter | Qt::TextWordWrap, empty_hint());
     }
     painter.restore();
     paint_keyboard(painter);

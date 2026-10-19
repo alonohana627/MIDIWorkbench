@@ -505,6 +505,7 @@ LibraryPanel::~LibraryPanel() {
     if (import_stop_)
         import_stop_->request_stop();
     import_thread_.reset();
+    maintenance_thread_.reset(); // the index build stops at its next page
     read_thread_.reset();
     browse_thread_.reset();
     write_thread_.reset(); // drains
@@ -610,10 +611,24 @@ void LibraryPanel::set_mode(ResultMode mode) {
     mode_ = mode;
     mode_label_->setText(mode == ResultMode::melody ? tr("Melody search results") : tr("Trash"));
     mode_bar_->setVisible(mode != ResultMode::text);
+    apply_column_visibility();
     if (mode != ResultMode::trash && trash_button_->isChecked()) {
         const QSignalBlocker blocker(trash_button_);
         trash_button_->setChecked(false);
     }
+}
+
+void LibraryPanel::apply_column_visibility() {
+    auto* header = table_->horizontalHeader();
+    const QStringList hidden =
+        QSettings().value("library/hidden_columns", QStringList{QString::number(column_tags), QString::number(column_status)})
+            .toStringList();
+    for (int column = column_title + 1; column < library_column_count; ++column)
+        header->setSectionHidden(column, hidden.contains(QString::number(column)));
+    // A melody hit's Status says where it matched (transposition, ticks, track): two hits in one
+    // file differ only there, so it is always shown for melody results (review_5).
+    if (mode_ == ResultMode::melody)
+        header->setSectionHidden(column_status, false);
 }
 
 void LibraryPanel::configure_columns() {
@@ -623,11 +638,7 @@ void LibraryPanel::configure_columns() {
     header->setStretchLastSection(false);
     header->setSectionResizeMode(QHeaderView::ResizeToContents);
     header->setSectionResizeMode(column_title, QHeaderView::Stretch);
-    const QStringList hidden =
-        QSettings().value("library/hidden_columns", QStringList{QString::number(column_tags), QString::number(column_status)})
-            .toStringList();
-    for (int column = column_title + 1; column < library_column_count; ++column)
-        header->setSectionHidden(column, hidden.contains(QString::number(column)));
+    apply_column_visibility();
     header->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(header, &QHeaderView::customContextMenuRequested, this, [this, header](const QPoint& point) {
         QMenu menu(this);
@@ -674,8 +685,13 @@ void LibraryPanel::choose_library() {
         open_library(root, false, true);
         return;
     }
+    // Folder litter the system adds (desktop.ini, Thumbs.db, .DS_Store, dot files) does not make
+    // a folder "not empty" (review_5).
     bool has_files = false;
     for (std::filesystem::directory_iterator it(root, error), end; !error && it != end; it.increment(error)) {
+        const QString name = QString::fromStdWString(it->path().filename().wstring()).toLower();
+        if (name.startsWith('.') || name == "desktop.ini" || name == "thumbs.db")
+            continue;
         has_files = true;
         break;
     }
@@ -685,7 +701,11 @@ void LibraryPanel::choose_library() {
     }
     // A folder of MIDI files is not a library: offer one next to it and import the files (the
     // originals are only read).
-    const std::filesystem::path suggested = root.parent_path() / (root.filename().wstring() + L" Library");
+    // Next to the folder; for a drive root (no folder name) inside it (the import skips the
+    // library's own folder).
+    const std::filesystem::path suggested = root.has_filename() && root.filename() != root.root_path()
+                                                ? root.parent_path() / (root.filename().wstring() + L" Library")
+                                                : root / L"MIDI Workbench Library";
     const auto answer = QMessageBox::question(
         this, tr("Not a library"),
         tr("\"%1\" is not a library. Create a library in \"%2\" and import the MIDI files from \"%1\"?")
@@ -738,6 +758,7 @@ void LibraryPanel::open_library(const std::filesystem::path& root, bool create, 
                 guard->import_button_->setEnabled(true);
                 guard->trash_button_->setEnabled(true);
                 guard->run_search();
+                guard->schedule_browse_index(true);
                 if (import_after)
                     guard->import_path(*import_after);
             },
@@ -829,6 +850,18 @@ void LibraryPanel::import_path(const std::filesystem::path& source) {
     });
 }
 
+void LibraryPanel::schedule_browse_index(bool collect_garbage) {
+    if (!library_)
+        return;
+    auto library = library_;
+    maintenance_thread_->post([library, collect_garbage](std::stop_token stop) {
+        // Failures only mean searches keep using SQL paging; nothing to report to the user.
+        std::ignore = library->build_browse_index(stop);
+        if (collect_garbage && !stop.stop_requested())
+            std::ignore = library->collect_garbage(); // default 30-day grace: only long-unreferenced objects
+    });
+}
+
 void LibraryPanel::schedule_analysis() {
     if (!library_)
         return;
@@ -836,7 +869,8 @@ void LibraryPanel::schedule_analysis() {
     // isolated parser, so melody search finds saved items without waiting for an import (ux-panels-14).
     QPointer<LibraryPanel> guard(this);
     auto library = library_;
-    status_->setText(tr("Indexing for melody search…"));
+    // Reported in the window's status bar: the panel's own line keeps describing the results.
+    emit status_message(tr("Indexing for melody search…"));
     import_thread_->post([guard, library, parser = import_parser_ ? import_parser_ : parser_](std::stop_token stop) {
         library::AnalyzeOptions analyze;
         analyze.parser = parser;
@@ -849,7 +883,7 @@ void LibraryPanel::schedule_analysis() {
             [guard, text] {
                 if (!guard)
                     return;
-                guard->status_->setText(text);
+                emit guard->status_message(text);
                 guard->refresh_visible(); // status column: indexing -> ready
             },
             Qt::QueuedConnection);
@@ -1294,7 +1328,10 @@ void LibraryPanel::run_metadata_task(std::function<Status(library::Library&, std
                 if (!failed.empty())
                     emit guard->status_message(tr("Not saved for %n item(s): %1", nullptr, static_cast<int>(failed.size()))
                                                    .arg(error));
-                for (const auto& old : previous) { // in ascending positions: reinserting keeps the order
+                // Positions were recorded while removing one after another, so put rows back in
+                // reverse removal order to get the original order (review_5).
+                for (auto it = previous.rbegin(); it != previous.rend(); ++it) {
+                    const auto& old = *it;
                     const bool refused = std::ranges::find(failed, old.row.asset_id) != failed.end();
                     if (refused && removes_row)
                         guard->model_->insert_row(old.position, old.row);
@@ -1424,6 +1461,8 @@ void LibraryPanel::poll_changes() {
                 guard->change_revision_ = batch.latest_revision;
                 if (first)
                     return; // the first poll only learns where the outbox stands
+                if (batch.full_reload)
+                    guard->schedule_browse_index(false); // searches use SQL until it is rebuilt
                 if (batch.full_reload || batch.structure_changed) {
                     guard->refresh_results(); // text results keep their item and scroll position
                     return;

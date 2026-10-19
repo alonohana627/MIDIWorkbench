@@ -185,6 +185,30 @@ TEST_SUITE("cli") {
         CHECK(verified.code == cli::exit_success);
         CHECK(verified.json["report"]["ok"] == true);
         CHECK(run({"library", "repair", "--library", path_text(library), "--rebuild-fts"}).code == cli::exit_success);
+        // A derived-index rebuild drops the motif index; search reports partial until analyze runs.
+        const auto rebuilt = run({"library", "repair", "--library", path_text(library), "--rebuild-derived"});
+        INFO(rebuilt.json.dump());
+        REQUIRE(rebuilt.code == cli::exit_success);
+        CHECK(rebuilt.json["report"]["derived_rows_removed"].get<int>() > 0);
+        CHECK(run({"library", "repair", "--library", path_text(library)}).code == cli::exit_invalid_arguments);
+        const auto reanalyzed = run({"library", "analyze", "--library", path_text(library)});
+        INFO(reanalyzed.json.dump());
+        CHECK(reanalyzed.code == cli::exit_success);
+        CHECK(reanalyzed.json["report"]["analyzed"].get<int>() > 0);
+        CHECK(reanalyzed.json["report"]["budget_reached"] == false);
+        const auto after = run({"library", "melody", "--library", path_text(library), "--notes", "D4 E4 F4 G4", "--mode",
+                                "transposed"});
+        CHECK(after.code == cli::exit_success);
+        CHECK(after.json["matches"].size() >= 1);
+        // gc: nothing is unreferenced in a fresh library; the report is complete and nothing is lost.
+        const auto gc = run({"library", "gc", "--library", path_text(library), "--grace-days", "0"});
+        INFO(gc.json.dump());
+        REQUIRE(gc.code == cli::exit_success);
+        CHECK(gc.json["report"]["suspended"] == false);
+        CHECK(gc.json["report"]["deleted"] == 0);
+        CHECK(run({"library", "gc", "--library", path_text(library), "--grace-days", "-1"}).code ==
+              cli::exit_invalid_arguments);
+        CHECK(run({"library", "verify", "--library", path_text(library), "--objects"}).code == cli::exit_success);
     }
 
     TEST_CASE("capabilities lists dependencies and SQLite options") {

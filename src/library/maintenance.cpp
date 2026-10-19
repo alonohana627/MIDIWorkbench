@@ -345,7 +345,7 @@ Result<VerifyReport> restore_backup(const std::filesystem::path& backup, const s
     return report;
 }
 
-Result<RepairReport> repair_rebuild_fts(Library& library) {
+Result<RepairReport> repair_library(Library& library, const RepairOptions& options) {
     RepairReport report;
     report.safety_backup = library.root() / "backups" / std::format("{}-pre-repair", now_utc_ms());
     auto backup = create_backup(library, report.safety_backup);
@@ -359,11 +359,23 @@ Result<RepairReport> repair_rebuild_fts(Library& library) {
         MWB_TRY(library.backup_catalog(std::filesystem::path(catalog_only) / "library.sqlite"));
         report.safety_backup = catalog_only;
     }
-    auto rows = library.rebuild_fts();
-    if (!rows)
-        return std::unexpected(std::move(rows).error());
-    report.fts_rows = *rows;
+    if (options.rebuild_fts) {
+        auto rows = library.rebuild_fts();
+        if (!rows)
+            return std::unexpected(std::move(rows).error());
+        report.fts_rows = *rows;
+    }
+    if (options.rebuild_derived) {
+        auto removed = library.rebuild_derived();
+        if (!removed)
+            return std::unexpected(std::move(removed).error());
+        report.derived_rows_removed = *removed;
+    }
     return report;
+}
+
+Result<RepairReport> repair_rebuild_fts(Library& library) {
+    return repair_library(library, RepairOptions{.rebuild_fts = true});
 }
 
 } // namespace mwb::library

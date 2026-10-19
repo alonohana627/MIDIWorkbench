@@ -31,12 +31,16 @@ struct CommandOptions {
     int sample_rate = 48000;
     int limit = 100;
     std::int64_t rows = 100000;
+    std::int64_t motif_rows = 0;
+    int repetitions = 25;
     bool json = true;
     bool strict = false;
     bool overwrite = false;
     bool normalize = false;
     bool verify_objects = false;
     bool rebuild_fts = false;
+    bool rebuild_derived = false;
+    double grace_days = 30.0; ///< `library gc`: unreferenced objects younger than this stay.
     bool warnings_as_errors = false;
 };
 
@@ -67,6 +71,7 @@ struct CommandOutput {
 [[nodiscard]] CommandOutput command_library_backup(const CommandOptions& options);
 [[nodiscard]] CommandOutput command_library_verify(const CommandOptions& options);
 [[nodiscard]] CommandOutput command_library_repair(const CommandOptions& options);
+[[nodiscard]] CommandOutput command_library_gc(const CommandOptions& options);
 [[nodiscard]] CommandOutput command_devices(const CommandOptions& options);
 [[nodiscard]] CommandOutput command_capabilities(const CommandOptions& options);
 [[nodiscard]] CommandOutput command_bench(const CommandOptions& options);

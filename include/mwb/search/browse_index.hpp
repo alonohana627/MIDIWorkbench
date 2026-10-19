@@ -97,6 +97,11 @@ public:
     void clear();
 
     [[nodiscard]] std::size_t size() const { return rows_.size(); }
+    /// The stored row, or null (page rows carry their sort keys from here).
+    [[nodiscard]] const BrowseRow* find(std::int64_t id) const {
+        const auto found = rows_.find(id);
+        return found == rows_.end() ? nullptr : &found->second.row;
+    }
     /// Measured bytes held by rows, dictionary and sort orders.
     [[nodiscard]] std::size_t memory_bytes() const { return memory_bytes_ + dictionary_bytes_; }
     [[nodiscard]] bool over_budget() const { return memory_bytes() > budget_bytes_; }
@@ -121,9 +126,15 @@ private:
         std::size_t bytes = 0;
     };
 
-    [[nodiscard]] Truth evaluate_row(const StoredRow& row, const Query& query, const SearchOptions& options) const;
-    [[nodiscard]] Truth evaluate_node(const StoredRow& row, const QueryNode& node, const SearchOptions& options) const;
-    [[nodiscard]] Truth evaluate_text(const StoredRow& row, const Predicate& predicate) const;
+    /// Query text tokens resolved to dictionary ids once per call (nullopt: not ASCII-exact),
+    /// not once per row.
+    using TokenCache = std::unordered_map<const Predicate*, std::optional<std::vector<std::uint32_t>>>;
+
+    [[nodiscard]] Truth evaluate_row(const StoredRow& row, const Query& query, const SearchOptions& options,
+                                     TokenCache& cache) const;
+    [[nodiscard]] Truth evaluate_node(const StoredRow& row, const QueryNode& node, const SearchOptions& options,
+                                      TokenCache& cache) const;
+    [[nodiscard]] Truth evaluate_text(const StoredRow& row, const Predicate& predicate, TokenCache& cache) const;
     [[nodiscard]] std::size_t measure(const StoredRow& row) const;
     [[nodiscard]] std::uint32_t intern(const std::string& token);
 

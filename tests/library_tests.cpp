@@ -607,9 +607,19 @@ TEST_SUITE("import") {
                                          phrase_smf(Phrase{}.set_pitches({30, 31, 32})), MediaType::smf)
                     .has_value());
         write_bytes(file, phrase_smf(Phrase{}.set_pitches({90, 91, 92})));
+        const auto edited_head = library->asset(asset)->value().current_revision_id;
         auto review = library->import_paths({file});
         CHECK(review->counts.source_changed == 1);
-        CHECK(library->revisions(asset)->size() == 3);
+        // The changed source is kept as a candidate revision for review; the edit stays the head
+        // (code-library-10), and restoring the candidate adopts the source's bytes.
+        CHECK(library->revisions(asset)->size() == 4);
+        CHECK(library->asset(asset)->value().current_revision_id == edited_head);
+        REQUIRE(review->items[0].candidate_revision_id.has_value());
+        const auto candidate = *review->items[0].candidate_revision_id;
+        CHECK(library->revision_bytes(candidate).value() == phrase_smf(Phrase{}.set_pitches({90, 91, 92})));
+        const auto adopted = library->restore_revision(asset, candidate, edited_head);
+        REQUIRE(adopted.has_value());
+        CHECK(library->revision_bytes(*adopted).value() == phrase_smf(Phrase{}.set_pitches({90, 91, 92})));
 
         std::stop_source stop;
         stop.request_stop();
@@ -875,7 +885,7 @@ TEST_SUITE("plans") {
         REQUIRE(library->enqueue_job("analyze", "analyze-1", "{}").has_value());
         auto queries = hot_queries(*library);
         REQUIRE(queries.has_value());
-        CHECK(queries->size() == 5);
+        CHECK(queries->size() == 13); // incl. selective filters, the motif index and the analysis batch
         for (const auto& query : *queries) {
             auto plan = library->explain_query_plan(query.statement);
             REQUIRE(plan.has_value());
@@ -902,16 +912,321 @@ TEST_SUITE("plans") {
 
     TEST_CASE("the bench helper measures real timings on a synthetic catalog") {
         test::TemporaryDirectory temporary;
-        auto report = run_bench(temporary.path() / "bench", bench_options(500, 3));
+        auto options = bench_options(500, 3);
+        options.motif_rows = 250; // with a planted motif every 100 streams (code-library-13)
+        auto report = run_bench(temporary.path() / "bench", options);
+        INFO((report ? report->to_json() : report.error().describe()));
         REQUIRE(report.has_value());
         CHECK(report->rows == 500);
-        CHECK(report->timings.size() == 7);
+        // 7 SQL timings, the index build, 5 index pages and 3 melody searches.
+        CHECK(report->timings.size() == 16);
         CHECK(report->plan_problems.empty());
         for (const auto& timing : report->timings) {
             CAPTURE(timing.name);
-            CHECK(timing.samples == 3);
+            CHECK(timing.samples == (timing.name == "browse_index_build" ? 1u : 3u));
             CHECK(timing.p50_ms <= timing.max_ms);
         }
-        CHECK(report->to_json().find("page_first_title") != std::string::npos);
+        for (const auto* name : {"page_first_title", "index_page_first_title", "index_select_has_sysex", "motif_exact_8",
+                                 "motif_exact_32", "motif_similar_16"})
+            CHECK(report->to_json().find(name) != std::string::npos);
+    }
+}
+
+TEST_SUITE("analysis") {
+    TEST_CASE("a restored revision keeps the user's manual key (code-library-3)") {
+        test::TemporaryDirectory temporary;
+        auto library = make_library(temporary.path() / "library");
+        const auto file = temporary.path() / "in" / "song.mid";
+        write_bytes(file, phrase_smf(Phrase{}));
+        const auto asset = *library->import_paths({file})->items[0].asset_id;
+        const auto first = library->asset(asset)->value().current_revision_id;
+        REQUIRE(library->commit_revision(CommitRequest{asset, first, RevisionOrigin::edit, "edit"},
+                                         phrase_smf(Phrase{}.set_pitches({62, 65, 69, 72})), MediaType::smf)
+                    .has_value());
+        REQUIRE(library->set_key_override(asset, 0, 9, "minor").has_value());
+        const auto head = library->asset(asset)->value().current_revision_id;
+        REQUIRE(library->restore_revision(asset, *first, head).has_value());
+        SearchRequest request;
+        request.query_text = "key:\"A minor\" key.origin:manual";
+        auto page = library->search(request);
+        REQUIRE(page.has_value());
+        REQUIRE(page->rows.size() == 1);
+        CHECK(page->rows[0].id == asset);
+    }
+
+    TEST_CASE("a cancelled or unreadable analysis is retried later, never marked failed (code-library-5)") {
+        test::TemporaryDirectory temporary;
+        auto library = make_library(temporary.path() / "library");
+        write_bytes(temporary.path() / "in" / "a.mid", phrase_smf(Phrase{}));
+        REQUIRE(library->import_paths({temporary.path() / "in"}).has_value());
+        AnalyzeOptions cancelling;
+        cancelling.parser = [](std::span<const std::uint8_t>, std::string_view, const midi::ParseLimits&,
+                               std::stop_token) -> Result<midi::ImportResult> {
+            return make_error(ErrorCode::cancelled, "the import was cancelled");
+        };
+        auto cancelled = library->analyze(cancelling);
+        REQUIRE(cancelled.has_value());
+        CHECK(cancelled->cancelled);
+        CHECK(cancelled->revisions_failed == 0);
+        // Objects briefly unreadable: recorded as retry-later.
+        const auto objects = temporary.path() / "library" / "objects";
+        std::filesystem::rename(objects, temporary.path() / "library" / "objects-away");
+        auto unreadable = library->analyze();
+        REQUIRE(unreadable.has_value());
+        std::filesystem::rename(temporary.path() / "library" / "objects-away", objects);
+        auto retried = library->analyze();
+        REQUIRE(retried.has_value());
+        CHECK(retried->revisions_analyzed == 1);
+        // A genuinely broken file is recorded failed once and never re-parsed by later runs
+        // (code-library-1 leftover).
+        AnalyzeOptions breaking;
+        breaking.parser = [](std::span<const std::uint8_t>, std::string_view, const midi::ParseLimits&,
+                             std::stop_token) -> Result<midi::ImportResult> {
+            return make_error(ErrorCode::invalid_data, "broken");
+        };
+        write_bytes(temporary.path() / "in2" / "b.mid", phrase_smf(Phrase{}.set_pitches({41, 43})));
+        REQUIRE(library->import_paths({temporary.path() / "in2"}).has_value());
+        CHECK(library->analyze(breaking)->revisions_failed == 1);
+        int parses = 0;
+        AnalyzeOptions counting;
+        counting.parser = [&parses](std::span<const std::uint8_t>, std::string_view, const midi::ParseLimits&,
+                                    std::stop_token) -> Result<midi::ImportResult> {
+            ++parses;
+            return make_error(ErrorCode::invalid_data, "broken");
+        };
+        auto again = library->analyze(counting);
+        REQUIRE(again.has_value());
+        CHECK(parses == 0);
+        CHECK(again->revisions_failed == 0);
+    }
+
+    TEST_CASE("the derived index has a budget, and a new head drops the old head's streams (code-library-7)") {
+        test::TemporaryDirectory temporary;
+        const auto root = temporary.path() / "library";
+        auto library = make_library(root);
+        const auto file = temporary.path() / "in" / "song.mid";
+        write_bytes(file, phrase_smf(Phrase{}.set_pitches({60, 62, 64, 65, 67, 69, 71, 72})));
+        const auto asset = *library->import_paths({file})->items[0].asset_id;
+        AnalyzeOptions tiny;
+        tiny.budget_bytes = 1;
+        auto stopped = library->analyze(tiny);
+        REQUIRE(stopped.has_value());
+        CHECK(stopped->budget_reached);
+        CHECK(stopped->revisions_analyzed == 0);
+        REQUIRE(library->analyze()->revisions_analyzed == 1); // the default budget resumes
+        const auto count_streams = [&] {
+            SQLite::Database database((root / "library.sqlite").string(), SQLite::OPEN_READONLY);
+            SQLite::Statement query(database, "SELECT count(*) FROM motif_stream");
+            query.executeStep();
+            return query.getColumn(0).getInt64();
+        };
+        CHECK(count_streams() == 1);
+        const auto head = library->asset(asset)->value().current_revision_id;
+        REQUIRE(library->commit_revision(CommitRequest{asset, head, RevisionOrigin::edit, "edit"},
+                                         phrase_smf(Phrase{}.set_pitches({50, 52, 53})), MediaType::smf)
+                    .has_value());
+        CHECK(count_streams() == 0); // the superseded head's derived rows are gone
+    }
+
+    TEST_CASE("unindexed items and unreadable streams make a melody result partial instead of silent or failing") {
+        test::TemporaryDirectory temporary;
+        const auto root = temporary.path() / "library";
+        auto library = make_library(root);
+        const auto in = temporary.path() / "in";
+        write_bytes(in / "theme.mid", phrase_smf(Phrase{}.set_pitches({60, 64, 67, 72, 71, 67, 64, 62})));
+        write_bytes(in / "other.mid", phrase_smf(Phrase{}.set_pitches({62, 66, 69, 74, 73, 69, 66, 64}))); // transposed
+        REQUIRE(library->import_paths({in}).has_value());
+        search::ExactQuery query;
+        query.mode = search::MatchMode::transposed;
+        for (const int pitch : {64, 67, 72, 71, 67})
+            query.notes.push_back(search::QueryNote{static_cast<Tick>(query.notes.size()) * 480, 240,
+                                                    static_cast<std::uint8_t>(pitch), 100});
+        auto before = library->motif_search(query);
+        REQUIRE(before.has_value());
+        CHECK(before->partial); // nothing is indexed yet: the result says so (code-library-4)
+        CHECK(before->unindexed_heads == 2);
+        REQUIRE(library->analyze().has_value());
+        auto indexed = library->motif_search(query);
+        REQUIRE(indexed.has_value());
+        CHECK_FALSE(indexed->partial);
+        CHECK(indexed->occurrences.size() == 2);
+        {
+            // Damage one stored stream (bit rot, a restored damaged backup).
+            SQLite::Database database((root / "library.sqlite").string(), SQLite::OPEN_READWRITE);
+            database.exec("UPDATE motif_stream SET payload = x'00010203' WHERE id = (SELECT min(id) FROM motif_stream)");
+        }
+        auto damaged = library->motif_search(query);
+        REQUIRE(damaged.has_value()); // not an error for every search (code-library-9)
+        CHECK(damaged->partial);
+        CHECK(damaged->skipped_streams == 1);
+        CHECK(damaged->occurrences.size() == 1);
+        REQUIRE(library->rebuild_derived().has_value()); // repair: rebuild the derived index
+        REQUIRE(library->analyze()->revisions_analyzed == 2);
+        CHECK(library->motif_search(query)->occurrences.size() == 2);
+    }
+
+    TEST_CASE("garbage collection removes object files the catalog does not know (code-library-12)") {
+        test::TemporaryDirectory temporary;
+        const auto root = temporary.path() / "library";
+        auto library = make_library(root);
+        const std::string hex(64, 'a');
+        const auto orphan = root / "objects" / "aa" / (hex + ".mid");
+        write_bytes(orphan, Bytes{'M', 'T', 'h', 'd'});
+        GarbageCollectionOptions options;
+        options.now_ms = 0; // tests: every unknown file counts as old
+        auto report = library->collect_garbage(options);
+        REQUIRE(report.has_value());
+        CHECK(report->orphan_files == 1);
+        CHECK_FALSE(std::filesystem::exists(orphan));
+    }
+}
+
+TEST_SUITE("catalog") {
+    TEST_CASE("searches are served by the browse index once built and stay current from the outbox (code-library-11)") {
+        test::TemporaryDirectory temporary;
+        auto library = make_library(temporary.path() / "library");
+        const auto in = temporary.path() / "in";
+        write_bytes(in / "bass line.mid", phrase_smf(Phrase{}.set_tempo_us(400000).set_program(33)));
+        write_bytes(in / "rising lead.mid", phrase_smf(Phrase{}.set_name("Rising Lead")));
+        auto report = library->import_paths({in});
+        REQUIRE(report.has_value());
+        const auto bass = only_asset(*report, "bass line.mid");
+        const auto lead = only_asset(*report, "rising lead.mid");
+        REQUIRE(library->populate_synthetic(400, 5).has_value());
+
+        // Pages through a request; reports whether every page came from the index.
+        const auto pages = [&](SearchRequest request, bool use_index, bool& all_from_index) {
+            request.use_browse_index = use_index;
+            request.page_size = 37; // several pages, last one partial
+            std::vector<std::int64_t> ids;
+            all_from_index = true;
+            for (int guard = 0; guard < 1000; ++guard) {
+                auto page = library->search(request);
+                REQUIRE(page.has_value());
+                all_from_index = all_from_index && page->from_browse_index;
+                for (const auto& row : page->rows)
+                    ids.push_back(row.id);
+                if (!page->next)
+                    break;
+                request.after = page->next;
+            }
+            return ids;
+        };
+        const std::vector<std::string> queries{"", "tag:bass", "tag:picked", "bpm:120..140", "lead", "favorite:true rating:>=2",
+                                               "NOT drums:true notes:>=100", "key:C"};
+        const std::vector<search::SortOrder> orders{{search::SortField::title, false},
+                                                     {search::SortField::title, true},
+                                                     {search::SortField::modified, true},
+                                                     {search::SortField::created, false}};
+        // Pages in exactly the SQL order, for every sort.
+        const auto check_parity = [&](bool expect_index) {
+            for (const auto& text : queries)
+                for (const auto& order : orders) {
+                    CAPTURE(text);
+                    CAPTURE(static_cast<int>(order.field));
+                    CAPTURE(order.descending);
+                    SearchRequest request;
+                    request.query_text = text;
+                    request.order = order;
+                    bool sql_index = true;
+                    bool memory_index = false;
+                    const auto sql = pages(request, false, sql_index);
+                    const auto memory = pages(request, true, memory_index);
+                    CHECK_FALSE(sql_index);
+                    CHECK(memory_index == expect_index);
+                    CHECK(memory == sql);
+                }
+        };
+
+        CHECK_FALSE(library->browse_index_status().ready);
+        check_parity(false); // still loading: SQL
+        auto built = library->build_browse_index();
+        REQUIRE(built.has_value());
+        CHECK(built->ready);
+        CHECK(built->rows == 402);
+        CHECK(built->memory_bytes > 0);
+        check_parity(true);
+
+        // Writes after the build reach the index through the outbox before the next page.
+        REQUIRE(library->add_tag(lead, "picked").has_value());
+        REQUIRE(library->set_rating(bass, 5).has_value());
+        REQUIRE(library->set_favorite(bass, true).has_value());
+        REQUIRE(library->set_title(lead, "aaa first").has_value());
+        REQUIRE(library->trash({bass}).has_value());
+        check_parity(true);
+        SearchRequest tagged;
+        tagged.query_text = "tag:picked";
+        CHECK(all_ids(*library, tagged) == std::vector<std::int64_t>{lead});
+        REQUIRE(library->restore_from_trash({bass}).has_value());
+        REQUIRE(library->trash({lead}).has_value());
+        REQUIRE(library->purge({lead}).has_value());
+        write_bytes(temporary.path() / "more" / "new.mid", phrase_smf(Phrase{}.set_pitches({40, 41})));
+        REQUIRE(library->import_paths({temporary.path() / "more"}).has_value());
+        check_parity(true);
+        CHECK(library->browse_index_status().rows == 402); // one purged, one imported
+
+        // Relevance order is always SQL.
+        SearchRequest relevance;
+        relevance.query_text = "lead";
+        relevance.order.field = search::SortField::relevance;
+        auto ranked = library->search(relevance);
+        REQUIRE(ranked.has_value());
+        CHECK_FALSE(ranked->from_browse_index);
+
+        // Over its budget the index is not kept: SQL paging serves the library.
+        auto small = library->build_browse_index({}, 4096);
+        REQUIRE(small.has_value());
+        CHECK(small->over_budget);
+        CHECK_FALSE(small->ready);
+        CHECK(library->browse_index_status().over_budget);
+        check_parity(false);
+
+        // A cancelled build leaves the previous state untouched.
+        std::stop_source stop;
+        stop.request_stop();
+        auto cancelled = library->build_browse_index(stop.get_token());
+        REQUIRE_FALSE(cancelled.has_value());
+        CHECK(cancelled.error().code == ErrorCode::cancelled);
+    }
+}
+
+TEST_SUITE("analysis") {
+    TEST_CASE("the M10K fixture plants a known motif that exact and similar search find (code-library-13)") {
+        test::TemporaryDirectory temporary;
+        auto library = make_library(temporary.path() / "library");
+        REQUIRE(library->populate_synthetic(300, 9).value() == 300);
+        REQUIRE(library->populate_synthetic_motifs(250, 9).value() == 250);
+        const auto planted = synthetic_planted_motif();
+        REQUIRE(planted.size() == 32);
+        search::ExactQuery exact;
+        exact.mode = search::MatchMode::transposed;
+        exact.notes = planted;
+        auto found = library->motif_search(exact);
+        REQUIRE(found.has_value());
+        CHECK(found->occurrences.size() == 3); // streams 0, 100 and 200
+        CHECK(found->partial);                  // 50 heads have no streams: said, not hidden
+        CHECK(found->unindexed_heads == 50);
+        search::ApproximateQuery similar;
+        similar.notes.assign(planted.begin() + 4, planted.begin() + 20);
+        auto near = library->similar_search(similar);
+        REQUIRE(near.has_value());
+        CHECK(near->matches.size() >= 3);
+        // A cancelled generation ends at once instead of finishing the search (code-library-8).
+        std::stop_source cancel;
+        cancel.request_stop();
+        // It comes back as a partial result that says so, never as a complete empty one.
+        auto stopped_exact = library->motif_search(exact, cancel.get_token());
+        REQUIRE(stopped_exact.has_value());
+        CHECK(stopped_exact->partial);
+        CHECK(stopped_exact->partial_reason.find("cancelled") != std::string::npos);
+        CHECK(stopped_exact->occurrences.empty());
+        auto stopped_similar = library->similar_search(similar, cancel.get_token());
+        REQUIRE(stopped_similar.has_value());
+        CHECK(stopped_similar->partial);
+        CHECK(stopped_similar->partial_reason.find("cancelled") != std::string::npos);
+        CHECK(stopped_similar->matches.empty());
+        // The remaining heads get streams on a second call; nothing is written twice.
+        CHECK(library->populate_synthetic_motifs(1000, 9).value() == 50);
+        CHECK(library->populate_synthetic_motifs(10, 9).value() == 0);
     }
 }

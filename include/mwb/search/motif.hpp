@@ -237,6 +237,8 @@ struct ExactSearchResult {
     std::optional<ExactContinuation> next;
     std::size_t candidates_verified = 0;
     bool indexed = true; ///< False when a constrained scan was used (short queries).
+    std::size_t unindexed_heads = 0;  ///< Items not analyzed yet: not searched musically.
+    std::size_t skipped_streams = 0;  ///< Stored streams that could not be read (skipped).
 };
 
 /// Verifies one window of a stream against the query; returns the occurrence when it matches.
@@ -321,6 +323,8 @@ struct ApproximateSearchResult {
     bool partial = false;
     std::string partial_reason;
     std::string label; ///< "approximate search (budget: N streams, M windows per stream)".
+    std::size_t unindexed_heads = 0;  ///< Items not analyzed yet: not searched musically.
+    std::size_t skipped_streams = 0;  ///< Stored streams that could not be read (skipped).
 };
 
 /// Aligns the query against the candidate stream around `implied_start` with the banded monotone

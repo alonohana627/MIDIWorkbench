@@ -5,6 +5,7 @@
 #include "mwb/document/recovery.hpp"
 #include "mwb/ui/task_thread.hpp"
 #include "mwb/core/model.hpp"
+#include "mwb/core/tempo_map.hpp"
 
 #include <QMainWindow>
 #include <QPointer>
@@ -214,6 +215,13 @@ private:
     /// activates it when it is a button or a check cell, a mouse-focused control leaves Space to Play.
     QPointer<QWidget> keyboard_focus_;
     QLabel* step_label_ = nullptr; ///< "STEP" while step recording is armed.
+    /// The library item being previewed (no tab owns the transport meanwhile).
+    struct Preview {
+        QString title;
+        TempoMap tempo;
+        MeterMap meter;
+    };
+    std::optional<Preview> preview_;
     QAction* snap_label_action_ = nullptr; ///< " Snap " caption; hidden in the compact toolbar.
     bool compact_toolbar_ = false;
     QAction* snap_off_action_ = nullptr;

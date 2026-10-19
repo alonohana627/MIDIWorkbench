@@ -36,10 +36,11 @@ literally (Unicode is fine).
 | `library analyze --library DIR [--profile all\|fingerprints\|motif]` | Builds summaries, fingerprints and motif indexes |
 | `library backup --library DIR --output DIR` | Consistent verified backup with manifest |
 | `library verify --library DIR [--objects]` | Integrity, foreign keys, object hashes (read-only) |
-| `library repair --library DIR --rebuild-fts` | Safety backup, then rebuilds the full-text index |
+| `library repair --library DIR [--rebuild-fts] [--rebuild-derived]` | Safety backup, then rebuilds the full-text index and/or drops the derived indexes (fingerprints, motif, features) so the next `library analyze` rebuilds them |
+| `library gc --library DIR [--grace-days D]` | Removes objects no revision references (and stray files in `objects/`) once older than the grace period (default 30 days); suspended while a backup runs |
 | `devices` | Audio endpoints and MIDI ports with stable IDs |
 | `capabilities` | Build ID, compiler, Qt, dependency versions, SQLite options, backends |
-| `bench --library DIR [--rows N]` | Synthetic catalog; times hot queries and checks their plans |
+| `bench --library DIR [--rows N] [--motif-rows M]` | Synthetic catalog; times hot queries (SQL and the in-memory browse index) and checks their plans; `--motif-rows` adds indexed melody streams with a planted motif and times exact and similar melody search (M10K: 10000) |
 
 ## Recipe example
 

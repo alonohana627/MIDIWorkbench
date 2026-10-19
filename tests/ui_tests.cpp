@@ -2195,6 +2195,7 @@ TEST_SUITE("library_ui") {
         INFO("status: " << fixture.status().toStdString());
         REQUIRE(said);
         CHECK_FALSE(fixture.status().contains("library is empty"));
+        CHECK_FALSE(fixture.table()->horizontalHeader()->isSectionHidden(6)); // match details shown for melody hits
         // A save would have re-run the text search before; melody results stay.
         DocumentData document = make_blank_document("Later");
         fixture.panel->save_document(std::make_shared<const DocumentData>(document), std::nullopt, std::nullopt, "Later",
@@ -2206,6 +2207,20 @@ TEST_SUITE("library_ui") {
         CHECK(back->isVisible());
         back->click();
         REQUIRE(wait_until([&] { return fixture.table()->model()->rowCount() == 2; }, 3000));
+        CHECK(fixture.table()->horizontalHeader()->isSectionHidden(6)); // the user's column choice again
+    }
+
+    TEST_CASE("an open library builds its browse index in the background and searches then use it") {
+        LibraryFixture fixture(3);
+        auto library = fixture.panel->library();
+        REQUIRE(library);
+        REQUIRE(wait_until([&] { return library->browse_index_status().ready; }, 5000));
+        CHECK(library->browse_index_status().rows == 3);
+        library::SearchRequest request;
+        auto page = library->search(request);
+        REQUIRE(page.has_value());
+        CHECK(page->from_browse_index);
+        CHECK(page->rows.size() == 3);
     }
 
     TEST_CASE("a library reopened at startup does not count as chosen by the user") {
@@ -2373,5 +2388,122 @@ TEST_SUITE("window") {
         fixture.window->current_tab()->piano_roll().setFocus();
         fixture.key(Qt::Key_Space);
         CHECK(wait_until([&] { return play->iconText() == "Play"; }, 2000));
+    }
+}
+
+// Reviewer probes, batch 5 (probe_batch5); the library screenshot probe runs only where the
+// reviewer's library exists and saves into the test's temporary workspace.
+
+TEST_SUITE("reviewer_probe6") {
+    TEST_CASE("probe6: where the focus is at startup") {
+        WindowFixture fixture;
+        QWidget* focus = QApplication::focusWidget();
+        MESSAGE("startup focus: " << (focus ? focus->metaObject()->className() : "none") << " '"
+                << (focus ? focus->accessibleName().toStdString() : "") << "' tooltip '"
+                << (focus ? focus->toolTip().left(40).toStdString() : "") << "'");
+        CHECK(qobject_cast<PianoRollView*>(focus) != nullptr);
+    }
+    TEST_CASE("probe6: library UI screenshots (CLI-made library), melody and trash modes") {
+        WindowFixture fixture;
+        auto* library = fixture.window->findChild<LibraryPanel*>();
+        REQUIRE(library);
+        const std::filesystem::path reviewer_library = std::filesystem::path("C:/Users/user/AppData/Local/Temp/claude/C--Users-user-SoundStaff/e1a24cfc-98ee-406f-b798-a61ae3fd6517/scratchpad/lib5/Test Library");
+        std::error_code exists_error;
+        if (!std::filesystem::exists(reviewer_library / "library.sqlite", exists_error))
+            return; // the reviewer's CLI-made library exists only on the review machine
+        library->open_library(reviewer_library, false, true);
+        auto* table = library->findChild<QTableView*>();
+        REQUIRE(table);
+        REQUIRE(wait_until([&] { return table->model()->rowCount() >= 12; }, 8000));
+        QTest::qWait(300);
+        fixture.window->grab().save(QString::fromStdWString((fixture.directory.path() / "dark_library.png").wstring()));
+        library->grab().save(QString::fromStdWString((fixture.directory.path() / "dark_library_panel.png").wstring()));
+        MESSAGE("title width " << table->columnWidth(0) << " of viewport " << table->viewport()->width());
+        // Melody search for the motif 0 2 4 5 7 (G major start).
+        std::vector<std::pair<Tick, std::uint8_t>> onsets;
+        std::vector<Tick> durations;
+        const int motif[] = {0, 2, 4, 5, 7};
+        for (int k = 0; k < 5; ++k) {
+            onsets.emplace_back(k * 240, static_cast<std::uint8_t>(67 + motif[k]));
+            durations.push_back(220);
+        }
+        library->search_melody(onsets, durations, false);
+        QTest::qWait(1500);
+        MESSAGE("melody rows " << table->model()->rowCount());
+        for (int row = 0; row < table->model()->rowCount(); ++row)
+            MESSAGE("  " << table->model()->index(row, 0).data().toString().toStdString() << " | status hidden: "
+                    << table->horizontalHeader()->isSectionHidden(6) << " | tooltip: "
+                    << table->model()->index(row, 0).data(Qt::ToolTipRole).toString().replace('\n', " / ").toStdString());
+        library->grab().save(QString::fromStdWString((fixture.directory.path() / "dark_library_melody.png").wstring()));
+        library->show_trash(true);
+        QTest::qWait(800);
+        library->grab().save(QString::fromStdWString((fixture.directory.path() / "dark_library_trash.png").wstring()));
+        MESSAGE("trash rows " << table->model()->rowCount());
+    }
+    TEST_CASE("probe6: the readout during a library preview") {
+        WindowFixture fixture;
+        auto* library = fixture.window->findChild<LibraryPanel*>();
+        REQUIRE(library);
+        DocumentData item = make_blank_document("Riff");
+        ChangeBuilder builder(item, "note");
+        builder.add_note(item.sequences.front().tracks.front().id, 0, 3840 * 8, 0, 60, 100);
+        REQUIRE(apply_change_set(item, builder.finish()));
+        auto* label = fixture.window->findChild<QLabel*>("transport.position");
+        REQUIRE(label);
+        const QString before = label->text();
+        emit library->preview_requested(item, "Riff", std::nullopt);
+        QTest::qWait(1200);
+        MESSAGE("readout before '" << before.toStdString() << "' during '" << label->text().toStdString() << "'");
+        CHECK(label->text() != before);
+        fixture.window->current_tab()->piano_roll().setFocus();
+        fixture.key(Qt::Key_Space);
+    }
+}
+
+TEST_SUITE("reviewer_probe6") {
+    TEST_CASE("probe6: Down right after startup") {
+        WindowFixture fixture;
+        auto& controller = fixture.window->current_tab()->controller();
+        const auto before = controller.active_sequence().settings.default_note_length;
+        const auto generation = controller.generation();
+        fixture.key(Qt::Key_Down);
+        QTest::qWait(100);
+        MESSAGE("default length " << before.to_string() << " -> " << controller.active_sequence().settings.default_note_length.to_string()
+                << ", generation " << generation << " -> " << controller.generation() << ", undo '" << controller.undo_text().toStdString() << "'");
+        CHECK(controller.generation() == generation);
+    }
+}
+
+TEST_SUITE("window") {
+    TEST_CASE("the piano roll has the keyboard at startup and after opening a file") {
+        WindowFixture fixture;
+        CHECK(qobject_cast<PianoRollView*>(QApplication::focusWidget()) != nullptr);
+        REQUIRE(fixture.window->open_path(std::filesystem::path(__FILE__).parent_path().parent_path() / "docs" / "images" /
+                                          "demo.mid"));
+        REQUIRE(wait_until([&] { return fixture.window->current_tab()->controller().notes().notes.size() > 0; }, 5000));
+        QTest::qWait(100);
+        CHECK(QApplication::focusWidget() == &fixture.window->current_tab()->piano_roll());
+        auto& controller = fixture.window->current_tab()->controller();
+        const auto generation = controller.generation();
+        fixture.key(Qt::Key_Down); // no selection: never an inspector setting
+        CHECK(controller.generation() == generation);
+    }
+
+    TEST_CASE("the readout follows a library preview") {
+        WindowFixture fixture;
+        auto* library = fixture.window->findChild<LibraryPanel*>();
+        auto* label = fixture.window->findChild<QLabel*>("transport.position");
+        REQUIRE(library);
+        REQUIRE(label);
+        DocumentData item = make_blank_document("Riff");
+        ChangeBuilder builder(item, "tempo and note");
+        builder.add_note(item.sequences.front().tracks.front().id, 0, 3840 * 8, 0, 60, 100);
+        REQUIRE(apply_change_set(item, builder.finish()));
+        emit library->preview_requested(item, "Riff", std::nullopt);
+        REQUIRE(wait_until([&] { return label->text().contains("Play") && !label->text().startsWith("1.1.000"); }, 3000));
+        CHECK(label->toolTip().contains("Riff"));
+        fixture.window->current_tab()->piano_roll().setFocus();
+        fixture.key(Qt::Key_Space);
+        CHECK(wait_until([&] { return label->text().contains("Stop"); }, 2000));
     }
 }

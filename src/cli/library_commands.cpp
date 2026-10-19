@@ -209,8 +209,10 @@ CommandOutput command_library_analyze(const CommandOptions& options) {
                                                 {"failed", report->revisions_failed},
                                                 {"streams", report->streams},
                                                 {"grams", report->grams},
-                                                {"cancelled", report->cancelled}}}});
-    if (report->revisions_failed > 0) {
+                                                {"cancelled", report->cancelled},
+                                                {"budget_reached", report->budget_reached}}}});
+    // A full disk budget leaves heads unindexed, which is a partial result like a failed file.
+    if (report->revisions_failed > 0 || report->budget_reached) {
         output.exit_code = exit_partial;
         output.json["status"] = "partial";
     }
@@ -246,24 +248,53 @@ CommandOutput command_library_verify(const CommandOptions& options) {
 }
 
 CommandOutput command_library_repair(const CommandOptions& options) {
-    if (!options.rebuild_fts)
-        return failure("library repair", Error{ErrorCode::invalid_argument,
-                                               "choose a repair; this version offers --rebuild-fts", {}, {}});
+    if (!options.rebuild_fts && !options.rebuild_derived)
+        return failure("library repair",
+                       Error{ErrorCode::invalid_argument, "choose a repair: --rebuild-fts and/or --rebuild-derived", {}, {}});
     auto library = open_library(options.library, false);
     if (!library)
         return failure("library repair", library.error());
-    auto report = library::repair_rebuild_fts(**library);
+    library::RepairOptions repair;
+    repair.rebuild_fts = options.rebuild_fts;
+    repair.rebuild_derived = options.rebuild_derived;
+    auto report = library::repair_library(**library, repair);
     if (!report)
         return failure("library repair", report.error());
     return success("library repair", {{"report",
                                        {{"safety_backup", app::path_to_utf8(report->safety_backup)},
                                         {"full_backup", report->full_backup},
-                                        {"fts_rows", report->fts_rows}}}});
+                                        {"fts_rows", report->fts_rows},
+                                        {"derived_rows_removed", report->derived_rows_removed}}}});
+}
+
+CommandOutput command_library_gc(const CommandOptions& options) {
+    auto library = open_library(options.library, false);
+    if (!library)
+        return failure("library gc", library.error());
+    library::GarbageCollectionOptions gc;
+    gc.grace_period_ms = static_cast<std::int64_t>(options.grace_days * 24.0 * 60.0 * 60.0 * 1000.0);
+    auto report = (*library)->collect_garbage(gc);
+    if (!report)
+        return failure("library gc", report.error());
+    auto output = success("library gc", {{"report",
+                                          {{"unreferenced", report->unreferenced},
+                                           {"deleted", report->deleted},
+                                           {"orphan_files", report->orphan_files},
+                                           {"waiting", report->waiting},
+                                           {"staging_removed", report->staging_removed},
+                                           {"suspended", report->suspended}}}});
+    if (report->suspended) { // a running backup holds the objects; nothing was removed
+        output.exit_code = exit_partial;
+        output.json["status"] = "suspended";
+    }
+    return output;
 }
 
 CommandOutput command_bench(const CommandOptions& options) {
     library::BenchOptions bench;
     bench.rows = static_cast<std::size_t>(options.rows);
+    bench.motif_rows = static_cast<std::size_t>(options.motif_rows);
+    bench.repetitions = static_cast<std::size_t>(options.repetitions);
     auto report = library::run_bench(app::path_from_utf8(options.library), bench);
     if (!report)
         return failure("bench", report.error());

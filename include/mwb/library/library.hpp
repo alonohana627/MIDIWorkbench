@@ -84,6 +84,9 @@ struct ImportItem {
     ImportOutcome outcome = ImportOutcome::failed;
     std::optional<std::int64_t> asset_id;
     std::string reason;
+    /// source_changed: the changed bytes kept as a non-head revision of the asset for review
+    /// (restore_revision(asset, candidate, head) adopts them, section 22.4).
+    std::optional<std::int64_t> candidate_revision_id{};
 };
 
 /// Section 24.2 counts.
@@ -183,6 +186,16 @@ struct SearchRequest {
     std::size_t page_size = search::default_page_size;
     std::optional<std::int64_t> collection_scope;
     bool across_sequences = false; ///< Explicit "across any sequences" mode.
+    /// False forces SQL paging even when the browse index is ready (parity tests, diagnostics).
+    bool use_browse_index = true;
+};
+
+/// State of the in-memory browse index (section 19.4).
+struct BrowseIndexStatus {
+    bool ready = false;       ///< Built and within budget: filters and sorts are served from memory.
+    bool over_budget = false; ///< Passed its memory budget; searches use SQL paging.
+    std::size_t rows = 0;
+    std::size_t memory_bytes = 0;
 };
 
 /// Search page.
@@ -190,6 +203,7 @@ struct SearchPage {
     std::vector<SearchRow> rows;
     std::optional<search::PageCursor> next;
     bool truncated = false; ///< Relevance results were bounded to relevance_materialize_limit.
+    bool from_browse_index = false; ///< Served by the in-memory browse index instead of SQL.
 };
 
 /// Revision commit conflict detail: the head moved since the editor loaded it.
@@ -214,6 +228,7 @@ struct GarbageCollectionOptions {
 struct GarbageCollectionReport {
     std::size_t unreferenced = 0;    ///< Objects without catalog references.
     std::size_t deleted = 0;         ///< Removed after their grace period.
+    std::size_t orphan_files = 0;    ///< Object files with no catalog row, removed after the grace period.
     std::size_t waiting = 0;         ///< Still inside the grace period.
     std::size_t staging_removed = 0;
     bool suspended = false;          ///< A backup is active; nothing was removed.
@@ -232,6 +247,9 @@ struct AnalyzeOptions {
     midi::ParseLimits limits;
     /// Called after each revision with the number processed so far (on the calling thread).
     std::function<void(std::size_t done)> progress;
+    /// Disk budget of the derived motif index (spec 26.6/28.3: 5 GiB). Analysis stops before a
+    /// revision would exceed it and reports budget_reached; raising it later resumes.
+    std::uint64_t budget_bytes = 5ull << 30;
 };
 struct AnalyzeReport {
     std::size_t revisions_analyzed = 0;
@@ -240,6 +258,7 @@ struct AnalyzeReport {
     std::size_t streams = 0;
     std::size_t grams = 0;
     bool cancelled = false;
+    bool budget_reached = false;         ///< Stopped at AnalyzeOptions::budget_bytes.
 };
 
 /// A leased job (job table).
@@ -256,6 +275,39 @@ inline constexpr std::string_view lease_job_sql =
     "UPDATE job SET state = 'running', attempts = attempts + 1, updated_ms = ?1 WHERE id = (SELECT id FROM job "
     "INDEXED BY job_queue WHERE state = 'queued' ORDER BY id LIMIT 1) RETURNING id, kind, idempotency_key, "
     "arguments_json, attempts";
+
+/// Motif index statements (hot queries). The head check goes through asset_head: without that
+/// hint SQLite picked asset_created_head (deleted_ms=?) and walked every active asset for each
+/// posting or stream, 3 ms per stream at L100K (code-library-13).
+/// Postings of one gram in current heads: ?1 family, ?2 length, ?3 hash, ?4 profile, ?5 limit.
+inline constexpr std::string_view motif_postings_sql =
+    "SELECT g.stream_id, g.start_ordinal FROM motif_gram AS g CROSS JOIN motif_stream AS s ON s.id = g.stream_id "
+    "CROSS JOIN asset AS a INDEXED BY asset_head ON a.current_revision_id = s.revision_id WHERE g.family = ?1 AND "
+    "g.gram_length = ?2 AND g.gram_hash = ?3 AND s.profile_version = ?4 AND a.deleted_ms IS NULL ORDER BY "
+    "g.stream_id, g.start_ordinal LIMIT ?5";
+/// One stream of a current head: ?1 stream id.
+inline constexpr std::string_view motif_stream_sql =
+    "SELECT s.revision_id, a.id, s.payload FROM motif_stream AS s CROSS JOIN asset AS a INDEXED BY asset_head ON "
+    "a.current_revision_id = s.revision_id WHERE s.id = ?1 AND a.deleted_ms IS NULL";
+/// Stream ids of current heads in id order (constrained scans): ?1 after id, ?2 profile, ?3 limit.
+inline constexpr std::string_view motif_stream_ids_sql =
+    "SELECT s.id FROM motif_stream AS s CROSS JOIN asset AS a INDEXED BY asset_head ON a.current_revision_id = "
+    "s.revision_id WHERE s.id > ?1 AND s.profile_version = ?2 AND a.deleted_ms IS NULL ORDER BY s.id LIMIT ?3";
+
+/// The 32-note phrase planted by Library::populate_synthetic_motifs (onsets in 960-PPQ ticks).
+[[nodiscard]] std::vector<search::QueryNote> synthetic_planted_motif();
+
+/// Analysis batch selection (hot query, code-library-6): the next current heads without a
+/// finished derived analysis, driven by the revision primary key so a batch never visits every
+/// active asset (CROSS JOIN fixes revision as the outer loop: SQLite keeps that order, so the
+/// rowid range also gives the ORDER BY without a sort). ?1 after revision id, ?2 analysis
+/// version, ?3 batch size.
+inline constexpr std::string_view analysis_batch_sql =
+    "SELECT r.id, r.object_sha256, o.media_type, o.extension FROM revision AS r CROSS JOIN asset AS a ON a.id = "
+    "r.asset_id AND a.current_revision_id = r.id CROSS JOIN object_file AS o ON o.sha256 = r.object_sha256 WHERE "
+    "r.id > ?1 AND "
+    "a.deleted_ms IS NULL AND NOT EXISTS (SELECT 1 FROM analysis_run AS x WHERE x.revision_id = r.id AND x.analyzer = "
+    "'derived' AND x.version = ?2 AND x.status IN ('complete', 'failed')) ORDER BY r.id LIMIT ?3";
 
 /// The managed library.
 class Library {
@@ -366,6 +418,13 @@ public:
     [[nodiscard]] Result<std::vector<search::BrowseRow>> browse_rows(std::int64_t after_id, std::size_t limit);
     /// Browse-index rows of specific assets (change outbox application).
     [[nodiscard]] Result<std::vector<search::BrowseRow>> browse_rows_for(const std::vector<std::int64_t>& asset_ids);
+    /// Builds the in-memory browse index of section 19.4 page by page on the caller's (background)
+    /// thread and installs it; searches then serve filters and title/date sorts from memory, kept
+    /// current from the change outbox. Until it is ready, for relevance order, for text only SQLite
+    /// can tokenize, after a full outbox reload and above `budget_bytes`, searches use SQL paging.
+    [[nodiscard]] Result<BrowseIndexStatus> build_browse_index(
+        std::stop_token stop = {}, std::size_t budget_bytes = search::BrowseIndex::default_budget_bytes);
+    [[nodiscard]] BrowseIndexStatus browse_index_status();
     /// Search options with collection names resolved (shared by SQL and the browse index).
     [[nodiscard]] Result<search::SearchOptions> resolve_search_options(const search::Query& query,
                                                                        std::optional<std::int64_t> scope,
@@ -380,6 +439,9 @@ public:
                                                                  std::stop_token stop = {});
     [[nodiscard]] Result<search::ApproximateSearchResult> similar_search(const search::ApproximateQuery& query,
                                                                          std::stop_token stop = {});
+    /// Deletes every derived row (fingerprints, motif streams and grams, feature vectors) and their
+    /// analysis runs, so the next analyze() rebuilds them (repair of a damaged motif index).
+    [[nodiscard]] Result<std::size_t> rebuild_derived();
 
     // --- Jobs ------------------------------------------------------------------------------------
     [[nodiscard]] Result<std::int64_t> enqueue_job(const std::string& kind, const std::string& idempotency_key,
@@ -399,6 +461,11 @@ public:
     /// real SMF object, summaries, tags and FTS rows) in batched transactions.
     [[nodiscard]] Result<std::size_t> populate_synthetic(std::size_t rows, std::uint64_t seed = 1,
                                                          std::stop_token stop = {});
+    /// M10K fixture (section 33.2): gives up to `count` current heads without derived analysis one
+    /// indexed melody stream each (a deterministic 16-64 note random walk, grams included); every
+    /// 100th stream carries synthetic_planted_motif() transposed, so benchmarks have known hits.
+    [[nodiscard]] Result<std::size_t> populate_synthetic_motifs(std::size_t count, std::uint64_t seed = 1,
+                                                                std::stop_token stop = {});
     /// Suspends object garbage collection while alive (backups).
     class GarbageCollectionPause {
     public:
@@ -416,6 +483,10 @@ public:
 
 private:
     explicit Library(std::unique_ptr<State> state);
+    /// One page from the browse index after applying pending outbox changes; nullopt falls back to SQL.
+    [[nodiscard]] std::optional<SearchPage> search_browse_index(const search::Query& query,
+                                                                const search::SearchOptions& options,
+                                                                const SearchRequest& request);
     std::unique_ptr<State> state_;
 };
 

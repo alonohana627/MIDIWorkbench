@@ -125,7 +125,12 @@ bool asset_predicate(const BrowseRow& row, const Predicate& predicate, const Sea
     return false;
 }
 
-std::size_t string_bytes(const std::string& text) { return text.capacity() + 1; }
+/// Heap bytes of a string: none while it fits the inline (small-string) buffer, which sizeof of
+/// the owning struct already counts.
+std::size_t string_bytes(const std::string& text) {
+    static const std::size_t inline_capacity = std::string().capacity();
+    return text.capacity() > inline_capacity ? text.capacity() + 1 : 0;
+}
 
 } // namespace
 
@@ -281,18 +286,23 @@ void BrowseIndex::clear() {
     memory_bytes_ = 0;
 }
 
-Truth BrowseIndex::evaluate_text(const StoredRow& stored, const Predicate& predicate) const {
-    const auto query_tokens = ascii_fts_tokens(text_value(predicate));
-    if (!query_tokens)
-        return Truth::unknown;
-    std::vector<std::uint32_t> ids;
-    for (const auto& token : *query_tokens) {
-        const auto found = dictionary_.find(token);
-        if (found == dictionary_.end())
-            ids.push_back(std::numeric_limits<std::uint32_t>::max());
-        else
-            ids.push_back(found->second);
+Truth BrowseIndex::evaluate_text(const StoredRow& stored, const Predicate& predicate, TokenCache& cache) const {
+    auto cached = cache.find(&predicate);
+    if (cached == cache.end()) {
+        std::optional<std::vector<std::uint32_t>> resolved;
+        if (const auto query_tokens = ascii_fts_tokens(text_value(predicate))) {
+            resolved.emplace();
+            for (const auto& token : *query_tokens) {
+                const auto found = dictionary_.find(token);
+                resolved->push_back(found == dictionary_.end() ? std::numeric_limits<std::uint32_t>::max()
+                                                               : found->second);
+            }
+        }
+        cached = cache.emplace(&predicate, std::move(resolved)).first;
     }
+    if (!cached->second)
+        return Truth::unknown;
+    const auto& ids = *cached->second;
     std::vector<std::size_t> columns;
     switch (predicate.field) {
     case Field::title:
@@ -345,7 +355,8 @@ Truth BrowseIndex::evaluate_text(const StoredRow& stored, const Predicate& predi
     return undecided ? Truth::unknown : Truth::no;
 }
 
-Truth BrowseIndex::evaluate_node(const StoredRow& stored, const QueryNode& node, const SearchOptions& options) const {
+Truth BrowseIndex::evaluate_node(const StoredRow& stored, const QueryNode& node, const SearchOptions& options,
+                                 TokenCache& cache) const {
     const auto& row = stored.row;
     if (node.kind == NodeKind::and_node && node.children.empty())
         return Truth::yes;
@@ -354,14 +365,14 @@ Truth BrowseIndex::evaluate_node(const StoredRow& stored, const QueryNode& node,
     switch (node.kind) {
     case NodeKind::predicate:
         if (is_text_field(node.predicate.field))
-            return evaluate_text(stored, node.predicate);
+            return evaluate_text(stored, node.predicate, cache);
         return truth(asset_predicate(row, node.predicate, options));
     case NodeKind::not_node:
-        return negate(evaluate_node(stored, node.children.front(), options));
+        return negate(evaluate_node(stored, node.children.front(), options, cache));
     case NodeKind::or_node: {
         Truth result = Truth::no;
         for (const auto& child : node.children) {
-            const auto value = evaluate_node(stored, child, options);
+            const auto value = evaluate_node(stored, child, options, cache);
             if (value == Truth::yes)
                 return Truth::yes;
             if (value == Truth::unknown)
@@ -377,7 +388,7 @@ Truth BrowseIndex::evaluate_node(const StoredRow& stored, const QueryNode& node,
                 grouped.push_back(&child);
                 continue;
             }
-            const auto value = evaluate_node(stored, child, options);
+            const auto value = evaluate_node(stored, child, options, cache);
             if (value == Truth::no)
                 return Truth::no;
             if (value == Truth::unknown)
@@ -391,25 +402,28 @@ Truth BrowseIndex::evaluate_node(const StoredRow& stored, const QueryNode& node,
     return Truth::no;
 }
 
-Truth BrowseIndex::evaluate_row(const StoredRow& stored, const Query& query, const SearchOptions& options) const {
+Truth BrowseIndex::evaluate_row(const StoredRow& stored, const Query& query, const SearchOptions& options,
+                                TokenCache& cache) const {
     if (stored.row.deleted)
         return Truth::no;
     if (options.collection_scope && !contains(stored.row.collections, *options.collection_scope))
         return Truth::no;
-    return evaluate_node(stored, query.root, options);
+    return evaluate_node(stored, query.root, options, cache);
 }
 
 Truth BrowseIndex::evaluate(std::int64_t id, const Query& query, const SearchOptions& options) const {
     const auto found = rows_.find(id);
     if (found == rows_.end())
         return Truth::no;
-    return evaluate_row(found->second, query, options);
+    TokenCache cache;
+    return evaluate_row(found->second, query, options, cache);
 }
 
 Result<std::vector<std::int64_t>> BrowseIndex::matching_ids(const Query& query, const SearchOptions& options) const {
     std::vector<std::int64_t> ids;
+    TokenCache cache;
     for (const auto& [id, stored] : rows_) {
-        const auto value = evaluate_row(stored, query, options);
+        const auto value = evaluate_row(stored, query, options, cache);
         if (value == Truth::unknown)
             return make_error(ErrorCode::unsupported, "the browse index cannot evaluate this text query exactly");
         if (value == Truth::yes)
@@ -426,58 +440,74 @@ Result<BrowsePage> BrowseIndex::page(const Query& query, const SearchOptions& op
     if (limit == 0)
         return make_error(ErrorCode::invalid_argument, "page size must be at least 1");
     limit = std::min(limit, maximum_page_size);
+    // Keys are compared in place (no per-row string copies) with the same order as the SQL page
+    // query: (key, id) ascending or both descending; SqlValue's variant order covers a cursor of
+    // another type exactly as before.
+    const bool numeric = order.field == SortField::modified || order.field == SortField::created;
+    const auto number_of = [&](const StoredRow& stored) {
+        return order.field == SortField::modified ? stored.row.modified_ms : stored.row.created_ms;
+    };
+    const auto key_of = [&](const StoredRow& stored) -> SqlValue {
+        if (numeric)
+            return number_of(stored);
+        return stored.row.sort_title;
+    };
+    const auto ascending = [&](const StoredRow& left, std::int64_t left_id, const StoredRow& right, std::int64_t right_id) {
+        if (numeric) {
+            if (number_of(left) != number_of(right))
+                return number_of(left) < number_of(right);
+        } else if (const int compared = left.row.sort_title.compare(right.row.sort_title); compared != 0) {
+            return compared < 0;
+        }
+        return left_id < right_id;
+    };
+    // Position relative to the cursor: true when the row comes after it in page order.
+    const auto past_cursor = [&](const StoredRow& stored, std::int64_t id) {
+        const auto& cursor = after->sort_value;
+        bool key_less = false;    // row key < cursor key
+        bool key_greater = false; // row key > cursor key
+        if (numeric && std::holds_alternative<std::int64_t>(cursor)) {
+            key_less = number_of(stored) < std::get<std::int64_t>(cursor);
+            key_greater = number_of(stored) > std::get<std::int64_t>(cursor);
+        } else if (!numeric && std::holds_alternative<std::string>(cursor)) {
+            const int compared = std::string_view(stored.row.sort_title).compare(std::get<std::string>(cursor));
+            key_less = compared < 0;
+            key_greater = compared > 0;
+        } else {
+            const auto key = key_of(stored);
+            key_less = key < cursor;
+            key_greater = cursor < key;
+        }
+        if (order.descending)
+            return key_less || (!key_greater && id < after->id);
+        return key_greater || (!key_less && id > after->id);
+    };
     struct Candidate {
-        SqlValue key;
+        const StoredRow* row;
         std::int64_t id;
     };
     std::vector<Candidate> candidates;
+    TokenCache cache;
     for (const auto& [id, stored] : rows_) {
-        const auto value = evaluate_row(stored, query, options);
+        const auto value = evaluate_row(stored, query, options, cache);
         if (value == Truth::unknown)
             return make_error(ErrorCode::unsupported, "the browse index cannot evaluate this text query exactly");
-        if (value != Truth::yes)
+        if (value != Truth::yes || (after && !past_cursor(stored, id)))
             continue;
-        SqlValue key;
-        switch (order.field) {
-        case SortField::modified:
-            key = stored.row.modified_ms;
-            break;
-        case SortField::created:
-            key = stored.row.created_ms;
-            break;
-        case SortField::title:
-        case SortField::relevance:
-            key = stored.row.sort_title;
-            break;
-        }
-        candidates.push_back(Candidate{std::move(key), id});
+        candidates.push_back(Candidate{&stored, id});
     }
-    const auto less = [&](const SqlValue& left_key, std::int64_t left_id, const SqlValue& right_key,
-                          std::int64_t right_id) {
-        if (left_key != right_key)
-            return left_key < right_key;
-        return left_id < right_id;
-    };
     const auto before = [&](const Candidate& left, const Candidate& right) {
-        return order.descending ? less(right.key, right.id, left.key, left.id) : less(left.key, left.id, right.key, right.id);
+        return order.descending ? ascending(*right.row, right.id, *left.row, left.id)
+                                : ascending(*left.row, left.id, *right.row, right.id);
     };
-    std::ranges::sort(candidates, before);
+    // Only the page is ordered: O(N log limit) instead of sorting every match for every page.
+    const auto taken = std::min(limit, candidates.size());
+    std::ranges::partial_sort(candidates, candidates.begin() + static_cast<std::ptrdiff_t>(taken), before);
     BrowsePage page;
-    for (const auto& candidate : candidates) {
-        if (after) {
-            const bool past = order.descending ? less(candidate.key, candidate.id, after->sort_value, after->id)
-                                               : less(after->sort_value, after->id, candidate.key, candidate.id);
-            if (!past)
-                continue;
-        }
-        if (page.ids.size() == limit) {
-            break;
-        }
-        page.ids.push_back(candidate.id);
-        page.next = PageCursor{candidate.key, candidate.id};
-    }
-    if (page.ids.size() < limit)
-        page.next.reset();
+    for (std::size_t index = 0; index < taken; ++index)
+        page.ids.push_back(candidates[index].id);
+    if (taken == limit && taken > 0)
+        page.next = PageCursor{key_of(*candidates[taken - 1].row), candidates[taken - 1].id};
     return page;
 }
 

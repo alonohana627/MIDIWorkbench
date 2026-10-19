@@ -23,7 +23,7 @@ set(MWB_TEST_AREAS
   "cli|core midi music document library search playback audio platform app cli")
 # Performance checks only mean something in optimized builds.
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
-  list(APPEND MWB_TEST_AREAS "perf|core")
+  list(APPEND MWB_TEST_AREAS "perf|core midi music document search library")
 endif()
 foreach(entry IN LISTS MWB_TEST_AREAS)
   string(REPLACE "|" ";" parts "${entry}")

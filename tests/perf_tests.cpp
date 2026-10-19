@@ -8,6 +8,7 @@
 #include "mwb/core/notes.hpp"
 #include "mwb/core/random.hpp"
 #include "mwb/core/tempo_map.hpp"
+#include "mwb/library/bench.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -97,5 +98,35 @@ TEST_SUITE("perf") {
         });
         std::printf("E100K: apply+caches+undo %.1f ms, apply+undo+caches %.1f ms\n", edit, undo_only);
         CHECK(undo_only <= 50.0 + 2.0); // undo ordinary edit <= 50 ms p95 (one apply counted twice here)
+    }
+}
+
+TEST_SUITE("perf_library") {
+    // Section 33.3 on the synthetic L100K catalog with M10K melody streams: first pages and
+    // selective filters (SQL and the browse index) <= 150 ms p95 warm, exact motif search
+    // <= 500 ms p95, approximate <= 2 s p95 (code-library-13).
+    TEST_CASE("L100K/M10K: search pages and melody searches stay within the section 33.3 targets") {
+        test::TemporaryDirectory temporary;
+        library::BenchOptions options;
+        options.rows = 100'000;
+        options.motif_rows = 10'000;
+        options.repetitions = 10;
+        auto report = library::run_bench(temporary.path() / "bench", options);
+        REQUIRE(report.has_value());
+        CHECK(report->plan_problems.empty());
+        std::printf("L100K populate %.1f s\n", report->populate_seconds);
+        for (const auto& timing : report->timings) {
+            std::printf("%-24s p50 %8.2f ms  p95 %8.2f ms\n", timing.name.c_str(), timing.p50_ms, timing.p95_ms);
+            CAPTURE(timing.name);
+            const std::string& name = timing.name;
+            if (name.starts_with("motif_exact"))
+                CHECK(timing.p95_ms <= 500.0);
+            else if (name.starts_with("motif_similar"))
+                CHECK(timing.p95_ms <= 2000.0);
+            else if (name == "browse_index_build")
+                CHECK(timing.max_ms <= 30'000.0); // background work, bounded so it cannot silently grow
+            else
+                CHECK(timing.p95_ms <= 150.0);
+        }
     }
 }

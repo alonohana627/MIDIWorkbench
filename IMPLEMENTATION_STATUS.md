@@ -201,6 +201,23 @@ Catalog, 100,000 synthetic rows (`docs/testing/bench-catalog-100k.json`), p95: f
 0.04 ms, deep page 0.04 ms, tag filter 1.42 ms, FTS + bpm (title order) 5.20 ms, FTS + bpm
 (relevance) 49.27 ms, change polling 12.72 ms, job lease 2.04 ms. Target ≤150 ms: met.
 
+Library L100K with M10K melody streams (`mwb-cli bench --rows 100000 --motif-rows 10000`, the
+release-only `perf.perf_library` test), p95: first title page 0.51 ms, tag filter 2.59 ms, FTS +
+bpm 5.25 ms (relevance 31.3 ms), exact melody search of 8 and 32 notes 22 ms, similar search of 16
+notes 134 ms. Targets 150 ms / 500 ms / 2 s: met. Before the motif statements were pinned to the
+`asset_head` index, SQLite walked every active asset per posting and stream: exact 1 s and
+similar 30 s at this size. M10K alone (10,000 assets): exact 5.8 ms, similar 121 ms, browse-index
+pages 0.3-0.9 ms.
+
+In-memory browse index (section 19.4): built on the library panel's maintenance thread after
+open, kept current from the change outbox before every page, used for filters and title/date
+sorts; relevance, non-ASCII text, a loading or over-budget index use SQL. Measured 968 bytes per
+row (9.7 MB at 10K), so the 64 MiB default holds about 69,000 items; at L100K the build stops
+after its first page (projected size over budget) and SQL paging, measured above, serves the
+library. This is the spec's reconsideration trigger ("measured budget breach at the target
+corpus"): a compact row format (enum origins, float facts, one token vector) would bring L100K
+under 64 MiB; until then the budget is kept and the SQL fallback carries large libraries.
+
 Editor, E100K (`docs/testing/bench-e100k.json`, rerun after the review fixes), medians: note
 pairing 18.9 ms, interval index 7.4 ms, viewport query 0.007 ms, preparing a 3,125-note transform
 move 88 ms, core drag of 3,125 notes (`update_notes`) 30 ms, pasting 3,125 notes 4.3 ms, applying

@@ -15,6 +15,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <shared_mutex>
 #include <atomic>
 #include <condition_variable>
 #include <format>
@@ -45,6 +46,30 @@ std::string truncate_for_change(std::string_view text) {
 }
 
 std::string sort_key(std::string_view title) { return fold_for_search(title); }
+
+/// The digest an object file is named after (64 lowercase or uppercase hex digits), or nullopt.
+std::optional<Sha256Digest> parse_sha256_hex(std::string_view text) {
+    if (text.size() != 64)
+        return std::nullopt;
+    const auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9')
+            return c - '0';
+        if (c >= 'a' && c <= 'f')
+            return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+            return c - 'A' + 10;
+        return -1;
+    };
+    Sha256Digest digest{};
+    for (std::size_t index = 0; index < digest.size(); ++index) {
+        const int high = nibble(text[2 * index]);
+        const int low = nibble(text[2 * index + 1]);
+        if (high < 0 || low < 0)
+            return std::nullopt;
+        digest[index] = static_cast<std::uint8_t>(high * 16 + low);
+    }
+    return digest;
+}
 
 Sha256Digest analyzer_settings_hash(std::string_view analyzer, std::int32_t version) {
     Sha256Builder builder;
@@ -233,6 +258,18 @@ struct Library::State {
     std::function<void(std::int64_t)> listener;
     std::int64_t pending_change = 0;
     std::atomic<int> gc_pauses{0};
+    /// Publishing an object file and committing the catalog rows that reference it hold this
+    /// shared; garbage collection holds it exclusively from choosing candidates to removing their
+    /// files, so it can never delete a file a concurrent import or commit is about to reference
+    /// again (spec 22.2, code-library-12).
+    std::shared_mutex objects_lock;
+    /// The section 19.4 browse index; the mutex covers catching up with the outbox and paging.
+    struct BrowseCache {
+        std::mutex mutex;
+        std::unique_ptr<search::BrowseIndex> index; ///< Null until built, after a full reload or over budget.
+        std::int64_t revision = 0;                   ///< Outbox revision the index reflects.
+        bool over_budget = false;
+    } browse;
 
     State(std::filesystem::path library_root, LibraryOptions library_options, WriterLock acquired_lock)
         : root(std::move(library_root)), options(library_options), writer_lock(std::move(acquired_lock)), objects(root) {}
@@ -354,9 +391,97 @@ struct Library::State {
         return database.getLastInsertRowid();
     }
 
-    /// Inserts a revision and makes it the asset's head.
+    /// Inserts a revision without making it the head (a source-change candidate).
+    std::int64_t insert_revision(SQLite::Database& database, std::int64_t asset_id, std::optional<std::int64_t> parent,
+                                 const Sha256Digest& sha, RevisionOrigin origin, const std::string& label) {
+        Statement ordinal(database, "SELECT coalesce(max(ordinal), 0) + 1 FROM revision WHERE asset_id = ?1");
+        ordinal.bind(1, asset_id);
+        ordinal.executeStep();
+        const auto next = ordinal.getColumn(0).getInt64();
+        Statement insert(database, "INSERT INTO revision(uuid, asset_id, ordinal, parent_id, object_sha256, created_ms, "
+                                   "origin, label) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)");
+        sqlite_support::bind_uuid(insert, 1, Uuid::generate());
+        insert.bind(2, asset_id);
+        insert.bind(3, next);
+        if (parent)
+            insert.bind(4, *parent);
+        else
+            insert.bind(4);
+        sqlite_support::bind_bytes(insert, 5, sha);
+        insert.bind(6, now_utc_ms());
+        insert.bind(7, std::string(revision_origin_name(origin)));
+        insert.bind(8, label);
+        insert.exec();
+        return database.getLastInsertRowid();
+    }
+
+    /// Derived index rows (motif grams) kept: a running count in catalog_setting, initialized
+    /// from the table once, so the budget check never scans the index.
+    std::int64_t derived_gram_rows(SQLite::Database& database) {
+        Statement read(database, "SELECT value_json FROM catalog_setting WHERE key = 'derived.gram_rows'");
+        if (read.executeStep()) {
+            const auto value = Json::parse(read.getColumn(0).getString(), nullptr, false);
+            if (value.is_number_integer())
+                return value.get<std::int64_t>();
+        }
+        Statement count(database, "SELECT count(*) FROM motif_gram");
+        count.executeStep();
+        const auto rows = count.getColumn(0).getInt64();
+        store_gram_rows(database, rows);
+        return rows;
+    }
+
+    void store_gram_rows(SQLite::Database& database, std::int64_t rows) {
+        Statement store(database, "INSERT OR REPLACE INTO catalog_setting(key, schema_version, value_json) VALUES "
+                                  "('derived.gram_rows', 1, ?1)");
+        store.bind(1, Json(std::max<std::int64_t>(0, rows)).dump());
+        store.exec();
+    }
+
+    /// Deletes a revision's derived rows (fingerprints, motif streams with their grams, feature
+    /// vectors) and keeps the gram count right. Derived data is disposable (section 26.6).
+    void delete_derived(SQLite::Database& database, std::int64_t revision_id) {
+        Statement grams(database, "SELECT count(*) FROM motif_gram WHERE stream_id IN (SELECT id FROM motif_stream WHERE "
+                                  "revision_id = ?1)");
+        grams.bind(1, revision_id);
+        grams.executeStep();
+        const auto removed = grams.getColumn(0).getInt64();
+        for (const auto* table : {"fingerprint", "motif_stream", "feature_vector"}) {
+            Statement clear(database, std::format("DELETE FROM {} WHERE revision_id = ?1", table));
+            clear.bind(1, revision_id);
+            clear.exec();
+        }
+        if (removed > 0)
+            store_gram_rows(database, derived_gram_rows(database) - removed);
+    }
+
+    /// Applies the asset's manual key overrides to a revision's effective summaries (origin
+    /// "manual"), e.g. after a restore copied another revision's estimated keys (code-library-3).
+    void apply_key_overrides(SQLite::Database& database, std::int64_t asset_id, std::int64_t revision_id) {
+        Statement overrides(database, "SELECT sequence_no, value_json FROM asset_override WHERE asset_id = ?1 AND "
+                                      "field = 'key'");
+        overrides.bind(1, asset_id);
+        while (overrides.executeStep()) {
+            const auto value = Json::parse(overrides.getColumn(1).getString(), nullptr, false);
+            if (!value.is_object() || !value.contains("root") || !value["root"].is_number_integer() ||
+                !value.contains("mode") || !value["mode"].is_string())
+                continue;
+            Statement update(database, "UPDATE sequence_summary SET key_root = ?1, key_mode = ?2, key_origin = 'manual', "
+                                       "key_confidence = NULL WHERE revision_id = ?3 AND sequence_no = ?4");
+            update.bind(1, static_cast<std::int64_t>(value["root"].get<int>()));
+            update.bind(2, value["mode"].get<std::string>());
+            update.bind(3, revision_id);
+            update.bind(4, overrides.getColumn(0).getInt64());
+            update.exec();
+        }
+    }
+
+    /// Inserts a revision and makes it the asset's head. The previous head's derived index rows
+    /// are dropped: only heads are searched, so they would only grow the index (code-library-7).
     std::int64_t insert_head_revision(SQLite::Database& database, std::int64_t asset_id, std::optional<std::int64_t> parent,
                                       const Sha256Digest& sha, RevisionOrigin origin, const std::string& label) {
+        if (parent)
+            delete_derived(database, *parent);
         Statement ordinal(database, "SELECT coalesce(max(ordinal), 0) + 1 FROM revision WHERE asset_id = ?1");
         ordinal.bind(1, asset_id);
         ordinal.executeStep();
@@ -936,7 +1061,9 @@ Result<ImportReport> Library::import_paths(const std::vector<std::filesystem::pa
                 add_item(relative, ImportOutcome::cancelled, std::nullopt, "import cancelled");
                 continue;
             }
-            // Step 5: publish the object under its hash (reuse when present).
+            // Step 5: publish the object under its hash (reuse when present). Held until the
+            // catalog transaction below has committed its reference (garbage collection waits).
+            std::shared_lock objects_guard(state.objects_lock);
             auto published = state.objects.publish(captured->staging_path, captured->sha256, media_extension(media),
                                                    captured->bytes.size());
             if (!published) {
@@ -950,6 +1077,7 @@ Result<ImportReport> Library::import_paths(const std::vector<std::filesystem::pa
             struct Outcome {
                 ImportOutcome outcome;
                 std::int64_t asset;
+                std::optional<std::int64_t> candidate{};
             };
             auto outcome = state.write("import", [&](SQLite::Database& database) -> Result<Outcome> {
                 state.insert_object_row(database, captured->sha256, media, captured->bytes.size());
@@ -1013,9 +1141,17 @@ Result<ImportReport> Library::import_paths(const std::vector<std::filesystem::pa
                     const bool follows_import =
                         head && std::ranges::equal(std::span<const std::uint8_t>(*head), last_object);
                     if (!follows_import) {
+                        // The asset was edited here: the changed source is kept as a non-head
+                        // candidate revision for review (section 22.4), never applied over the edit
+                        // and referenced, so garbage collection keeps its bytes.
+                        const auto candidate = state.insert_revision(database, asset_id, state.head_revision(database, asset_id),
+                                                                     captured->sha256, RevisionOrigin::import,
+                                                                     "source change candidate");
+                        state.write_basic_analysis(database, asset_id, candidate, parsed);
                         update_location(location_id, "changed", false);
-                        state.record_change(database, "source.changed", {asset_id}, false);
-                        return Outcome{ImportOutcome::source_changed, asset_id};
+                        state.record_change(database, "source.changed", {asset_id}, false, Json::object(),
+                                            Json{{"candidate", candidate}});
+                        return Outcome{ImportOutcome::source_changed, asset_id, candidate};
                     }
                     const auto revision = state.insert_head_revision(database, asset_id, state.head_revision(database, asset_id),
                                                                      captured->sha256, RevisionOrigin::import, "");
@@ -1052,6 +1188,7 @@ Result<ImportReport> Library::import_paths(const std::vector<std::filesystem::pa
                 continue;
             }
             add_item(relative, outcome->outcome, outcome->asset, parsed.reason);
+            report.items.back().candidate_revision_id = outcome->candidate;
         }
     }
     return report;
@@ -1098,6 +1235,7 @@ Result<std::int64_t> Library::create_asset(const DocumentData& document, std::st
     if (!bytes)
         return std::unexpected(std::move(bytes).error());
     const auto digest = sha256(*bytes);
+    std::shared_lock objects_guard(state_->objects_lock); // through the catalog commit below
     MWB_TRY(state_->objects.publish_bytes(*bytes, digest, media_extension(MediaType::native)));
     ParsedObject parsed;
     parsed.analysis = analyze_document(document);
@@ -1139,6 +1277,13 @@ Result<std::int64_t> Library::duplicate_asset(std::int64_t asset_id) {
         const auto revision = state.insert_head_revision(database, copy_id, std::nullopt, digest, RevisionOrigin::edit,
                                                          "duplicate");
         state.copy_basic_analysis(database, head, revision);
+        // Manual keys travel with the copy (its summaries say "manual"; the override row says why).
+        Statement copy_overrides(database, "INSERT INTO asset_override(asset_id, sequence_no, field, schema_version, "
+                                           "value_json, modified_ms) SELECT ?2, sequence_no, field, schema_version, "
+                                           "value_json, modified_ms FROM asset_override WHERE asset_id = ?1");
+        copy_overrides.bind(1, asset_id);
+        copy_overrides.bind(2, copy_id);
+        copy_overrides.exec();
         state.refresh_fts(database, copy_id);
         state.record_change(database, "asset.duplicate", {copy_id}, false, Json{{"source", asset_id}});
         return copy_id;
@@ -1561,6 +1706,7 @@ Result<std::int64_t> Library::commit_revision(const CommitRequest& request, std:
                                               MediaType media_type) {
     const auto digest = sha256(bytes);
     // Section 22.3: publish the immutable object first; a conflicting head keeps it for review.
+    std::shared_lock objects_guard(state_->objects_lock); // through the catalog commit below
     MWB_TRY(state_->objects.publish_bytes(bytes, digest, media_extension(media_type)));
     const auto parsed = parse_object(bytes, media_type, "revision", {}, {});
     auto& state = *state_;
@@ -1609,6 +1755,7 @@ Result<std::int64_t> Library::restore_revision(std::int64_t asset_id, std::int64
         const auto restored = state.insert_head_revision(database, asset_id, head, digest, RevisionOrigin::restore,
                                                          std::format("restore of revision {}", revision_id));
         state.copy_basic_analysis(database, revision_id, restored);
+        state.apply_key_overrides(database, asset_id, restored); // the user's key survives a restore
         state.refresh_fts(database, asset_id);
         state.record_change(database, "revision.restore", {asset_id}, false, Json{{"head", head.value_or(0)}},
                             Json{{"head", restored}, {"source", revision_id}});
@@ -1786,6 +1933,8 @@ Result<GarbageCollectionReport> Library::collect_garbage(const GarbageCollection
         return report;
     }
     const auto now = options.now_ms.value_or(now_utc_ms());
+    // Exclusive: no object is published and referenced again between choosing it and removing it.
+    std::unique_lock objects_guard(state.objects_lock);
     struct Candidate {
         Sha256Digest sha;
         std::string extension;
@@ -1834,6 +1983,58 @@ Result<GarbageCollectionReport> Library::collect_garbage(const GarbageCollection
         std::error_code error;
         if (std::filesystem::remove(state.objects.object_path(candidate.sha, candidate.extension), error) || !error)
             ++report.deleted;
+    }
+    // Files no catalog row knows (a failed transaction after publishing, a conflicting commit's
+    // object from before candidates were kept) are removed once they are older than the grace period.
+    // The walk over every object runs without the exclusive lock (imports and saves continue); each
+    // candidate is checked again under it right before removal.
+    objects_guard.unlock();
+    std::vector<std::pair<std::filesystem::path, Sha256Digest>> orphans;
+    {
+        auto reader = state.reader();
+        std::error_code walk_error;
+        const auto objects_root = state.objects.root() / "objects";
+        for (auto it = std::filesystem::recursive_directory_iterator(objects_root, walk_error);
+             !walk_error && it != std::filesystem::recursive_directory_iterator(); it.increment(walk_error)) {
+            if (!reader || !it->is_regular_file(walk_error))
+                continue;
+            const auto stem = path_utf8(it->path().stem());
+            const auto parsed_sha = parse_sha256_hex(stem);
+            if (!parsed_sha)
+                continue; // not an object file name
+            const Sha256Digest sha = *parsed_sha;
+            const bool known = sqlite_support::guarded("gc orphan check", [&]() -> Result<bool> {
+                                   Statement query(***reader, "SELECT 1 FROM object_file WHERE sha256 = ?1");
+                                   sqlite_support::bind_bytes(query, 1, sha);
+                                   return query.executeStep();
+                               }).value_or(true);
+            if (known)
+                continue;
+            std::error_code age_error;
+            const auto written = std::filesystem::last_write_time(it->path(), age_error);
+            if (age_error)
+                continue;
+            const auto age = std::filesystem::file_time_type::clock::now() - written;
+            const bool old = options.now_ms ? true : age > std::chrono::milliseconds(options.grace_period_ms);
+            if (old)
+                orphans.emplace_back(it->path(), sha);
+        }
+    }
+    if (!orphans.empty()) {
+        objects_guard.lock();
+        auto reader = state.reader();
+        for (const auto& [path, sha] : orphans) {
+            const bool known = reader ? sqlite_support::guarded("gc orphan check", [&]() -> Result<bool> {
+                                            Statement query(***reader, "SELECT 1 FROM object_file WHERE sha256 = ?1");
+                                            sqlite_support::bind_bytes(query, 1, sha);
+                                            return query.executeStep();
+                                        }).value_or(true)
+                                      : true;
+            std::error_code remove_error;
+            if (!known && std::filesystem::remove(path, remove_error))
+                ++report.orphan_files;
+        }
+        objects_guard.unlock();
     }
     std::error_code error;
     for (const auto& entry : std::filesystem::directory_iterator(state.objects.staging_directory(), error)) {
@@ -1942,7 +2143,19 @@ Result<search::CompiledSearch> Library::compile_search(const SearchRequest& requ
 }
 
 Result<SearchPage> Library::search(const SearchRequest& request, std::stop_token stop) {
-    auto compiled = compile_search(request);
+    auto query = search::parse_query(request.query_text);
+    if (!query)
+        return std::unexpected(query.error().to_error());
+    auto options = resolve_search_options(*query, request.collection_scope, request.across_sequences);
+    if (!options)
+        return std::unexpected(std::move(options).error());
+    if (request.use_browse_index && request.order.field != search::SortField::relevance)
+        if (auto served = search_browse_index(*query, *options, request))
+            return std::move(*served);
+    auto compiled = search::compile_page_query(*query, *options, request.order,
+                                               request.order.field == search::SortField::relevance ? std::nullopt
+                                                                                                   : request.after,
+                                               request.page_size);
     if (!compiled)
         return std::unexpected(std::move(compiled).error());
     auto reader = state_->reader();
@@ -2016,6 +2229,127 @@ Result<SearchPage> Library::search(const SearchRequest& request, std::stop_token
     return page;
 }
 
+std::optional<SearchPage> Library::search_browse_index(const search::Query& query, const search::SearchOptions& options,
+                                                       const SearchRequest& request) {
+    auto& cache = state_->browse;
+    std::lock_guard lock(cache.mutex);
+    if (!cache.index)
+        return std::nullopt;
+    // Catch up with the change outbox first, so a page never shows a state older than SQL would.
+    auto changes = changes_since(cache.revision);
+    if (!changes)
+        return std::nullopt;
+    if (changes->full_reload) {
+        cache.index.reset(); // too much changed (or the catalog was restored): SQL until rebuilt
+        return std::nullopt;
+    }
+    if (!changes->asset_ids.empty()) {
+        auto rows = browse_rows_for(changes->asset_ids);
+        if (!rows)
+            return std::nullopt;
+        std::set<std::int64_t> present;
+        for (const auto& row : *rows) {
+            cache.index->upsert(row);
+            present.insert(row.id);
+        }
+        for (const auto id : changes->asset_ids)
+            if (!present.contains(id))
+                cache.index->remove(id); // purged
+    }
+    // Rows were read after the outbox position, so they are at least that new; re-applying a
+    // later change is an idempotent upsert.
+    cache.revision = changes->latest_revision;
+    if (cache.index->over_budget()) {
+        cache.index.reset();
+        cache.over_budget = true;
+        return std::nullopt;
+    }
+    auto page = cache.index->page(query, options, request.order, request.after, request.page_size);
+    if (!page)
+        return std::nullopt; // relevance or text only SQLite tokenizes exactly: SQL answers
+    SearchPage result;
+    result.from_browse_index = true;
+    for (const auto id : page->ids) {
+        const auto* row = cache.index->find(id);
+        if (row == nullptr)
+            continue;
+        result.rows.push_back(SearchRow{row->id, row->sort_title, row->modified_ms, row->created_ms, std::nullopt});
+    }
+    result.next = page->next;
+    return result;
+}
+
+Result<BrowseIndexStatus> Library::build_browse_index(std::stop_token stop, std::size_t budget_bytes) {
+    // The outbox position is taken before the first page: changes during the build are applied
+    // again by the next search (idempotent upserts), so nothing committed meanwhile is missed.
+    std::int64_t revision = 0;
+    std::size_t total_rows = 0;
+    {
+        auto reader = state_->reader();
+        if (!reader)
+            return std::unexpected(std::move(reader).error());
+        auto latest = sqlite_support::guarded("browse index position", [&]() -> Result<std::int64_t> {
+            Statement statement(***reader, "SELECT coalesce(max(id), 0) FROM catalog_change");
+            statement.executeStep();
+            Statement count(***reader, "SELECT count(*) FROM asset");
+            count.executeStep();
+            total_rows = static_cast<std::size_t>(count.getColumn(0).getInt64());
+            return statement.getColumn(0).getInt64();
+        });
+        if (!latest)
+            return std::unexpected(std::move(latest).error());
+        revision = *latest;
+    }
+    auto index = std::make_unique<search::BrowseIndex>(budget_bytes);
+    BrowseIndexStatus status;
+    std::int64_t after = 0;
+    while (true) {
+        if (stop.stop_requested())
+            return make_error(ErrorCode::cancelled, "browse index build cancelled");
+        auto rows = browse_rows(after, 1000); // short read transactions; writers are never blocked long
+        if (!rows)
+            return std::unexpected(std::move(rows).error());
+        if (rows->empty())
+            break;
+        for (const auto& row : *rows)
+            index->upsert(row);
+        after = rows->back().id;
+        // Measured size per row so far, projected onto the whole catalog: a library that will not
+        // fit stops after one page instead of loading up to the budget and discarding it.
+        const auto projected = index->memory_bytes() / std::max<std::size_t>(1, index->size()) * total_rows;
+        if (index->over_budget() || (index->size() >= 1000 && projected > budget_bytes)) {
+            status.over_budget = true; // stop loading: SQL paging serves this library
+            break;
+        }
+    }
+    status.rows = index->size();
+    status.memory_bytes = index->memory_bytes();
+    auto& cache = state_->browse;
+    std::lock_guard lock(cache.mutex);
+    cache.over_budget = status.over_budget;
+    if (status.over_budget) {
+        cache.index.reset();
+        return status;
+    }
+    cache.index = std::move(index);
+    cache.revision = revision;
+    status.ready = true;
+    return status;
+}
+
+BrowseIndexStatus Library::browse_index_status() {
+    auto& cache = state_->browse;
+    std::lock_guard lock(cache.mutex);
+    BrowseIndexStatus status;
+    status.over_budget = cache.over_budget;
+    if (cache.index) {
+        status.ready = true;
+        status.rows = cache.index->size();
+        status.memory_bytes = cache.index->memory_bytes();
+    }
+    return status;
+}
+
 namespace {
 
 std::vector<double> json_numbers(const Json& object, const char* key) {
@@ -2036,8 +2370,36 @@ std::vector<std::string> json_strings(const Json& object, const char* key) {
     return values;
 }
 
+/// The statements a browse row needs, prepared once per page and reset per row (preparing them
+/// for every row was ~8 prepares per asset, code-library-11).
+struct BrowseStatements {
+    explicit BrowseStatements(SQLite::Database& database)
+        : tags(database, "SELECT t.normalized_name FROM asset_tag AS at JOIN tag AS t ON t.id = at.tag_id WHERE "
+                         "at.asset_id = ?1"),
+          collections(database, "SELECT collection_id FROM collection_asset WHERE asset_id = ?1"),
+          missing(database, "SELECT 1 FROM source_location WHERE asset_id = ?1 AND state IN ('missing', 'offline') "
+                            "LIMIT 1"),
+          text(database, "SELECT title, source_names, tags, description, lyrics FROM asset_fts WHERE rowid = ?1"),
+          run(database, "SELECT status, json_extract(result_json, '$.state') FROM analysis_run WHERE revision_id = "
+                        "?1 AND analyzer = 'basic' AND status IN ('complete', 'failed') LIMIT 1"),
+          sequences(database, "SELECT sequence_no, tempo_representative, tempo_min, tempo_max, tempo_origin, "
+                              "key_root, key_mode, key_origin, key_confidence, quarter_length, duration_seconds, "
+                              "track_count, note_count, min_pitch, max_pitch, has_drums, diagnostics_json FROM "
+                              "sequence_summary WHERE revision_id = ?1 ORDER BY sequence_no"),
+          tracks(database, "SELECT channel_mask, program_json FROM track_summary WHERE revision_id = ?1 AND "
+                           "sequence_no = ?2 ORDER BY track_no") {}
+
+    Statement tags;
+    Statement collections;
+    Statement missing;
+    Statement text;
+    Statement run;
+    Statement sequences;
+    Statement tracks;
+};
+
 /// Loads one browse row on a connection inside the caller's read transaction.
-search::BrowseRow load_browse_row(SQLite::Database& database, const Statement& asset) {
+search::BrowseRow load_browse_row(BrowseStatements& statements, const Statement& asset) {
     search::BrowseRow row;
     row.id = asset.getColumn(0).getInt64();
     row.sort_title = asset.getColumn(1).getString();
@@ -2049,28 +2411,30 @@ search::BrowseRow load_browse_row(SQLite::Database& database, const Statement& a
     row.rating = asset.getColumn(7).getInt();
     const auto head = column_optional_int(asset, 8);
 
-    Statement tags(database, "SELECT t.normalized_name FROM asset_tag AS at JOIN tag AS t ON t.id = at.tag_id WHERE "
-                             "at.asset_id = ?1");
+    for (Statement* statement : {&statements.tags, &statements.collections, &statements.missing, &statements.text,
+                                 &statements.run, &statements.sequences}) {
+        statement->reset();
+        statement->clearBindings();
+    }
+    auto& tags = statements.tags;
     tags.bind(1, row.id);
     while (tags.executeStep())
         row.tags.push_back(tags.getColumn(0).getString());
-    Statement collections(database, "SELECT collection_id FROM collection_asset WHERE asset_id = ?1");
+    auto& collections = statements.collections;
     collections.bind(1, row.id);
     while (collections.executeStep())
         row.collections.push_back(collections.getColumn(0).getInt64());
-    Statement missing(database, "SELECT 1 FROM source_location WHERE asset_id = ?1 AND state IN ('missing', 'offline') "
-                                "LIMIT 1");
+    auto& missing = statements.missing;
     missing.bind(1, row.id);
     row.source_missing = missing.executeStep();
-    Statement text(database, "SELECT title, source_names, tags, description, lyrics FROM asset_fts WHERE rowid = ?1");
+    auto& text = statements.text;
     text.bind(1, row.id);
     if (text.executeStep())
         for (int column = 0; column < static_cast<int>(search::fts_column_count); ++column)
             row.text[static_cast<std::size_t>(column)] = text.getColumn(column).getString();
     if (!head)
         return row;
-    Statement run(database, "SELECT status, json_extract(result_json, '$.state') FROM analysis_run WHERE revision_id = "
-                            "?1 AND analyzer = 'basic' AND status IN ('complete', 'failed') LIMIT 1");
+    auto& run = statements.run;
     run.bind(1, *head);
     if (run.executeStep()) {
         if (run.getColumn(0).getString() == "failed")
@@ -2082,10 +2446,7 @@ search::BrowseRow load_browse_row(SQLite::Database& database, const Statement& a
         else
             row.analysis = search::AnalysisState::indexing;
     }
-    Statement sequences(database, "SELECT sequence_no, tempo_representative, tempo_min, tempo_max, tempo_origin, "
-                                  "key_root, key_mode, key_origin, key_confidence, quarter_length, duration_seconds, "
-                                  "track_count, note_count, min_pitch, max_pitch, has_drums, diagnostics_json FROM "
-                                  "sequence_summary WHERE revision_id = ?1 ORDER BY sequence_no");
+    auto& sequences = statements.sequences;
     sequences.bind(1, *head);
     while (sequences.executeStep()) {
         search::SequenceFacts facts;
@@ -2115,8 +2476,8 @@ search::BrowseRow load_browse_row(SQLite::Database& database, const Statement& a
             facts.meters = json_strings(diagnostics, "meter_names");
             facts.event_classes = json_strings(diagnostics, "event_classes");
         }
-        Statement tracks(database, "SELECT channel_mask, program_json FROM track_summary WHERE revision_id = ?1 AND "
-                                   "sequence_no = ?2 ORDER BY track_no");
+        auto& tracks = statements.tracks;
+        tracks.reset();
         tracks.bind(1, *head);
         tracks.bind(2, sequence_no);
         while (tracks.executeStep()) {
@@ -2149,8 +2510,9 @@ Result<std::vector<search::BrowseRow>> Library::browse_rows(std::int64_t after_i
         assets.bind(1, after_id);
         assets.bind(2, static_cast<std::int64_t>(limit));
         std::vector<search::BrowseRow> rows;
+        BrowseStatements statements(***reader);
         while (assets.executeStep())
-            rows.push_back(load_browse_row(***reader, assets));
+            rows.push_back(load_browse_row(statements, assets));
         snapshot.commit();
         return rows;
     });
@@ -2163,11 +2525,13 @@ Result<std::vector<search::BrowseRow>> Library::browse_rows_for(const std::vecto
     return sqlite_support::guarded("browse rows", [&]() -> Result<std::vector<search::BrowseRow>> {
         SQLite::Transaction snapshot(***reader);
         std::vector<search::BrowseRow> rows;
+        BrowseStatements statements(***reader);
+        Statement asset(***reader, std::string(browse_columns) + " WHERE id = ?1");
         for (const auto asset_id : asset_ids) {
-            Statement asset(***reader, std::string(browse_columns) + " WHERE id = ?1");
+            asset.reset();
             asset.bind(1, asset_id);
             if (asset.executeStep())
-                rows.push_back(load_browse_row(***reader, asset));
+                rows.push_back(load_browse_row(statements, asset));
         }
         snapshot.commit();
         return rows;
@@ -2179,6 +2543,42 @@ Result<std::vector<search::BrowseRow>> Library::browse_rows_for(const std::vecto
 namespace {
 
 constexpr std::int32_t derived_analysis_version = 1;
+
+/// Writes one motif stream with its grams; returns the gram count (analysis and the M10K fixture).
+std::size_t insert_motif_stream(SQLite::Database& database, std::int64_t revision, const search::MotifStream& stream) {
+    const auto payload = search::encode_motif_stream(stream);
+    Statement insert(database, "INSERT INTO motif_stream(revision_id, sequence_no, track_no, channel, voice_kind, "
+                               "profile_version, note_count, stream_sha256, codec_version, payload) VALUES (?1, ?2, "
+                               "?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)");
+    insert.bind(1, revision);
+    insert.bind(2, static_cast<std::int64_t>(stream.sequence_no));
+    insert.bind(3, static_cast<std::int64_t>(stream.track_no));
+    insert.bind(4, static_cast<std::int64_t>(stream.channel));
+    insert.bind(5, std::string(search::voice_kind_name(stream.voice)));
+    insert.bind(6, static_cast<std::int64_t>(stream.profile_version));
+    insert.bind(7, static_cast<std::int64_t>(stream.notes.size()));
+    sqlite_support::bind_bytes(insert, 8, sha256(payload));
+    insert.bind(9, static_cast<std::int64_t>(search::motif_codec_version));
+    sqlite_support::bind_bytes(insert, 10, payload);
+    insert.exec();
+    const auto stream_id = database.getLastInsertRowid();
+    Statement gram(database, "INSERT INTO motif_gram(stream_id, family, gram_length, gram_hash, start_ordinal, "
+                             "start_tick) VALUES (?1, ?2, ?3, ?4, ?5, ?6)");
+    std::size_t count = 0;
+    for (const auto& item_gram : search::stream_grams(stream)) {
+        gram.reset();
+        gram.bind(1, stream_id);
+        gram.bind(2, std::string(search::token_family_name(item_gram.key.family)));
+        gram.bind(3, static_cast<std::int64_t>(item_gram.key.length));
+        const auto hash = search::gram_hash_bytes(item_gram.key.hash);
+        sqlite_support::bind_bytes(gram, 4, hash);
+        gram.bind(5, static_cast<std::int64_t>(item_gram.start_ordinal));
+        gram.bind(6, item_gram.start_tick);
+        gram.exec();
+        ++count;
+    }
+    return count;
+}
 
 /// Motif index over the catalog: only current heads of active assets, one profile version.
 class CatalogMotifIndex final : public search::MotifIndexReader {
@@ -2203,11 +2603,7 @@ public:
 
     Result<std::vector<search::GramPosting>> postings(const search::GramKey& key, std::size_t limit) override {
         return sqlite_support::guarded("motif postings", [&]() -> Result<std::vector<search::GramPosting>> {
-            Statement query(database_, "SELECT g.stream_id, g.start_ordinal FROM motif_gram AS g JOIN motif_stream AS s "
-                                       "ON s.id = g.stream_id JOIN asset AS a ON a.current_revision_id = s.revision_id "
-                                       "WHERE g.family = ?1 AND g.gram_length = ?2 AND g.gram_hash = ?3 AND "
-                                       "s.profile_version = ?4 AND a.deleted_ms IS NULL ORDER BY g.stream_id, "
-                                       "g.start_ordinal LIMIT ?5");
+            Statement query(database_, std::string(motif_postings_sql));
             bind_key(query, key);
             query.bind(5, static_cast<std::int64_t>(limit));
             std::vector<search::GramPosting> result;
@@ -2220,15 +2616,19 @@ public:
 
     Result<std::optional<search::StoredMotifStream>> load_stream(std::int64_t stream_id) override {
         return sqlite_support::guarded("motif stream", [&]() -> Result<std::optional<search::StoredMotifStream>> {
-            Statement query(database_, "SELECT s.revision_id, a.id, s.payload FROM motif_stream AS s JOIN asset AS a ON "
-                                       "a.current_revision_id = s.revision_id WHERE s.id = ?1 AND a.deleted_ms IS NULL");
+            Statement query(database_, std::string(motif_stream_sql));
             query.bind(1, stream_id);
             if (!query.executeStep())
                 return std::optional<search::StoredMotifStream>{};
             const auto payload = sqlite_support::column_bytes(query, 2);
             auto stream = search::decode_motif_stream(payload);
-            if (!stream)
-                return std::unexpected(std::move(stream).error());
+            if (!stream) {
+                // One damaged stream must not fail every search (code-library-9): it is skipped,
+                // counted, and the result says it is partial. `library repair --rebuild-derived`
+                // rebuilds the index.
+                ++skipped_;
+                return std::optional<search::StoredMotifStream>{};
+            }
             search::StoredMotifStream stored;
             stored.info.stream_id = stream_id;
             stored.info.revision_id = query.getColumn(0).getInt64();
@@ -2243,9 +2643,7 @@ public:
 
     Result<std::vector<std::int64_t>> stream_ids(std::int64_t after_id, std::size_t limit) override {
         return sqlite_support::guarded("motif streams", [&]() -> Result<std::vector<std::int64_t>> {
-            Statement query(database_, "SELECT s.id FROM motif_stream AS s JOIN asset AS a ON a.current_revision_id = "
-                                       "s.revision_id WHERE s.id > ?1 AND s.profile_version = ?2 AND a.deleted_ms IS NULL "
-                                       "ORDER BY s.id LIMIT ?3");
+            Statement query(database_, std::string(motif_stream_ids_sql));
             query.bind(1, after_id);
             query.bind(2, static_cast<std::int64_t>(search::motif_profile_version));
             query.bind(3, static_cast<std::int64_t>(limit));
@@ -2255,6 +2653,8 @@ public:
             return ids;
         });
     }
+
+    [[nodiscard]] std::size_t skipped() const { return skipped_; }
 
 private:
     static void bind_key(Statement& query, const search::GramKey& key) {
@@ -2266,7 +2666,43 @@ private:
     }
 
     SQLite::Database& database_;
+    std::size_t skipped_ = 0;
 };
+
+/// Active heads without a complete derived analysis: never searched musically.
+std::size_t count_unindexed_heads(SQLite::Database& database) {
+    return sqlite_support::guarded("unindexed heads", [&]() -> Result<std::size_t> {
+               Statement query(database, "SELECT count(*) FROM asset AS a WHERE a.deleted_ms IS NULL AND "
+                                         "a.current_revision_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM analysis_run AS x "
+                                         "WHERE x.revision_id = a.current_revision_id AND x.analyzer = 'derived' AND "
+                                         "x.status = 'complete')");
+               query.executeStep();
+               return static_cast<std::size_t>(query.getColumn(0).getInt64());
+           })
+        .value_or(0);
+}
+
+/// Marks a motif or similar result partial when some items were not searched (spec 26.6: never
+/// imply that unindexed assets were searched musically).
+template <typename Result>
+void report_coverage(Result& result, std::size_t unindexed, std::size_t skipped) {
+    result.unindexed_heads = unindexed;
+    result.skipped_streams = skipped;
+    std::vector<std::string> reasons;
+    if (!result.partial_reason.empty())
+        reasons.push_back(result.partial_reason);
+    if (unindexed > 0)
+        reasons.push_back(std::format("{} item(s) not indexed for melody search yet", unindexed));
+    if (skipped > 0)
+        reasons.push_back(std::format("{} stored stream(s) could not be read", skipped));
+    if (unindexed > 0 || skipped > 0) {
+        result.partial = true;
+        std::string joined;
+        for (const auto& reason : reasons)
+            joined += (joined.empty() ? "" : "; ") + reason;
+        result.partial_reason = joined;
+    }
+}
 
 } // namespace
 
@@ -2296,12 +2732,9 @@ Result<AnalyzeReport> Library::analyze(const AnalyzeOptions& options, std::stop_
             if (!reader)
                 return std::unexpected(std::move(reader).error());
             auto loaded = sqlite_support::guarded("analysis batch", [&]() -> Result<std::vector<Pending>> {
-                Statement query(***reader, "SELECT r.id, r.object_sha256, o.media_type, o.extension FROM asset AS a JOIN "
-                                           "revision AS r ON r.id = a.current_revision_id JOIN object_file AS o ON "
-                                           "o.sha256 = r.object_sha256 WHERE a.deleted_ms IS NULL AND r.id > ?1 AND NOT "
-                                           "EXISTS (SELECT 1 FROM analysis_run AS x WHERE x.revision_id = r.id AND "
-                                           "x.analyzer = 'derived' AND x.version = ?2 AND x.status IN ('complete', "
-                                           "'failed')) ORDER BY r.id LIMIT ?3");
+                // Driven by the revision key (SEARCH r USING INTEGER PRIMARY KEY), so each batch
+                // reads only its own rows instead of every active asset (code-library-6).
+                Statement query(***reader, std::string(analysis_batch_sql));
                 query.bind(1, after_revision);
                 query.bind(2, derived_analysis_version);
                 query.bind(3, static_cast<std::int64_t>(std::max<std::size_t>(1, options.batch_size)));
@@ -2330,9 +2763,13 @@ Result<AnalyzeReport> Library::analyze(const AnalyzeOptions& options, std::stop_
             }
             std::optional<DocumentData> document;
             std::string failure;
+            // A read error that may pass (a locked or briefly missing file) is retried by a later
+            // run instead of marking the revision failed forever (code-library-5).
+            bool retry_later = false;
             auto bytes = state.objects.read(item.sha, item.extension);
             if (!bytes) {
                 failure = bytes.error().message;
+                retry_later = bytes.error().code != ErrorCode::invalid_data;
             } else if (item.media == MediaType::native) {
                 auto loaded = document::native_from_bytes(*bytes);
                 if (loaded)
@@ -2346,10 +2783,15 @@ Result<AnalyzeReport> Library::analyze(const AnalyzeOptions& options, std::stop_
                 // isolated worker in the application, section 28.2), never unconditionally in process.
                 auto imported = options.parser ? options.parser(*bytes, "analysis", options.limits, stop)
                                                : midi::import_midi(*bytes, "analysis", options.limits, stop);
-                if (imported)
+                if (imported) {
                     document = std::move(imported->document);
-                else
+                } else if (stop.stop_requested() || imported.error().code == ErrorCode::cancelled) {
+                    // Cancelled, not broken: nothing is recorded, a later run analyzes it.
+                    report.cancelled = true;
+                    break;
+                } else {
                     failure = imported.error().message;
+                }
             }
             std::vector<Fingerprint> fingerprints;
             std::vector<search::MotifStream> streams;
@@ -2380,12 +2822,20 @@ Result<AnalyzeReport> Library::analyze(const AnalyzeOptions& options, std::stop_
                 }
             }
             std::size_t gram_count = 0;
+            std::size_t planned_grams = 0;
+            for (const auto& stream : streams)
+                planned_grams += search::stream_grams(stream).size();
+            bool over_budget = false;
             auto written = state.write("analysis.derived", [&](SQLite::Database& database) -> Status {
-                for (const auto* table : {"fingerprint", "motif_stream", "feature_vector"}) {
-                    Statement clear(database, std::format("DELETE FROM {} WHERE revision_id = ?1", table));
-                    clear.bind(1, item.revision);
-                    clear.exec();
+                // About 64 bytes per gram row with its two B-tree entries: stop before the derived
+                // index would pass its budget (spec 26.6/28.3), the revision stays unanalyzed.
+                constexpr std::uint64_t bytes_per_gram = 64;
+                const auto rows = static_cast<std::uint64_t>(state.derived_gram_rows(database));
+                if ((rows + planned_grams) * bytes_per_gram > options.budget_bytes && planned_grams > 0) {
+                    over_budget = true;
+                    return ok();
                 }
+                state.delete_derived(database, item.revision);
                 for (const auto& fingerprint : fingerprints) {
                     Statement insert(database, "INSERT INTO fingerprint(revision_id, profile, profile_version, sha256) "
                                                "VALUES (?1, ?2, ?3, ?4)");
@@ -2395,38 +2845,8 @@ Result<AnalyzeReport> Library::analyze(const AnalyzeOptions& options, std::stop_
                     sqlite_support::bind_bytes(insert, 4, fingerprint.sha256);
                     insert.exec();
                 }
-                for (const auto& stream : streams) {
-                    const auto payload = search::encode_motif_stream(stream);
-                    Statement insert(database, "INSERT INTO motif_stream(revision_id, sequence_no, track_no, channel, "
-                                               "voice_kind, profile_version, note_count, stream_sha256, codec_version, "
-                                               "payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)");
-                    insert.bind(1, item.revision);
-                    insert.bind(2, static_cast<std::int64_t>(stream.sequence_no));
-                    insert.bind(3, static_cast<std::int64_t>(stream.track_no));
-                    insert.bind(4, static_cast<std::int64_t>(stream.channel));
-                    insert.bind(5, std::string(search::voice_kind_name(stream.voice)));
-                    insert.bind(6, static_cast<std::int64_t>(stream.profile_version));
-                    insert.bind(7, static_cast<std::int64_t>(stream.notes.size()));
-                    sqlite_support::bind_bytes(insert, 8, sha256(payload));
-                    insert.bind(9, static_cast<std::int64_t>(search::motif_codec_version));
-                    sqlite_support::bind_bytes(insert, 10, payload);
-                    insert.exec();
-                    const auto stream_id = database.getLastInsertRowid();
-                    Statement gram(database, "INSERT INTO motif_gram(stream_id, family, gram_length, gram_hash, "
-                                             "start_ordinal, start_tick) VALUES (?1, ?2, ?3, ?4, ?5, ?6)");
-                    for (const auto& item_gram : search::stream_grams(stream)) {
-                        gram.reset();
-                        gram.bind(1, stream_id);
-                        gram.bind(2, std::string(search::token_family_name(item_gram.key.family)));
-                        gram.bind(3, static_cast<std::int64_t>(item_gram.key.length));
-                        const auto hash = search::gram_hash_bytes(item_gram.key.hash);
-                        sqlite_support::bind_bytes(gram, 4, hash);
-                        gram.bind(5, static_cast<std::int64_t>(item_gram.start_ordinal));
-                        gram.bind(6, item_gram.start_tick);
-                        gram.exec();
-                        ++gram_count;
-                    }
-                }
+                for (const auto& stream : streams)
+                    gram_count += insert_motif_stream(database, item.revision, stream);
                 for (const auto& feature : features) {
                     Statement insert(database, "INSERT INTO feature_vector(revision_id, sequence_no, profile_version, "
                                                "dimension, payload) VALUES (?1, ?2, ?3, ?4, ?5)");
@@ -2444,7 +2864,7 @@ Result<AnalyzeReport> Library::analyze(const AnalyzeOptions& options, std::stop_
                 run.bind(1, item.revision);
                 run.bind(2, derived_analysis_version);
                 sqlite_support::bind_bytes(run, 3, settings);
-                run.bind(4, std::string(document ? "complete" : "failed"));
+                run.bind(4, std::string(document ? "complete" : retry_later ? "cancelled" : "failed"));
                 run.bind(5, now_utc_ms());
                 Json result{{"version", 1},
                             {"fingerprints", fingerprints.size()},
@@ -2455,10 +2875,15 @@ Result<AnalyzeReport> Library::analyze(const AnalyzeOptions& options, std::stop_
                     result["reason"] = failure;
                 run.bind(6, result.dump());
                 run.exec();
+                state.store_gram_rows(database, state.derived_gram_rows(database) + static_cast<std::int64_t>(gram_count));
                 return ok();
             });
             if (!written)
                 return std::unexpected(std::move(written).error());
+            if (over_budget) {
+                report.budget_reached = true;
+                break;
+            }
             if (document) {
                 ++report.revisions_analyzed;
                 report.streams += streams.size();
@@ -2469,16 +2894,37 @@ Result<AnalyzeReport> Library::analyze(const AnalyzeOptions& options, std::stop_
             if (options.progress)
                 options.progress(report.revisions_analyzed + report.revisions_failed);
         }
+        if (report.cancelled || report.budget_reached)
+            break;
     }
     return report;
+}
+
+Result<std::size_t> Library::rebuild_derived() {
+    auto& state = *state_;
+    return state.write("analysis.rebuild", [&](SQLite::Database& database) -> Result<std::size_t> {
+        std::size_t removed = 0;
+        for (const auto* table : {"fingerprint", "motif_stream", "feature_vector"}) {
+            Statement clear(database, std::format("DELETE FROM {}", table));
+            removed += static_cast<std::size_t>(clear.exec());
+        }
+        Statement runs(database, "DELETE FROM analysis_run WHERE analyzer IN ('derived', 'derived-partial')");
+        runs.exec();
+        state.store_gram_rows(database, 0);
+        return removed;
+    });
 }
 
 Result<search::ExactSearchResult> Library::motif_search(const search::ExactQuery& query, std::stop_token stop) {
     auto reader = state_->reader();
     if (!reader)
         return std::unexpected(std::move(reader).error());
+    ProgressInterrupt interrupt(***reader, stop); // long SQL steps end when the search is cancelled
     CatalogMotifIndex index(***reader);
-    return search::exact_search(index, query, std::move(stop));
+    auto result = search::exact_search(index, query, std::move(stop));
+    if (result)
+        report_coverage(*result, count_unindexed_heads(***reader), index.skipped());
+    return result;
 }
 
 Result<search::ApproximateSearchResult> Library::similar_search(const search::ApproximateQuery& query,
@@ -2486,8 +2932,12 @@ Result<search::ApproximateSearchResult> Library::similar_search(const search::Ap
     auto reader = state_->reader();
     if (!reader)
         return std::unexpected(std::move(reader).error());
+    ProgressInterrupt interrupt(***reader, stop);
     CatalogMotifIndex index(***reader);
-    return search::approximate_search(index, query, std::move(stop));
+    auto result = search::approximate_search(index, query, std::move(stop));
+    if (result)
+        report_coverage(*result, count_unindexed_heads(***reader), index.skipped());
+    return result;
 }
 
 // --- Jobs -------------------------------------------------------------------------------------------
@@ -2543,6 +2993,94 @@ Status Library::finish_job(std::int64_t job_id, bool success, const std::string&
     });
 }
 
+std::vector<search::QueryNote> synthetic_planted_motif() {
+    // A fixed, distinctive 32-note line (wide leaps, uneven rhythm) that a random walk of small
+    // steps practically never reproduces, so its hits are exactly the planted ones.
+    static constexpr std::array<int, 32> pitches{60, 67, 63, 72, 58, 65, 70, 61, 68, 64, 75, 59, 66, 71, 62, 69,
+                                                 57, 73, 64, 60, 76, 63, 67, 58, 74, 61, 69, 65, 72, 59, 70, 62};
+    static constexpr std::array<Tick, 4> steps{240, 480, 240, 720};
+    std::vector<search::QueryNote> notes;
+    Tick onset = 0;
+    for (std::size_t index = 0; index < pitches.size(); ++index) {
+        const auto step = steps[index % steps.size()];
+        notes.push_back(search::QueryNote{onset, step - 40, static_cast<std::uint8_t>(pitches[index]), 96});
+        onset += step;
+    }
+    return notes;
+}
+
+Result<std::size_t> Library::populate_synthetic_motifs(std::size_t count, std::uint64_t seed, std::stop_token stop) {
+    auto& state = *state_;
+    const auto division = Division::make_ppq(default_ppq);
+    const auto settings_hash = search::extraction_settings_hash(search::ExtractionSettings{}, division);
+    const auto run_settings = analyzer_settings_hash("derived", derived_analysis_version);
+    const auto planted = synthetic_planted_motif();
+    DeterministicRandom random(seed);
+    const auto pick = [&](std::uint32_t bound) { return static_cast<std::int64_t>(random.bounded(bound)); };
+    std::size_t written = 0;
+    while (written < count) {
+        if (stop.stop_requested())
+            return make_error(ErrorCode::cancelled, "synthetic population cancelled");
+        auto inserted = state.write("bench.motifs", [&](SQLite::Database& database) -> Result<std::size_t> {
+            Statement heads(database, std::string(analysis_batch_sql));
+            heads.bind(1, std::int64_t{0});
+            heads.bind(2, derived_analysis_version);
+            heads.bind(3, static_cast<std::int64_t>(std::min<std::size_t>(500, count - written)));
+            std::vector<std::int64_t> revisions;
+            while (heads.executeStep())
+                revisions.push_back(heads.getColumn(0).getInt64());
+            std::size_t grams = 0;
+            for (std::size_t position = 0; position < revisions.size(); ++position) {
+                const auto revision = revisions[position];
+                search::MotifStream stream;
+                stream.division = division;
+                stream.settings_hash = settings_hash;
+                const auto length = static_cast<std::size_t>(16 + pick(49));
+                const bool plant = (written + position) % 100 == 0;
+                const auto plant_at = plant ? static_cast<std::size_t>(pick(static_cast<std::uint32_t>(length))) : length;
+                const auto transpose = pick(13) - 6;
+                Tick onset = 0;
+                int pitch = 48 + static_cast<int>(pick(24));
+                std::uint32_t ordinal = 0;
+                for (std::size_t index = 0; index < length; ++index) {
+                    if (index == plant_at) {
+                        const Tick base = onset;
+                        for (const auto& note : planted) {
+                            const auto planted_pitch = static_cast<std::uint8_t>(note.pitch + transpose);
+                            stream.notes.push_back(search::MotifNote{base + note.onset, base + note.onset + note.duration,
+                                                                     planted_pitch, note.velocity, ordinal++});
+                            onset = base + note.onset + 480;
+                        }
+                    }
+                    pitch = std::clamp(pitch + static_cast<int>(pick(5)) - 2, 36, 96);
+                    const Tick step = 120 * (1 + pick(4));
+                    stream.notes.push_back(search::MotifNote{onset, onset + step - 20, static_cast<std::uint8_t>(pitch),
+                                                             static_cast<std::uint8_t>(70 + pick(50)), ordinal++});
+                    onset += step;
+                }
+                grams += insert_motif_stream(database, revision, stream);
+                Statement run(database, "INSERT OR REPLACE INTO analysis_run(revision_id, analyzer, version, "
+                                        "settings_sha256, status, completed_ms, result_json) VALUES (?1, 'derived', "
+                                        "?2, ?3, 'complete', ?4, ?5)");
+                run.bind(1, revision);
+                run.bind(2, derived_analysis_version);
+                sqlite_support::bind_bytes(run, 3, run_settings);
+                run.bind(4, now_utc_ms());
+                run.bind(5, Json{{"version", 1}, {"streams", 1}, {"synthetic", true}}.dump());
+                run.exec();
+            }
+            state.store_gram_rows(database, state.derived_gram_rows(database) + static_cast<std::int64_t>(grams));
+            return revisions.size();
+        });
+        if (!inserted)
+            return std::unexpected(std::move(inserted).error());
+        if (*inserted == 0)
+            break; // no unanalyzed heads left
+        written += *inserted;
+    }
+    return written;
+}
+
 // --- Maintenance hooks -----------------------------------------------------------------------------
 
 Result<std::vector<std::string>> Library::explain_query_plan(const search::SqlFragment& statement) {
@@ -2578,6 +3116,7 @@ Result<std::size_t> Library::populate_synthetic(std::size_t rows, std::uint64_t 
     if (!bytes)
         return std::unexpected(std::move(bytes).error());
     const auto digest = sha256(*bytes);
+    std::shared_lock objects_guard(state.objects_lock); // through the catalog commits below
     MWB_TRY(state.objects.publish_bytes(*bytes, digest, media_extension(MediaType::smf)));
 
     static constexpr std::array<std::string_view, 24> words{

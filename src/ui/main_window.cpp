@@ -195,6 +195,11 @@ MainWindow::MainWindow(StartupOptions options, app::DataDirectories directories,
     build_toolbar();
     build_menus();
     qApp->installEventFilter(this); // focused controls keep their own keys (eventFilter)
+    // At startup the editor has the keyboard (the window is shown after this constructor).
+    QTimer::singleShot(0, this, [this] {
+        if (auto* tab = current_tab())
+            tab->piano_roll().setFocus(Qt::OtherFocusReason);
+    });
     {
         // Saved shortcut profile (versioned JSON); a damaged profile keeps the defaults.
         const QString profile = QSettings().value("shortcuts/profile").toString();
@@ -1159,6 +1164,9 @@ void MainWindow::open_document(DocumentData document, std::optional<std::filesys
     });
     tabs_->tabBar()->setTabButton(index, QTabBar::RightSide, close);
     tabs_->setCurrentIndex(index);
+    // Keys go to the editor of a document that just opened: never to the first focusable
+    // Inspector field, where an arrow key would change a setting (review_5).
+    tab->piano_roll().setFocus(Qt::OtherFocusReason);
     tab->set_keyboard_visible(keyboard_action_ && keyboard_action_->isChecked());
     tab->piano_roll().fit_all();
     QPointer<EditorTab> fit_target(tab);
@@ -1983,6 +1991,11 @@ void MainWindow::preview_library_item(DocumentData document, const QString& titl
     // The preview is not one of the open documents: no tab owns the transport while it plays,
     // and the next Play of a tab publishes that tab again (start_playback).
     transport_owner_ = nullptr;
+    // The readout follows the preview through its own tempo and meter maps (review_5).
+    if (!document.sequences.empty()) {
+        const auto& sequence = document.sequences.front();
+        preview_ = Preview{title, TempoMap::build(sequence), MeterMap::build(sequence)};
+    }
     Tick from = 0;
     if (range && !document.sequences.empty()) {
         // A melody match plays with a one-bar lead-in.
@@ -2026,6 +2039,7 @@ void MainWindow::commit_tempo(double bpm) {
 }
 
 void MainWindow::start_playback(EditorTab& tab, Tick from) {
+    preview_.reset(); // a document takes the transport back from a library preview
     if (transport_owner_ != &tab.controller()) {
         playback_->stop(0); // another document owned the transport
         transport_owner_ = &tab.controller();
@@ -2194,6 +2208,20 @@ void MainWindow::update_status_from_transport() {
         position_label_->setToolTip(display.playing_older_generation && display.state == TransportDisplay::State::playing
                                         ? tr("Playing the version before your latest edit; it updates in a moment")
                                         : tr("Transport position (bar.beat.tick), tempo, meter and state"));
+    } else if (preview_) {
+        // A library preview owns the transport: its own position, tempo and meter.
+        const auto& meter = preview_->meter.segment_at(display.position);
+        const double bpm =
+            std::round(600'000'000.0 / static_cast<double>(std::max<std::int64_t>(1, preview_->tempo.tempo_at(display.position)))) / 10.0;
+        position_label_->setText(QString("%1  %2  %3/%4  %5")
+                                     .arg(QString::fromStdString(preview_->meter.format(display.position)))
+                                     .arg(tr("♩=%1").arg(QString::number(bpm, 'f', bpm == std::floor(bpm) ? 0 : 1)))
+                                     .arg(meter.numerator)
+                                     .arg(meter.denominator)
+                                     .arg(state));
+        position_label_->setToolTip(tr("Previewing \"%1\" from the library").arg(preview_->title));
+    }
+    {
         for (int index = 0; index < tabs_->count(); ++index)
             if (auto* tab = qobject_cast<EditorTab*>(tabs_->widget(index))) {
                 const bool owner = &tab->controller() == transport_owner_;

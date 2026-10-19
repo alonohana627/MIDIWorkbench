@@ -33,6 +33,9 @@ struct BenchOptions {
     std::size_t rows = 10'000;
     std::size_t repetitions = 25;
     std::uint64_t seed = 1;
+    /// Assets that also get an indexed melody stream (M10K at 10,000): adds exact and approximate
+    /// motif search timings; 0 skips them.
+    std::size_t motif_rows = 0;
 };
 
 /// Latency percentiles of one measured operation.
@@ -51,6 +54,11 @@ struct BenchReport {
     double populate_seconds = 0.0;
     std::vector<BenchTiming> timings;
     std::vector<std::string> plan_problems; ///< "query: plan line" for every violation.
+    /// In-memory browse index after its build: rows loaded, measured bytes, and whether it passed
+    /// its budget (then the rows are those loaded before the build stopped).
+    std::size_t browse_index_rows = 0;
+    std::size_t browse_index_bytes = 0;
+    bool browse_index_over_budget = false;
     [[nodiscard]] std::string to_json() const;
 };
 

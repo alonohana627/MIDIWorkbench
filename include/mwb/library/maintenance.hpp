@@ -67,8 +67,17 @@ struct RepairReport {
     std::filesystem::path safety_backup;
     bool full_backup = false;     ///< False when only the catalog could be saved (damaged objects).
     std::size_t fts_rows = 0;
+    std::size_t derived_rows_removed = 0;
 };
 
+/// Which repairs `library repair` runs after its one safety backup.
+struct RepairOptions {
+    bool rebuild_fts = false;
+    bool rebuild_derived = false; ///< Drops derived indexes; the next analyze rebuilds them.
+};
+
+/// `library repair`: safety backup first, then the chosen repairs.
+[[nodiscard]] Result<RepairReport> repair_library(Library& library, const RepairOptions& options);
 /// `library repair --rebuild-fts`: safety backup first, then one-transaction FTS rebuild.
 [[nodiscard]] Result<RepairReport> repair_rebuild_fts(Library& library);
 

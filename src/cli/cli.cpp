@@ -140,6 +140,13 @@ int run(const std::vector<std::string>& arguments, std::string& standard_output,
     auto* library_repair = library->add_subcommand("repair", "Explicit bounded repair with backup");
     library_repair->add_option("--library", options.library)->required();
     library_repair->add_flag("--rebuild-fts", options.rebuild_fts);
+    library_repair->add_flag("--rebuild-derived", options.rebuild_derived,
+                             "Drop fingerprints, motif and feature indexes so the next analyze rebuilds them");
+    auto* library_gc = library->add_subcommand("gc", "Remove unreferenced objects after their grace period");
+    library_gc->add_option("--library", options.library)->required();
+    library_gc->add_option("--grace-days", options.grace_days, "Keep unreferenced objects younger than this (default 30)")
+        ->check(CLI::Range(0.0, 3650.0));
+    library_gc->add_flag("--json", options.json);
 
     auto* devices = application.add_subcommand("devices", "Enumerate audio and MIDI endpoints");
     devices->add_flag("--json", options.json);
@@ -148,6 +155,9 @@ int run(const std::vector<std::string>& arguments, std::string& standard_output,
     auto* bench = application.add_subcommand("bench", "Generate a synthetic catalog and time hot paths");
     bench->add_option("--library", options.library)->required();
     bench->add_option("--rows", options.rows)->check(CLI::Range(1, 10'000'000));
+    bench->add_option("--motif-rows", options.motif_rows, "Also index this many melody streams (M10K: 10000)")
+        ->check(CLI::Range(0, 1'000'000));
+    bench->add_option("--repetitions", options.repetitions, "Samples per timing (default 25)")->check(CLI::Range(1, 1000));
     bench->add_flag("--json", options.json);
 
     std::vector<std::string> reversed(arguments.rbegin(), arguments.rend());
@@ -194,6 +204,8 @@ int run(const std::vector<std::string>& arguments, std::string& standard_output,
         output = command_library_verify(options);
     else if (library_repair->parsed())
         output = command_library_repair(options);
+    else if (library_gc->parsed())
+        output = command_library_gc(options);
     else if (devices->parsed())
         output = command_devices(options);
     else if (capabilities->parsed())

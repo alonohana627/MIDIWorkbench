@@ -41,14 +41,36 @@ Result<std::vector<HotQuery>> hot_queries(Library& library) {
     fts_bpm.query_text = "lead bpm:120..140";
     SearchRequest fts_bpm_relevance = fts_bpm;
     fts_bpm_relevance.order.field = search::SortField::relevance;
+    // Selective structured filters (code-library-2/13): they must use the summary and fact
+    // indexes, never walk the whole catalog.
+    SearchRequest exact_bpm;
+    exact_bpm.query_text = "bpm:173.3";
+    SearchRequest sysex;
+    sysex.query_text = "has:sysex";
+    SearchRequest channel_program;
+    channel_program.query_text = "channel:16 program:128";
+    SearchRequest many_notes;
+    many_notes.query_text = "notes:>=511";
     for (auto [name, request] : {std::pair{"paging_title", paging}, std::pair{"tag_filter", tag},
-                                 std::pair{"fts_bpm", fts_bpm}, std::pair{"fts_bpm_relevance", fts_bpm_relevance}}) {
+                                 std::pair{"fts_bpm", fts_bpm}, std::pair{"fts_bpm_relevance", fts_bpm_relevance},
+                                 std::pair{"select_exact_bpm", exact_bpm}, std::pair{"select_has_sysex", sysex},
+                                 std::pair{"select_channel_program", channel_program},
+                                 std::pair{"select_many_notes", many_notes}}) {
         auto query = compiled(library, name, request);
         if (!query)
             return std::unexpected(std::move(query).error());
         queries.push_back(std::move(*query));
     }
     queries.push_back(HotQuery{"job_leasing", search::SqlFragment{std::string(lease_job_sql), {now_utc_ms()}}});
+    const auto hash = std::string(32, '\x5a');
+    queries.push_back(HotQuery{"motif_postings", search::SqlFragment{std::string(motif_postings_sql),
+                                                                     {std::string("interval"), std::int64_t{4}, hash,
+                                                                      std::int64_t{1}, std::int64_t{1000}}}});
+    queries.push_back(HotQuery{"motif_stream", search::SqlFragment{std::string(motif_stream_sql), {std::int64_t{1}}}});
+    queries.push_back(HotQuery{"motif_stream_ids", search::SqlFragment{std::string(motif_stream_ids_sql),
+                                                                       {std::int64_t{0}, std::int64_t{1}, std::int64_t{256}}}});
+    queries.push_back(HotQuery{"analysis_batch", search::SqlFragment{std::string(analysis_batch_sql),
+                                                                     {std::int64_t{0}, std::int64_t{1}, std::int64_t{64}}}});
     return queries;
 }
 
@@ -78,6 +100,9 @@ std::string BenchReport::to_json() const {
                         {"max_ms", timing.max_ms}});
     object["timings"] = std::move(list);
     object["plan_problems"] = plan_problems;
+    object["browse_index"] = {{"rows", browse_index_rows},
+                              {"bytes", browse_index_bytes},
+                              {"over_budget", browse_index_over_budget}};
     return object.dump();
 }
 
@@ -92,6 +117,11 @@ Result<BenchReport> run_bench(const std::filesystem::path& directory, const Benc
     if (!rows)
         return std::unexpected(std::move(rows).error());
     report.rows = *rows;
+    if (options.motif_rows > 0) {
+        auto motifs = library.populate_synthetic_motifs(options.motif_rows, options.seed, stop);
+        if (!motifs)
+            return std::unexpected(std::move(motifs).error());
+    }
     report.populate_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - populate_start).count();
     for (std::size_t index = 0; index < options.repetitions * 2; ++index)
@@ -151,6 +181,59 @@ Result<BenchReport> run_bench(const std::filesystem::path& directory, const Benc
     MWB_TRY(measure("tag_filter", search_operation(tag)));
     MWB_TRY(measure("fts_bpm_title", search_operation(fts_bpm)));
     MWB_TRY(measure("fts_bpm_relevance", search_operation(relevance)));
+    // The same pages from the in-memory browse index (section 19.4), as the desktop serves them.
+    const auto build_start = std::chrono::steady_clock::now();
+    auto built = library.build_browse_index(stop);
+    if (!built)
+        return std::unexpected(std::move(built).error());
+    report.timings.push_back(BenchTiming{
+        "browse_index_build", 1, 0, 0, 0,
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - build_start).count()});
+    report.timings.back().p50_ms = report.timings.back().p95_ms = report.timings.back().p99_ms =
+        report.timings.back().max_ms;
+    report.browse_index_rows = built->rows;
+    report.browse_index_bytes = built->memory_bytes;
+    report.browse_index_over_budget = built->over_budget;
+    if (built->ready) {
+        SearchRequest exact = first_page;
+        exact.query_text = "bpm:173.3";
+        SearchRequest sysex = first_page;
+        sysex.query_text = "has:sysex";
+        MWB_TRY(measure("index_page_first_title", search_operation(first_page)));
+        MWB_TRY(measure("index_tag_filter", search_operation(tag)));
+        MWB_TRY(measure("index_fts_bpm_title", search_operation(fts_bpm)));
+        MWB_TRY(measure("index_select_exact_bpm", search_operation(exact)));
+        MWB_TRY(measure("index_select_has_sysex", search_operation(sysex)));
+    }
+    if (options.motif_rows > 0) {
+        const auto planted = synthetic_planted_motif();
+        const auto exact_operation = [&](std::size_t notes) {
+            return [&library, &stop, &planted, notes]() -> Status {
+                search::ExactQuery query;
+                query.mode = search::MatchMode::transposed;
+                query.notes.assign(planted.begin(), planted.begin() + static_cast<std::ptrdiff_t>(notes));
+                auto result = library.motif_search(query, stop);
+                if (!result)
+                    return std::unexpected(std::move(result).error());
+                if (result->occurrences.empty())
+                    return make_error(ErrorCode::invalid_data, "the planted motif was not found");
+                return ok();
+            };
+        };
+        MWB_TRY(measure("motif_exact_8", exact_operation(8)));
+        MWB_TRY(measure("motif_exact_32", exact_operation(32)));
+        MWB_TRY(measure("motif_similar_16", [&]() -> Status {
+            search::ApproximateQuery query;
+            query.notes.assign(planted.begin() + 4, planted.begin() + 20);
+            query.notes[3].pitch = static_cast<std::uint8_t>(query.notes[3].pitch + 1); // a near miss
+            auto result = library.similar_search(query, stop);
+            if (!result)
+                return std::unexpected(std::move(result).error());
+            if (result->matches.empty())
+                return make_error(ErrorCode::invalid_data, "no similar phrase found for the planted motif");
+            return ok();
+        }));
+    }
     MWB_TRY(measure("changes_since", [&]() -> Status {
         auto changes = library.changes_since(0);
         if (!changes)

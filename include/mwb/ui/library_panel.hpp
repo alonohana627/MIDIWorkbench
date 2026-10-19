@@ -120,6 +120,8 @@ public:
     void open_library(const std::filesystem::path& root, bool create, bool interactive = false,
                       std::optional<std::filesystem::path> import_after = std::nullopt);
     [[nodiscard]] bool is_open() const { return library_ != nullptr; }
+    /// The open library (null before one is open); shared with the panel's background threads.
+    [[nodiscard]] std::shared_ptr<library::Library> library() const { return library_; }
     /// Moves the selected results to the trash after a confirmation (context menu, Delete key).
     void trash_selected();
     /// Shows the trash (restore, delete permanently) instead of the search results.
@@ -155,6 +157,9 @@ private:
     void import_path(const std::filesystem::path& source);
     /// Indexes items for melody search in the background (after saves and cancelled imports).
     void schedule_analysis();
+    /// Builds the browse index on the maintenance thread (after open and after a full outbox reload);
+    /// `collect_garbage` also runs the idle object collection afterwards.
+    void schedule_browse_index(bool collect_garbage);
     /// Re-reads the visible rows in place (melody and trash results are never replaced).
     void refresh_visible();
     /// What changes call instead of a plain re-search: text results re-run and keep the
@@ -166,6 +171,8 @@ private:
     void purge_selected();
     void set_mode(ResultMode mode);
     void configure_columns();
+    /// Saved column choice, plus the Status column while melody hits are shown.
+    void apply_column_visibility();
     void present_revisions(std::int64_t asset_id, const QString& title, std::optional<std::int64_t> head,
                            const Result<std::vector<library::RevisionInfo>>& revisions);
     void run_search(bool keep_position = false);
@@ -224,6 +231,8 @@ private:
     std::unique_ptr<TaskThread> browse_thread_ = std::make_unique<TaskThread>();
     std::unique_ptr<TaskThread> write_thread_ = std::make_unique<TaskThread>(true);
     std::unique_ptr<TaskThread> import_thread_ = std::make_unique<TaskThread>();
+    /// Background upkeep after open: the in-memory browse index (section 19.4), then object GC.
+    std::unique_ptr<TaskThread> maintenance_thread_ = std::make_unique<TaskThread>();
     std::shared_ptr<std::atomic<std::uint64_t>> drag_latest_ = std::make_shared<std::atomic<std::uint64_t>>(0);
 };
 

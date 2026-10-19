@@ -29,6 +29,7 @@
 #include "mwb/ui/playback_service.hpp"
 #include "mwb/ui/recording_controller.hpp"
 #include "mwb/ui/shortcut_editor.hpp"
+#include "mwb/ui/scale_bar.hpp"
 #include "mwb/ui/tempo_field.hpp"
 
 #include <QApplication>
@@ -1127,7 +1128,19 @@ void MainWindow::build_toolbar() {
         if (auto* button = qobject_cast<QToolButton*>(panels->widgetForAction(toggle)))
             button->setAccessibleName(tr("%1 panel").arg(dock->windowTitle()));
     }
-    tabs_->setCornerWidget(panels, Qt::TopRightCorner);
+    // The scale controls share the tab row: always in view, no extra toolbar height.
+    scale_bar_ = new ScaleBar(this);
+    connect(scale_bar_, &ScaleBar::select_outside_requested, this, [this] {
+        if (auto* tab = current_tab())
+            tab->piano_roll().select_out_of_scale();
+    });
+    auto* tab_corner = new QWidget(this);
+    auto* tab_corner_layout = new QHBoxLayout(tab_corner);
+    tab_corner_layout->setContentsMargins(0, 0, 0, 0);
+    tab_corner_layout->setSpacing(0);
+    tab_corner_layout->addWidget(scale_bar_);
+    tab_corner_layout->addWidget(panels);
+    tabs_->setCornerWidget(tab_corner, Qt::TopRightCorner);
     events_dock_->toggleViewAction()->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_3));
     // Panel toggles are commands too, so the command palette finds them.
     for (auto [dock, id] : {std::pair{library_dock_, "view.panel_library"}, std::pair{inspector_dock_, "view.panel_inspector"},
@@ -1459,6 +1472,8 @@ void MainWindow::current_tab_changed() {
     inspector_->set_controller(tab ? &tab->controller() : nullptr);
     recording_->set_target(tab ? &tab->controller() : nullptr, tab ? &tab->keyboard() : nullptr);
     drag_handle_->set_controller(tab ? &tab->controller() : nullptr);
+    if (scale_bar_)
+        scale_bar_->set_controller(tab ? &tab->controller() : nullptr);
     if (auto* old = events_dock_->widget()) {
         events_dock_->setWidget(nullptr);
         old->deleteLater();

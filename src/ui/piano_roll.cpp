@@ -712,7 +712,14 @@ void PianoRollView::paint_notes(QPainter& painter, const QRectF& area) {
             painter.drawRoundedRect(body.adjusted(2, 2, -2, -2), 1, 1);
         }
         if (highlight_scale && !in_scale(note.pitch)) {
-            outline = QPen(QColor(230, 120, 30), 2, Qt::DashLine); // out of scale: shape, not only color
+            // Out of scale: a warning outline plus a solid bar at the note's start, so it reads
+            // without color too; a selected note keeps its selection outline and the bar.
+            const QColor warning = warning_color();
+            if (!selected)
+                outline = QPen(warning, 2);
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(warning);
+            painter.drawRect(QRectF(body.left(), body.top(), std::min(4.0, body.width()), body.height()));
         }
         if (note.flags & (note_flag::unterminated | note_flag::zero_length))
             outline = QPen(danger, 2, Qt::DotLine); // invalid/orphan-derived

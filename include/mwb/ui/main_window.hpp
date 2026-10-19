@@ -46,6 +46,7 @@ class PlaybackService;
 class DragHandle;
 class RecordingController;
 class TempoField;
+class ScaleBar;
 
 /// Startup options shared by the GUI and its headless test mode (section 32.2).
 struct StartupOptions {
@@ -198,6 +199,7 @@ private:
     bool showing_pause_ = false;
     QDoubleSpinBox* tempo_multiplier_ = nullptr;
     TempoField* tempo_field_ = nullptr;
+    ScaleBar* scale_bar_ = nullptr;
     std::optional<Tick> tempo_edit_at_; ///< Position captured when a BPM edit burst started.
     QAction* loop_action_ = nullptr;
     QAction* metronome_action_ = nullptr;

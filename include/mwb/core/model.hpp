@@ -29,7 +29,7 @@ struct SequenceSettings {
     InputScalePolicy input_policy = InputScalePolicy::allow_all;
     bool nearest_tie_up = false;          ///< Nearest-member ties go upward when true.
     std::uint8_t default_velocity = 100;
-    Rational default_note_length{1, 16};
+    Rational default_note_length{1, 4};
     friend bool operator==(const SequenceSettings&, const SequenceSettings&) = default;
 };
 

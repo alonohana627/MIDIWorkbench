@@ -39,7 +39,9 @@ recording, organizing and searching MIDI. It needs no account and never goes onl
 3. Press **Space** to play from the edit cursor and again to stop; the playhead returns to where
    playback started. **Ctrl+Space** pauses and resumes in place. The loop bracket in the ruler
    repeats the first four bars.
-4. In the **Inspector**, pick a root and scale and tick **Highlight scale rows** to see the scale.
+4. Press **Scale** in the tab row (it picks the song's estimated key), or choose the root and scale
+   next to it. Scale rows are tinted and notes outside the scale get an orange outline and bar;
+   **Fold** shows only the scale's rows and **Select outside** selects the notes outside it.
 5. **File > Save** writes a `.mwb` document; **File > Export MIDI** writes a `.mid` for your DAW.
 6. To build a library, open the Library panel (books icon or **Ctrl+1**), click **Create or Open
    Library…**, choose an empty folder, then **Add Folder…** to import your MIDI files.

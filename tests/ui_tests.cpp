@@ -23,6 +23,7 @@
 #include "mwb/ui/piano_roll.hpp"
 #include "mwb/ui/playback_service.hpp"
 #include "mwb/ui/recording_controller.hpp"
+#include "mwb/ui/scale_bar.hpp"
 #include "mwb/ui/tempo_field.hpp"
 #include "mwb/ui/theme.hpp"
 
@@ -240,6 +241,52 @@ TEST_SUITE("controller") {
 }
 
 TEST_SUITE("piano_roll") {
+    TEST_CASE("the scale bar turns the scale on, picks root and type undoably and selects notes outside it") {
+        auto controller = make_controller();
+        PianoRollView view(*controller);
+        ScaleBar bar;
+        bar.set_controller(controller.get());
+        const NewNote notes[] = {{controller->active_track(), 0, 480, 60, 100, 0, 0},   // C: in C major
+                                 {controller->active_track(), 480, 960, 61, 100, 0, 0}, // C#: outside C major
+                                 {controller->active_track(), 960, 1440, 62, 100, 0, 0}}; // D: in both
+        auto changes = insert_notes(controller->document(), std::span(notes));
+        REQUIRE(changes);
+        REQUIRE(controller->apply(*changes));
+        CHECK(controller->active_sequence().settings.default_note_length == Rational{1, 4});
+        CHECK_FALSE(bar.select_button()->isEnabled()); // nothing to select against until the scale is on
+        bar.scale_button()->click();
+        CHECK(controller->active_sequence().settings.highlight_scale);
+        // A chromatic song gets a real scale when Scale is turned on, so notes outside it can show.
+        CHECK(controller->active_sequence().scale_mask != chromatic_scale_mask);
+        CHECK(bar.type_box()->currentData().toString() != QStringLiteral("chromatic"));
+        CHECK(bar.select_button()->isEnabled());
+        const int major = bar.type_box()->findData(QStringLiteral("major"));
+        REQUIRE(major >= 0);
+        bar.type_box()->setCurrentIndex(major);
+        emit bar.type_box()->activated(major);
+        QObject::connect(&bar, &ScaleBar::select_outside_requested, &view, &PianoRollView::select_out_of_scale);
+        bar.select_button()->click();
+        REQUIRE(controller->selection().size() == 1);
+        const auto& index = controller->note_index();
+        for (const auto& note : index.notes())
+            CHECK(controller->selection().contains(note.on_id) == (note.pitch == 61));
+        // Root D: D major has C# and not C.
+        bar.root_box()->setCurrentIndex(2);
+        emit bar.root_box()->activated(2);
+        CHECK(controller->active_sequence().root_pc == 2);
+        bar.select_button()->click();
+        REQUIRE(controller->selection().size() == 1);
+        for (const auto& note : controller->note_index().notes())
+            CHECK(controller->selection().contains(note.on_id) == (note.pitch == 60));
+        bar.fold_button()->click();
+        CHECK(controller->active_sequence().settings.fold_to_scale);
+        CHECK(controller->undo()); // fold
+        CHECK(controller->undo()); // root
+        CHECK(controller->active_sequence().root_pc == 0);
+        CHECK(bar.root_box()->currentIndex() == 0); // the bar follows undo
+        CHECK_FALSE(bar.fold_button()->isChecked());
+    }
+
     TEST_CASE("Alt+wheel makes the piano rows taller or shorter around the row under the mouse") {
         auto controller = make_controller();
         PianoRollView view(*controller);
@@ -289,8 +336,8 @@ TEST_SUITE("piano_roll") {
         CHECK(inserted.start == 960);
         CHECK(controller->selection().contains(inserted.on_id));
         // Drag the body two rows up and right by roughly a beat.
-        // Grab the left part: the rightmost third of a short note is its end-resize zone.
-        const QPoint body = target + QPoint(-2, 0);
+        // Grab the middle of the quarter note: its edges are the resize zones.
+        const QPoint body = target + QPoint(static_cast<int>(480 / mapping.ticks_per_pixel) - 5, 0);
         QTest::mousePress(&view, Qt::LeftButton, Qt::NoModifier, body);
         QTest::mouseMove(&view, body + QPoint(20, -static_cast<int>(mapping.row_height * 2)));
         QTest::mouseMove(&view, body + QPoint(static_cast<int>(960 / mapping.ticks_per_pixel), -static_cast<int>(mapping.row_height * 2)));
@@ -374,7 +421,7 @@ TEST_SUITE("piano_roll") {
         REQUIRE(controller->notes().notes.size() == 1);
         const auto note = controller->notes().notes.front();
         CHECK(note.start == 960);
-        CHECK(note.end - note.start == 240); // default 1/16 at PPQ 960
+        CHECK(note.end - note.start == 960); // default 1/4 at PPQ 960
         CHECK(controller->selection().contains(note.on_id));
     }
 
@@ -1745,6 +1792,39 @@ TEST_SUITE("reviewer_probe3") {
     }
 }
 
+TEST_SUITE("window") {
+    TEST_CASE("the scale bar in the tab row follows the open song and marks its notes outside the scale") {
+        WindowFixture fixture;
+        REQUIRE(fixture.window->open_path(std::filesystem::path(__FILE__).parent_path().parent_path() / "docs" / "images" / "demo.mid"));
+        QTest::qWait(300);
+        auto* tab = fixture.window->current_tab();
+        auto* bar = fixture.window->findChild<ScaleBar*>();
+        REQUIRE(bar);
+        CHECK(bar->isVisible());
+        CHECK(bar->scale_button()->isEnabled());
+        auto& controller = tab->controller();
+        CHECK(controller.active_sequence().settings.default_note_length == Rational{1, 4});
+        bar->scale_button()->click();
+        CHECK(controller.active_sequence().settings.highlight_scale);
+        CHECK(controller.active_sequence().scale_mask != chromatic_scale_mask);
+        bar->select_button()->click();
+        for (const auto& note : controller.note_index().notes())
+            if (controller.selection().contains(note.on_id))
+                CHECK(((controller.active_sequence().scale_mask >> ((note.pitch + 12 - controller.active_sequence().root_pc) % 12)) & 1) == 0);
+        // D major: the song's C and F naturals are now outside the scale.
+        bar->root_box()->setCurrentIndex(2);
+        emit bar->root_box()->activated(2);
+        bar->select_button()->click();
+        CHECK_FALSE(controller.selection().empty());
+        if (const QByteArray shot = qgetenv("MWB_TEST_SHOT"); !shot.isEmpty()) {
+            apply_theme(Theme::dark);
+            controller.set_selection({});
+            QTest::qWait(50);
+            fixture.window->grab().save(QString::fromLocal8Bit(shot));
+        }
+    }
+}
+
 TEST_SUITE("reviewer_probe4") {
     TEST_CASE("probe4: ruler seek while playing a real song") {
         WindowFixture fixture;
@@ -2072,7 +2152,7 @@ TEST_SUITE("gestures") {
         CHECK(roll.notes()[0].end - roll.notes()[0].start == 960);
         QTest::mouseClick(roll.view.get(), Qt::LeftButton, Qt::NoModifier, roll.at(1920, 62) + QPoint(2, 0));
         REQUIRE(roll.notes().size() == 2);
-        CHECK(roll.notes()[1].end - roll.notes()[1].start == 240); // default 1/16 at PPQ 960
+        CHECK(roll.notes()[1].end - roll.notes()[1].start == 960); // default 1/4 at PPQ 960
     }
 }
 

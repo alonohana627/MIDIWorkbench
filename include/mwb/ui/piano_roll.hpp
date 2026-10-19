@@ -115,6 +115,8 @@ signals:
     void mapping_changed();
     /// The edit tool changed (toolbar and B toggle stay in sync).
     void tool_changed(mwb::ui::EditTool tool);
+    /// A ruler click or scrub ended at `tick` (the new edit cursor): a rolling transport jumps there.
+    void seek_requested(mwb::Tick tick);
 
 protected:
     void paintEvent(QPaintEvent* event) override;

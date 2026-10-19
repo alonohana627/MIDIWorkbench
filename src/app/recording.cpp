@@ -237,7 +237,12 @@ Result<RecordedTake> TakeRecorder::finish(const DocumentData& document, Tick sto
     // Loop takes keep the last complete pass (the one before the pass in progress at stop) in the
     // composed result; a stop during the first pass keeps that pass. Every pass stays in the raw
     // take evidence (section 5.4).
-    const std::int64_t kept_pass = options_.loop ? std::max<std::int64_t>(0, stop_pass - 1) : 0;
+    // A punch-in while looping starts in a later pass: never compose a pass the take did not see.
+    std::int64_t first_pass = options_.first_pass.value_or(0);
+    if (options_.loop && !options_.first_pass && !ticks_.empty())
+        std::ignore = fold(ticks_.front(), first_pass);
+    const std::int64_t kept_pass =
+        options_.loop ? std::max(first_pass, std::max<std::int64_t>(0, stop_pass - 1)) : 0;
     if (options_.loop && last_pass > 0)
         result.messages.push_back("loop take: " + std::to_string(last_pass + 1) + " passes captured; pass " +
                                   std::to_string(kept_pass + 1) +
@@ -277,12 +282,13 @@ Result<RecordedTake> TakeRecorder::finish(const DocumentData& document, Tick sto
 
     // Raw evidence in bounded chunks (section 21.2), with capture metadata (capture_json v1).
     RecordingTake& take = result.take;
-    take.id = TakeId::generate();
+    take.id = take_id_; // the identity capture chunks were journaled under
     take.track = track_;
     take.name = std::move(take_name);
     take.created_ms = now_utc_ms();
-    take.start_tick = std::min(options_.start_tick, stop_tick);
-    take.end_tick = std::max(options_.start_tick, stop_tick);
+    // A take never starts before tick 0 (a stop during a count-in from bar 1 maps before it).
+    take.start_tick = std::max<Tick>(0, options_.start_tick);
+    take.end_tick = std::max(take.start_tick, stop_tick);
     take.status = interruption_ ? TakeStatus::interrupted : TakeStatus::accepted;
     for (std::size_t begin = 0, ordinal = 0; begin < raw_.size(); begin += take_chunk_messages, ++ordinal) {
         const auto count = std::min(take_chunk_messages, raw_.size() - begin);
@@ -318,6 +324,14 @@ Result<RecordedTake> TakeRecorder::finish(const DocumentData& document, Tick sto
 
 StepRecorder::StepRecorder(TrackId track, Tick cursor, Settings settings)
     : track_(track), cursor_(std::max<Tick>(0, cursor)), settings_(settings) {}
+
+bool StepRecorder::set_cursor(Tick cursor) {
+    cursor = std::max<Tick>(0, cursor);
+    if (!held_.empty() || cursor == cursor_)
+        return false;
+    cursor_ = cursor;
+    return true;
+}
 
 void StepRecorder::key_down(std::uint8_t pitch, std::uint8_t velocity) {
     if (held_.contains(pitch))

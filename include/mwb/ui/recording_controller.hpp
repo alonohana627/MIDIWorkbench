@@ -1,14 +1,19 @@
 #pragma once
 
 #include "mwb/app/recording.hpp"
+#include "mwb/ui/task_thread.hpp"
 
 #include <QObject>
 #include <QPointer>
 #include <QTimer>
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <thread>
+#include <utility>
+#include <vector>
 
 namespace mwb::platform {
 class IMidiBackend;
@@ -24,8 +29,11 @@ class PlaybackService;
 /// Live input and recording for the GUI (sections 8.3-8.5): opens a physical MIDI input by its
 /// stable identity, monitors it through the audition voice, and drives real-time takes (count-in,
 /// punch from the edit cursor or punch-in while playing, loop takes, held notes closed at stop)
-/// and step recording. Input callbacks only fill the platform queue; this object drains it on the
-/// GUI thread with a short timer, so timestamps stay those captured in the callback. Each message
+/// and step recording. Input devices are listed and opened on a background thread (the GUI never
+/// waits for a driver, section 19.4). A monitor thread blocks on the input queue and sends every
+/// channel message (notes, sustain and other controllers, bend, pressure) straight to the
+/// engine's monitor queue, so monitoring never waits for the GUI (section 14.1); it hands copies to
+/// the GUI, which records them with the timestamps captured in the callback. Each message
 /// is placed on the transport through the engine's audio clock (PlaybackService::
 /// transport_tick_at), so the tempo multiplier, loop passes and a deferred or already running
 /// start are all accounted for (section 8.4 rule 2).
@@ -36,15 +44,18 @@ public:
     RecordingController(PlaybackService& playback, QObject* parent = nullptr);
     ~RecordingController() override;
 
-    /// Lists input ports as (stable id, display name).
-    [[nodiscard]] std::vector<std::pair<QString, QString>> input_ports();
-    /// Opens an input by stable id (empty closes the current input).
-    bool open_input(const QString& stable_id, QString* error);
+    using PortList = std::vector<std::pair<QString, QString>>; ///< (stable id, display name)
+    /// Lists input ports in the background; `done` runs on the GUI thread with the ports, or an
+    /// empty list and the reason.
+    void list_input_ports(std::function<void(PortList ports, QString error)> done);
+    /// Opens an input by stable id in the background (empty closes the current input). The
+    /// result arrives as input_changed().
+    void open_input(const QString& stable_id);
     [[nodiscard]] QString input_name() const;
 
     void set_target(DocumentController* controller, KeyboardWidget* keyboard);
     void set_count_in_bars(int bars) { count_in_bars_ = std::clamp(bars, 0, 2); }
-    void set_monitoring(bool monitoring) { monitoring_ = monitoring; }
+    void set_monitoring(bool monitoring);
     void set_latency_compensation(std::chrono::nanoseconds latency) { latency_ = latency; }
 
     /// Starts a take (stopped: count-in, then capture from the edit cursor; playing: punch-in at
@@ -64,10 +75,24 @@ public:
 signals:
     void status_message(const QString& text);
     void recording_changed(bool recording);
+    /// Step recording was armed or disarmed (also when switching documents disarms it).
+    void step_recording_changed(bool armed);
+    /// An input open finished: `name` of the open input (empty when none) and the error, if any.
+    void input_changed(const QString& name, const QString& error);
 
 private:
+    struct Inbox;
+    struct Devices;
+    void install_input(std::shared_ptr<platform::IMidiInput> input, const QString& stable_id, const QString& error);
+    void stop_monitor();
+    /// Journals each completed take chunk as soon as it fills (crash protection, section 21.2).
+    void journal_full_chunks();
+    void update_live_timbre();
+    /// The user moved the edit cursor: step recording inserts there next (section 8.5).
+    void follow_edit_cursor();
     void poll_input();
-    void handle_message(const app::CapturedMessage& message, bool monitor);
+    /// Recording, step entry and the key display for one input message (GUI thread).
+    void handle_message(const app::CapturedMessage& message);
     /// Transport tick for a capture timestamp (see the class comment). Not const: it remembers the
     /// last engine mapping to extrapolate from once the engine stops mid-take.
     [[nodiscard]] Tick tick_for(std::int64_t steady_ns);
@@ -80,8 +105,11 @@ private:
     PlaybackService& playback_;
     QPointer<DocumentController> controller_;
     QPointer<KeyboardWidget> keyboard_;
-    std::unique_ptr<platform::IMidiBackend> backend_;
-    std::unique_ptr<platform::IMidiInput> input_;
+    std::shared_ptr<platform::IMidiInput> input_;
+    QString input_name_;
+    std::shared_ptr<Inbox> inbox_;        ///< Messages the monitor thread passed on, and the monitoring flag.
+    std::shared_ptr<Devices> devices_;    ///< MIDI backend, used only on device_thread_.
+    std::jthread monitor_;                ///< Blocks on input_ and forwards to the engine.
     QTimer poll_timer_;
     std::optional<app::TakeRecorder> recorder_;
     std::optional<app::StepRecorder> step_;
@@ -92,10 +120,12 @@ private:
     bool punched_in_ = false;      ///< The take began while the transport was playing.
     Tick record_start_ = 0;
     int count_in_bars_ = 1;
-    bool monitoring_ = true;
+    std::size_t journaled_chunks_ = 0;    ///< Full take chunks already given to the recovery journal.
+    std::vector<QMetaObject::Connection> target_connections_; ///< To the current DocumentController.
     std::chrono::nanoseconds latency_{0};
     std::uint64_t last_overflow_ = 0;
     int take_number_ = 1;
+    TaskThread device_thread_;            ///< Lists and opens inputs (stopped first on destruction).
 };
 
 } // namespace mwb::ui

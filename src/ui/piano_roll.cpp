@@ -1535,6 +1535,7 @@ void PianoRollView::commit_gesture() {
             // A click in the loop strip moves the edit cursor like the rest of the ruler.
             const Tick tick = std::max<Tick>(0, mapping_.x_to_tick(press_point_.x() - keyboard_width));
             controller_.set_edit_cursor(snap_nearest(tick, press_modifiers_));
+            emit seek_requested(controller_.edit_cursor());
         } else if (loop_preview_.end > loop_preview_.begin && (loop_preview_.begin != loop_at_press_.begin ||
                                                                  loop_preview_.end != loop_at_press_.end)) {
             if (set_loop_range(controller_, loop_preview_))
@@ -1543,9 +1544,11 @@ void PianoRollView::commit_gesture() {
                                         .arg(QString::fromStdString(controller_.meter_map().format(loop_preview_.end))));
         }
         break;
+    case Gesture::scrub:
+        emit seek_requested(controller_.edit_cursor()); // playback follows a ruler click (ux-editing-8)
+        break;
     case Gesture::none:
-    case Gesture::pan:
-    case Gesture::scrub: break;
+    case Gesture::pan: break;
     }
     handle_note_.reset();
     snapshot_ = {};

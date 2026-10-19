@@ -269,6 +269,10 @@ Status apply_structural(DocumentData& document, const EditOperation& operation) 
             [&](const TakeInsert& insert) -> Status {
                 if (insert.index > document.takes.size() || !find_track(document, insert.take.track))
                     return make_error(ErrorCode::invalid_data, "take insert is invalid");
+                // The same range rule the native format enforces, so a take that could never be
+                // saved never enters a document.
+                if (insert.take.start_tick < 0 || insert.take.end_tick < insert.take.start_tick)
+                    return make_error(ErrorCode::invalid_data, "recording take has an invalid range");
                 document.takes.insert(document.takes.begin() + static_cast<std::ptrdiff_t>(insert.index), insert.take);
                 return ok();
             },

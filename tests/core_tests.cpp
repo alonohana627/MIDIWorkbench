@@ -506,3 +506,23 @@ TEST_SUITE("changes") {
         check_single_zero_length(document, 1260, 64, 3);
     }
 }
+
+TEST_SUITE("changes") {
+    TEST_CASE("a take with a negative or reversed range is refused, as the native format would") {
+        DocumentData document = make_blank_document();
+        RecordingTake take;
+        take.id = TakeId::generate();
+        take.track = document.sequences.front().tracks.front().id;
+        take.start_tick = -1000;
+        take.end_tick = 0;
+        ChangeBuilder negative(document, "take");
+        negative.append(TakeInsert{0, take});
+        CHECK_FALSE(apply_change_set(document, negative.finish()));
+        take.start_tick = 500;
+        take.end_tick = 100;
+        ChangeBuilder reversed(document, "take");
+        reversed.append(TakeInsert{0, take});
+        CHECK_FALSE(apply_change_set(document, reversed.finish()));
+        CHECK(document.takes.empty());
+    }
+}

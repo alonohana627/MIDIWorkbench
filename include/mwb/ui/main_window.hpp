@@ -97,6 +97,8 @@ private:
     /// input. `override`: the event is the ShortcutOverride, else the KeyPress. Returns the
     /// eventFilter result when the key was routed, nullopt to continue normally.
     std::optional<bool> route_control_key(QKeyEvent& key, QWidget& focus, bool override);
+    /// Line edits, spin boxes, text editors and an open combo popup: they keep typed characters.
+    [[nodiscard]] static bool is_text_input(QWidget& focus);
     void build_actions();
     void build_menus();
     void build_docks();
@@ -203,6 +205,9 @@ private:
     /// Widget that last received focus from the keyboard (Tab, Backtab, a shortcut); Space
     /// activates it when it is a button or a check cell, a mouse-focused control leaves Space to Play.
     QPointer<QWidget> keyboard_focus_;
+    QLabel* step_label_ = nullptr; ///< "STEP" while step recording is armed.
+    std::chrono::steady_clock::time_point clip_until_{}; ///< "! CLIP" stays visible until then.
+    bool audio_was_lost_ = false;
     std::chrono::steady_clock::time_point position_key_down_{};
     /// Library item and revision each tab was opened from (for saving new revisions).
     std::map<const EditorTab*, std::pair<std::int64_t, std::int64_t>> library_sources_;

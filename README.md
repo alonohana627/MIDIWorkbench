@@ -72,7 +72,9 @@ multi-sequence file.
 | Space | Play from the edit cursor / stop and return to where playback started |
 | Ctrl+Space / Shift+Space | Pause and resume in place / play from the selection |
 | Home / End | Go to the start / the end of the song (also while playing) |
-| R | Record (with the count-in chosen in the Transport menu) |
+| R | Record (with the count-in chosen in the Transport menu); while playing, R punches in at the playhead and R again punches out |
+| Ctrl+Shift+R | Arm or disarm step recording (notes go in at the edit cursor; "STEP" shows in the status bar) |
+| Tab, then Return or Space | Press the focused button, tick a check box, open a panel section or toggle Mute/Solo |
 | 1 / 2 / 3 / 4 / 5 | Select / Draw / Erase / Split / Audition tool |
 | B | Toggle Draw and Select |
 | Ctrl+1 / Ctrl+2 / Ctrl+3 | Show or hide Library / Inspector / Event List |

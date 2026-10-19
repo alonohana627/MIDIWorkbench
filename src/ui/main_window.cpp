@@ -154,10 +154,32 @@ MainWindow::MainWindow(StartupOptions options, app::DataDirectories directories,
     tabs_->setDocumentMode(true);
     tabs_->setAccessibleName(tr("Open documents"));
     setCentralWidget(tabs_);
-    playback_ = create_playback_service(nullptr); // owned by the unique_ptr
+    // The output opens in the background (the window never waits for a device); the chosen
+    // output is remembered across sessions.
+    {
+        const QString saved = QSettings().value("audio/device").toString();
+        playback_ = create_playback_service(nullptr, saved.isEmpty() ? std::nullopt : std::optional<std::string>(saved.toStdString()));
+    }
+    connect(playback_.get(), &PlaybackService::device_lost, this,
+            [this](const QString& reason) { statusBar()->showMessage(reason, 15000); });
+    connect(playback_.get(), &PlaybackService::playback_refused, this,
+            [this](const QString& reason) { statusBar()->showMessage(reason, 10000); });
+    connect(playback_.get(), &PlaybackService::device_changed, this, [this] {
+        const auto display = playback_->display();
+        if (!display.opening && playback_->has_device() && audio_was_lost_)
+            statusBar()->showMessage(tr("Audio output reconnected: %1").arg(display.device_description), 6000);
+        audio_was_lost_ = display.state == TransportDisplay::State::device_lost || (!display.opening && !playback_->has_device());
+        update_status_from_transport();
+    });
     computer_keyboard_ = new ComputerKeyboardPlayer(this);
     recording_ = new RecordingController(*playback_, this);
     connect(recording_, &RecordingController::status_message, this, [this](const QString& text) { statusBar()->showMessage(text, 8000); });
+    connect(recording_, &RecordingController::input_changed, this, [this](const QString& name, const QString& error) {
+        if (!error.isEmpty())
+            statusBar()->showMessage(tr("MIDI input: %1").arg(error), 8000);
+        else if (!name.isEmpty())
+            statusBar()->showMessage(tr("MIDI input: %1").arg(name), 5000);
+    });
     build_docks();
     library_->set_drag_cache(directories_.drag_cache);
     io_thread_ = std::make_unique<TaskThread>();
@@ -190,6 +212,14 @@ MainWindow::MainWindow(StartupOptions options, app::DataDirectories directories,
     snap_label_ = new QLabel(this);
     device_label_ = new QLabel(this);
     recovery_label_ = new QLabel(this);
+    // Armed step recording is a mode: it stays visible while it lasts (section 8.5).
+    step_label_ = new QLabel(tr("● STEP"), this);
+    step_label_->setToolTip(tr("Step recording is armed: notes you play are entered at the edit cursor"));
+    step_label_->setAccessibleName(tr("Step recording armed"));
+    step_label_->setForegroundRole(QPalette::Highlight);
+    step_label_->setContentsMargins(4, 0, 4, 0);
+    statusBar()->addPermanentWidget(step_label_);
+    step_label_->hide();
     // Readouts are permanent sections: transient messages never hide them.
     cursor_label_->setFont(mono_font());
     cursor_label_->setMinimumWidth(190);
@@ -283,6 +313,10 @@ MainWindow::MainWindow(StartupOptions options, app::DataDirectories directories,
 MainWindow::~MainWindow() {
     transport_timer_.stop();
     recovery_timer_.stop();
+    // The recording controller's input monitor thread sends to the playback service: stop it
+    // before the service (a member) goes, not later with the child objects.
+    delete recording_;
+    recording_ = nullptr;
     playback_->panic(false);
     io_thread_.reset(); // joins a pending open or export
     drain_recovery_thread(); // queued clean closes land before the process ends
@@ -519,6 +553,7 @@ void MainWindow::build_actions() {
                                      ? tr("Playing mode on: A W S E D F T G Y H U J K play notes; Z/X octave; C/V velocity")
                                      : tr("Playing mode off"),
                                  5000);
+        update_command_state(); // letters re-enabled only where they apply (Loop needs a loop region)
     });
     playing_mode_action_->setCheckable(true);
 
@@ -564,34 +599,99 @@ void MainWindow::build_actions() {
     });
     record_action_->setCheckable(true);
     connect(recording_, &RecordingController::recording_changed, record_action_, &QAction::setChecked);
-    step_action_ = add_command("transport.step_record", tr("Step Recording"), {}, [this] {
-        recording_->set_step_recording(step_action_->isChecked());
-    });
+    step_action_ = add_command("transport.step_record", tr("Step Recording"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_R),
+                               [this] { recording_->set_step_recording(step_action_->isChecked()); });
     step_action_->setCheckable(true);
+    step_action_->setToolTip(tr("Step recording: enter notes one step at a time at the edit cursor"));
+    // The check mark always shows the real state (arming can fail; switching documents disarms).
+    connect(recording_, &RecordingController::step_recording_changed, this, [this](bool armed) {
+        step_action_->setChecked(armed);
+        if (step_label_)
+            step_label_->setVisible(armed);
+    });
     add_command("transport.step_rest", tr("Step Rest"), QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_Right), [this] { recording_->step_rest(); });
     add_command("transport.step_tie", tr("Step Tie"), QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_T), [this] { recording_->step_tie(); });
     add_command("transport.step_back", tr("Step Back"), QKeySequence(Qt::CTRL | Qt::Key_Backspace), [this] { recording_->step_back(); });
-    for (int bars = 0; bars <= 2; ++bars)
-        add_command(QString("transport.count_in_%1").arg(bars), tr("Count-in %n bar(s)", nullptr, bars), {},
-                    [this, bars] { recording_->set_count_in_bars(bars); });
+    {
+        // One checked choice, remembered across sessions, so the menu shows the current count-in.
+        auto* count_in_group = new QActionGroup(this);
+        const int saved = std::clamp(QSettings().value("recording/count_in_bars", 1).toInt(), 0, 2);
+        recording_->set_count_in_bars(saved);
+        for (int bars = 0; bars <= 2; ++bars) {
+            auto* action = add_command(QString("transport.count_in_%1").arg(bars), tr("Count-in %n bar(s)", nullptr, bars), {},
+                                       [this, bars] {
+                                           recording_->set_count_in_bars(bars);
+                                           QSettings().setValue("recording/count_in_bars", bars);
+                                       });
+            action->setCheckable(true);
+            action->setChecked(bars == saved);
+            count_in_group->addAction(action);
+        }
+    }
+    {
+        // Measured input latency (section 8.4 rule 4), applied once to every recorded message.
+        const int saved = std::clamp(QSettings().value("recording/latency_ms", 0).toInt(), 0, 500);
+        recording_->set_latency_compensation(std::chrono::milliseconds(saved));
+        add_command("transport.input_latency", tr("Input Latency Compensation…"), {}, [this] {
+            bool accepted = false;
+            const int current = QSettings().value("recording/latency_ms", 0).toInt();
+            const int value = QInputDialog::getInt(this, tr("Input Latency Compensation"),
+                                                   tr("Milliseconds to move recorded notes earlier (0 when unsure):"),
+                                                   current, 0, 500, 1, &accepted);
+            if (!accepted)
+                return;
+            QSettings().setValue("recording/latency_ms", value);
+            recording_->set_latency_compensation(std::chrono::milliseconds(value));
+            statusBar()->showMessage(tr("Input latency compensation: %1 ms").arg(value), 4000);
+        });
+    }
     add_command("transport.midi_input", tr("Choose MIDI Input…"), {}, [this] {
-        const auto ports = recording_->input_ports();
-        QStringList names{tr("None")};
-        for (const auto& [id, name] : ports)
-            names << name;
+        // Listing and opening run on the recording controller's device thread; the dialog opens
+        // when the list arrives (the window never waits for a MIDI driver).
+        statusBar()->showMessage(tr("Looking for MIDI inputs…"), 3000);
+        recording_->list_input_ports([this](RecordingController::PortList ports, QString error) {
+            if (ports.empty() && !error.isEmpty()) {
+                QMessageBox::warning(this, tr("MIDI Input"), error);
+                return;
+            }
+            QStringList names{tr("None")};
+            for (const auto& [id, name] : ports)
+                names << name;
+            bool chosen = false;
+            const QString name = QInputDialog::getItem(this, tr("MIDI Input"), tr("Input device"), names, 0, false, &chosen);
+            if (!chosen)
+                return;
+            QString id;
+            for (const auto& [port_id, port_name] : ports)
+                if (port_name == name)
+                    id = port_id;
+            recording_->open_input(id);
+        });
+    });
+    add_command("transport.audio_output", tr("Audio &Output…"), {}, [this] {
+        const auto devices = playback_->audio_devices();
+        QStringList names{tr("Default output")};
+        for (const auto& device : devices)
+            names << device.name;
+        const QString saved = QSettings().value("audio/device").toString();
+        int current = 0;
+        for (std::size_t index = 0; index < devices.size(); ++index)
+            if (QString::fromStdString(devices[index].id) == saved)
+                current = static_cast<int>(index) + 1;
         bool chosen = false;
-        const QString name = QInputDialog::getItem(this, tr("MIDI Input"), tr("Input device"), names, 0, false, &chosen);
+        const QString name = QInputDialog::getItem(this, tr("Audio Output"), tr("Output device"), names, current, false, &chosen);
         if (!chosen)
             return;
-        QString id;
-        for (const auto& [port_id, port_name] : ports)
-            if (port_name == name)
-                id = port_id;
-        QString error;
-        if (!recording_->open_input(id, &error))
-            QMessageBox::warning(this, tr("MIDI Input"), tr("Could not open %1: %2").arg(name, error));
-        else
-            statusBar()->showMessage(tr("MIDI input: %1").arg(recording_->input_name()), 5000);
+        std::optional<std::string> id;
+        for (const auto& device : devices)
+            if (device.name == name)
+                id = device.id;
+        QSettings().setValue("audio/device", id ? QString::fromStdString(*id) : QString());
+        playback_->reopen_device(id); // opens in the background; the status bar reports the result
+    });
+    add_command("transport.reconnect_audio", tr("Reconnect Audio Output"), {}, [this] {
+        const QString saved = QSettings().value("audio/device").toString();
+        playback_->reopen_device(saved.isEmpty() ? std::nullopt : std::optional<std::string>(saved.toStdString()));
     });
     add_command("help.about", tr("&About MIDI Workbench"), {}, [this] { show_about(); });
     add_command("help.shortcuts", tr("Keyboard &Shortcuts…"), {}, [this] {
@@ -683,7 +783,8 @@ void MainWindow::build_menus() {
                                                 "transport.position_left", "transport.position_right",
                                                 nullptr, "transport.loop", "transport.metronome",
                                                 nullptr, "transport.record", "transport.count_in_0", "transport.count_in_1",
-                                                "transport.count_in_2", "transport.midi_input", nullptr,
+                                                "transport.count_in_2", "transport.input_latency", "transport.midi_input", nullptr,
+                                                "transport.audio_output", "transport.reconnect_audio", nullptr,
                                                 "transport.step_record", "transport.step_rest", "transport.step_tie",
                                                 "transport.step_back", nullptr, "transport.panic"});
     add(menuBar()->addMenu(tr("&Help")), {"help.shortcuts", "help.diagnostics", "help.about"});
@@ -811,6 +912,7 @@ void MainWindow::build_toolbar() {
     }
     add("transport.pause_resume", IconId::pause);
     add("transport.record", IconId::record);
+    add("transport.step_record", IconId::step_record);
     add("transport.loop", IconId::loop);
     add("transport.metronome", IconId::metronome);
     auto* tempo_label = new QLabel(tr(" Speed × "), this);
@@ -1071,6 +1173,14 @@ void MainWindow::connect_tab(EditorTab* tab) {
             [this](const QString& message) { statusBar()->showMessage(message, 8000); });
     connect(&view, &PianoRollView::status_message, this, [this](const QString& text) { statusBar()->showMessage(text, 4000); });
     connect(&view, &PianoRollView::tool_changed, this, &MainWindow::update_command_state);
+    connect(&view, &PianoRollView::seek_requested, this, [this, tab](Tick tick) {
+        // A ruler click moves playback too, as in a DAW (ux-editing-8); never while recording.
+        const auto display = playback_->display();
+        if (&tab->controller() != transport_owner_ || display.state != TransportDisplay::State::playing)
+            return;
+        playback_->seek(tick);
+        play_started_from_ = tick; // Space now stops back here
+    });
     connect(tab, &EditorTab::status_message, this, [this](const QString& text) { statusBar()->showMessage(text, 6000); });
     connect(&view, &PianoRollView::hover_changed, this, [this, tab](Tick tick, int pitch) {
         cursor_label_->setText(QString("%1  %2 (%3)")
@@ -1779,6 +1889,10 @@ void MainWindow::play_from_selection() {
     auto* tab = current_tab();
     if (!tab)
         return;
+    if (recording_->recording()) {
+        statusBar()->showMessage(tr("Stop recording to move the playhead"), 4000); // section 13.3
+        return;
+    }
     const auto notes = tab->controller().selected_notes();
     Tick start = tab->controller().edit_cursor();
     if (!notes.empty())
@@ -1901,8 +2015,13 @@ void MainWindow::update_status_from_transport() {
     }
     // Short readout; the full device description is in the tooltip. Warnings use "!" not color alone.
     const QString device = display.device_description;
+    // Only this timer reads the meters, so a clip is never swallowed by another caller; the
+    // warning stays up for 2 s.
+    if (playback_->take_meters().clipped)
+        clip_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    const bool clipped = std::chrono::steady_clock::now() < clip_until_;
     device_label_->setText(tr("Audio: %1").arg(device.section(QString::fromUtf8(" · "), 0, 0)) +
-                           (display.clipped ? tr("  ! CLIP") : QString()) +
+                           (clipped ? tr("  ! CLIP") : QString()) +
                            (display.underflows ? tr("  ! %1 underflows").arg(display.underflows) : QString()));
     device_label_->setToolTip(device);
 }
@@ -1948,6 +2067,19 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
         else if (reason == Qt::MouseFocusReason || reason == Qt::OtherFocusReason)
             keyboard_focus_ = nullptr; // window activation and popups keep the previous state
     }
+    // Playing mode plays from the computer keyboard wherever the focus is in this window (track
+    // list, panels, buttons), except in text input and modal dialogs (section 8.2). Releases are
+    // always delivered, so a note never sticks when the focus moves while a key is held.
+    if ((event->type() == QEvent::KeyPress || event->type() == QEvent::KeyRelease) && computer_keyboard_ &&
+        computer_keyboard_->enabled()) {
+        QWidget* focus = QApplication::focusWidget();
+        const bool press = event->type() == QEvent::KeyPress;
+        const bool ours = focus && (isAncestorOf(focus) || (qobject_cast<QDockWidget*>(focus->window()) &&
+                                                            focus->window()->parentWidget() == this));
+        if (ours && watched == focus && (!press || (!is_text_input(*focus) && !QApplication::activeModalWidget())))
+            if (computer_keyboard_->handle_key(static_cast<QKeyEvent*>(event), press))
+                return true;
+    }
     if (event->type() == QEvent::ShortcutOverride || event->type() == QEvent::KeyPress) {
         auto* key = static_cast<QKeyEvent*>(event);
         QWidget* focus = QApplication::focusWidget();
@@ -1961,6 +2093,13 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
     return QMainWindow::eventFilter(watched, event);
 }
 
+bool MainWindow::is_text_input(QWidget& focus) {
+    // An item view's cell editor is a QLineEdit, so editing a cell counts too.
+    auto* combo = qobject_cast<QComboBox*>(&focus);
+    return qobject_cast<QLineEdit*>(&focus) || qobject_cast<QAbstractSpinBox*>(&focus) || focus.inherits("QPlainTextEdit") ||
+           focus.inherits("QTextEdit") || (combo && combo->view() && combo->view()->isVisible());
+}
+
 std::optional<bool> MainWindow::route_control_key(QKeyEvent& key, QWidget& focus, bool override) {
     const auto modifiers = key.modifiers() & ~(Qt::KeypadModifier | Qt::ShiftModifier);
     const int code = key.key();
@@ -1969,9 +2108,7 @@ std::optional<bool> MainWindow::route_control_key(QKeyEvent& key, QWidget& focus
     auto* button = qobject_cast<QAbstractButton*>(&focus);
     auto* view = qobject_cast<QAbstractItemView*>(&focus);
     auto* combo = qobject_cast<QComboBox*>(&focus);
-    const bool text_input = qobject_cast<QLineEdit*>(&focus) || qobject_cast<QAbstractSpinBox*>(&focus) ||
-                            focus.inherits("QPlainTextEdit") || focus.inherits("QTextEdit") ||
-                            (combo && combo->view() && combo->view()->isVisible()); // (an item view's editor is a QLineEdit)
+    const bool text_input = is_text_input(focus);
     const QModelIndex current = view ? view->currentIndex() : QModelIndex();
     const bool check_cell = current.isValid() && (current.flags() & Qt::ItemIsUserCheckable) &&
                             (current.flags() & Qt::ItemIsEnabled);

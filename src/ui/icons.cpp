@@ -165,6 +165,18 @@ void paint_icon(QPainter& painter, IconId id, const QColor& ink) {
         fill(dot, danger_color());
         break;
     }
+    case IconId::step_record: {
+        // Three rising steps with the record dot: note-by-note entry.
+        painter.drawLine(QPointF(3, 20), QPointF(8, 20));
+        painter.drawLine(QPointF(8, 20), QPointF(8, 15));
+        painter.drawLine(QPointF(8, 15), QPointF(13, 15));
+        painter.drawLine(QPointF(13, 15), QPointF(13, 10));
+        painter.drawLine(QPointF(13, 10), QPointF(18, 10));
+        QPainterPath dot;
+        dot.addEllipse(QPointF(18, 5.5), 3.5, 3.5);
+        fill(dot, danger_color());
+        break;
+    }
     case IconId::loop: {
         painter.drawArc(QRectF(4, 6, 16, 12), 30 * 16, 150 * 16);
         painter.drawArc(QRectF(4, 6, 16, 12), 210 * 16, 150 * 16);

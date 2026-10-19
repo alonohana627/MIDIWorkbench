@@ -20,6 +20,7 @@ enum class IconId {
     stop,
     rewind,
     record,
+    step_record,
     loop,
     metronome,
     library,

@@ -42,6 +42,10 @@ struct RecordingOptions {
     bool replace_range = false;            ///< Remove existing events inside the punch after acceptance.
     bool capture_held_notes = false;       ///< Notes begun before punch-in start at the boundary.
     std::optional<TimeRange> loop;         ///< Loop takes: notes held across the end are split.
+    /// Loop pass (counted by the transport since playback started) in which capture began, for a
+    /// punch-in while looping: the composed pass is never earlier. Unset: the pass of the first
+    /// captured message.
+    std::optional<std::int64_t> first_pass;
     std::int64_t latency_compensation_ns = 0; ///< Measured latency, applied once.
     std::uint8_t channel_filter_mask_low = 0xFF;  ///< Channels 1-8 accepted (bit per channel).
     std::uint8_t channel_filter_mask_high = 0xFF; ///< Channels 9-16 accepted.
@@ -79,9 +83,15 @@ public:
     [[nodiscard]] Result<RecordedTake> finish(const DocumentData& document, Tick stop_tick, std::string take_name);
 
     [[nodiscard]] std::size_t captured() const { return raw_.size(); }
+    /// Raw messages captured so far (for journaling full chunks while recording, section 21.2).
+    [[nodiscard]] std::span<const CapturedMessage> raw() const { return raw_; }
+    /// Identity the finished take will carry, fixed when recording starts so capture chunks
+    /// journaled during the take and the final TakeInsert refer to the same take.
+    [[nodiscard]] const TakeId& take_id() const { return take_id_; }
 
 private:
     TrackId track_;
+    TakeId take_id_ = TakeId::generate();
     RecordingOptions options_;
     std::function<Tick(std::int64_t)> time_to_tick_;
     std::vector<CapturedMessage> raw_;
@@ -118,6 +128,9 @@ public:
     [[nodiscard]] std::optional<ChangeSet> back(const DocumentData& document);
 
     [[nodiscard]] Tick cursor() const { return cursor_; }
+    /// Moves the insertion point (the user moved the edit cursor, section 8.5). Ignored while a
+    /// chord is being held, so a step always lands where it began; returns whether it moved.
+    bool set_cursor(Tick cursor);
     [[nodiscard]] const std::set<std::uint8_t>& held() const { return held_; }
 
 private:

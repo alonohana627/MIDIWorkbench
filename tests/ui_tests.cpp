@@ -3,6 +3,7 @@
 #include "mwb/core/note_edit.hpp"
 #include "mwb/app/environment.hpp"
 #include "mwb/core/serialization.hpp"
+#include "mwb/document/native_format.hpp"
 #include "mwb/document/recovery.hpp"
 #include "mwb/document/session.hpp"
 #include "mwb/platform/midi_backend.hpp"
@@ -23,6 +24,8 @@
 #include <QApplication>
 
 #include <chrono>
+#include <mutex>
+#include <QAction>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QKeyEvent>
@@ -467,7 +470,20 @@ public:
     void set_tempo_multiplier(double) override {}
     void audition_note_on(int, int, int, const std::string&) override {}
     void audition_note_off(int, int) override {}
+    void set_live_timbre(const std::string&) override {}
+    void monitor_message(std::span<const std::uint8_t> message) override {
+        std::lock_guard lock(monitor_mutex); // called on the input monitor thread
+        monitored.emplace_back(message.begin(), message.end());
+    }
+    std::vector<std::vector<std::uint8_t>> monitored_copy() {
+        std::lock_guard lock(monitor_mutex);
+        return monitored;
+    }
     void panic(bool) override {}
+    TransportMeters take_meters() override { return {}; }
+    void reopen_device(std::optional<std::string>) override {}
+    std::vector<AudioDeviceChoice> audio_devices() const override { return {}; }
+    void simulate_device_loss() override {}
     TransportDisplay display() const override {
         TransportDisplay display;
         display.state = state;
@@ -484,6 +500,8 @@ public:
     int stops = 0;
     int punch_outs = 0;
     int metronome_calls = 0;
+    std::mutex monitor_mutex;
+    std::vector<std::vector<std::uint8_t>> monitored;
 };
 
 /// Sends one live note message whose transport position is `tick`.
@@ -606,8 +624,7 @@ TEST_SUITE("recording") {
         application();
         auto playback = create_playback_service();
         REQUIRE(playback);
-        if (!playback->has_device())
-            return; // no audio backend in this environment
+        REQUIRE(wait_until([&] { return playback->has_device(); }, 5000)); // opens in the background (null backend in CTest)
         auto document = make_blank_document("Count-in");
         playback->set_tempo_multiplier(4.0); // 1 bar of 4/4 at 120 bpm lasts 0.5 s
         playback->publish_document(document, 0, 1);
@@ -951,8 +968,7 @@ TEST_SUITE("external_midi") {
         auto input = backend->open_input("null:in:loopback");
         REQUIRE(input);
         auto playback = create_playback_service();
-        if (!playback->has_device())
-            return; // no audio clock in this environment
+        REQUIRE(wait_until([&] { return playback->has_device(); }, 5000)); // opens in the background (null backend in CTest)
         DocumentData document = external_document();
         playback->publish_document(document, 0, 1);
         playback->play(0);
@@ -969,13 +985,316 @@ TEST_SUITE("external_midi") {
         auto input = backend->open_input("null:in:loopback");
         REQUIRE(input);
         auto playback = create_playback_service();
-        if (!playback->has_device())
-            return;
+        REQUIRE(wait_until([&] { return playback->has_device(); }, 5000)); // opens in the background (null backend in CTest)
         const DocumentData document = external_document();
         playback->publish_document(document, 0, 1);
         playback->play(0);
         REQUIRE(wait_for_message(**input, [](const auto& message) { return is_note_on(message, 60); }, 3000));
         playback.reset(); // the application quits mid-note
         CHECK(wait_for_message(**input, [](const auto& message) { return is_note_off(message, 60); }, 2000));
+    }
+}
+
+TEST_SUITE("audio_device") {
+    TEST_CASE("the device opens in the background; a lost output is reopened automatically and plays again") {
+        application();
+        auto playback = create_playback_service();
+        CHECK(playback->display().opening); // the constructor never waits for the device
+        REQUIRE(wait_until([&] { return playback->has_device(); }, 5000));
+        QSignalSpy lost(playback.get(), &PlaybackService::device_lost);
+        DocumentData document = make_blank_document("Device");
+        ChangeBuilder builder(document, "note");
+        builder.add_note(document.sequences.front().tracks.front().id, 0, 960 * 64, 0, 60, 100);
+        REQUIRE(apply_change_set(document, builder.finish()));
+        playback->publish_document(document, 0, 1);
+        playback->play(0);
+        REQUIRE(wait_until([&] { return playback->transport_tick_at(steady_ns()).has_value(); }, 3000));
+
+        playback->simulate_device_loss();
+        REQUIRE(wait_until([&] { return playback->display().state == TransportDisplay::State::device_lost; }, 2000));
+        CHECK(lost.count() == 1);
+        CHECK_FALSE(playback->has_device());
+        playback->play(0); // refused while no output is open
+        CHECK(playback->display().state == TransportDisplay::State::device_lost);
+
+        // Retried every 2 s: the (null) output comes back without restarting the app.
+        REQUIRE(wait_until([&] { return playback->has_device(); }, 6000));
+        CHECK(playback->display().state == TransportDisplay::State::stopped); // DeviceLost -> Reconfigure -> Stopped
+        playback->play(0);
+        CHECK(wait_until([&] { return playback->transport_tick_at(steady_ns()).has_value(); }, 3000));
+        playback->stop(0);
+    }
+
+    TEST_CASE("Play of a document the engine refuses ends at once with a reason") {
+        application();
+        auto playback = create_playback_service();
+        REQUIRE(wait_until([&] { return playback->has_device(); }, 5000));
+        QSignalSpy refused(playback.get(), &PlaybackService::playback_refused);
+        DocumentData document = make_blank_document("Dense");
+        std::vector<NewNote> notes;
+        for (int index = 0; index < 9000; ++index) // more note-ons in one block than the real-time budget
+            notes.push_back(NewNote{document.sequences.front().tracks.front().id, 0, 480,
+                                    static_cast<std::uint8_t>(index % 128), 100, static_cast<std::uint8_t>(index % 16), 0});
+        auto changes = insert_notes(document, notes);
+        REQUIRE(changes);
+        REQUIRE(apply_change_set(document, *changes));
+        playback->publish_document(document, 0, 1);
+        playback->play(0);
+        REQUIRE(wait_until([&] { return refused.count() > 0; }, 5000));
+        CHECK(playback->display().state == TransportDisplay::State::stopped); // not "Playing" with a frozen playhead
+        CHECK_FALSE(playback->display().playing_older_generation);
+    }
+
+    TEST_CASE("changing the speed while playing is heard at once") {
+        application();
+        auto playback = create_playback_service();
+        REQUIRE(wait_until([&] { return playback->has_device(); }, 5000));
+        DocumentData document = make_blank_document("Speed");
+        ChangeBuilder builder(document, "note");
+        builder.add_note(document.sequences.front().tracks.front().id, 0, 960 * 400, 0, 60, 100);
+        REQUIRE(apply_change_set(document, builder.finish()));
+        playback->publish_document(document, 0, 1);
+        playback->play(0);
+        REQUIRE(wait_until([&] { return playback->transport_tick_at(steady_ns()).has_value(); }, 3000));
+        const auto rate = [&] {
+            const std::int64_t now = steady_ns();
+            const auto first = playback->transport_tick_at(now);
+            const auto later = playback->transport_tick_at(now + 250'000'000);
+            return first && later ? *later - *first : Tick{-1};
+        };
+        CHECK(std::abs(rate() - 480) <= 2); // 120 BPM, PPQ 960: half a beat per 250 ms
+        playback->set_tempo_multiplier(2.0);
+        REQUIRE(wait_until([&] { return std::abs(rate() - 960) <= 2; }, 2000));
+        CHECK(playback->display().state == TransportDisplay::State::playing); // no restart, no stop
+        playback->stop(0);
+    }
+}
+
+TEST_SUITE("recording") {
+    TEST_CASE("MIDI input opens in the background and is monitored off the GUI thread, pedal and bend included") {
+        auto controller = make_controller();
+        FakePlayback playback;
+        RecordingController recording(playback);
+        recording.set_target(controller.get(), nullptr);
+        QSignalSpy changed(&recording, &RecordingController::input_changed);
+        recording.open_input("null:in:loopback");
+        CHECK(changed.count() == 0); // the open runs on the device thread
+        REQUIRE(wait_until([&] { return changed.count() > 0; }, 3000));
+        CHECK(changed.at(0).at(1).toString().isEmpty()); // no error
+        CHECK(recording.input_name() == "Null Loopback In");
+
+        auto backend = platform::create_null_midi_backend();
+        auto output = backend->open_output("null:out:loopback");
+        REQUIRE(output);
+        const std::array<std::array<std::uint8_t, 3>, 4> sent = {{{0x90, 60, 100}, {0xB0, 64, 127}, {0xE0, 0, 80}, {0x80, 60, 0}}};
+        for (const auto& message : sent)
+            REQUIRE((*output)->send(message));
+        // Every channel message reaches the monitor (on its own thread), sustain and bend too.
+        REQUIRE(wait_until([&] { return playback.monitored_copy().size() == sent.size(); }, 3000));
+        const auto monitored = playback.monitored_copy();
+        CHECK(monitored[1] == std::vector<std::uint8_t>{0xB0, 64, 127});
+        CHECK(monitored[2] == std::vector<std::uint8_t>{0xE0, 0, 80});
+
+        // The GUI still gets the messages for recording: a take started now records the input.
+        QTest::qWait(50); // the earlier messages reach the GUI before the take starts
+        recording.set_count_in_bars(0);
+        recording.toggle_recording();
+        playback.clock = 480;
+        REQUIRE((*output)->send(std::array<std::uint8_t, 3>{0x90, 64, 90}));
+        QTest::qWait(100);
+        playback.clock = 960;
+        REQUIRE((*output)->send(std::array<std::uint8_t, 3>{0x80, 64, 0}));
+        QTest::qWait(100);
+        recording.toggle_recording();
+        REQUIRE(controller->notes().notes.size() == 1);
+        CHECK(controller->notes().notes[0].pitch == 64);
+        recording.open_input(QString()); // closes; the monitor thread stops
+        CHECK(recording.input_name() == "none");
+    }
+
+    TEST_CASE("step recording follows the edit cursor and its armed state is signalled") {
+        auto controller = make_controller();
+        FakePlayback playback;
+        RecordingController recording(playback);
+        recording.set_target(controller.get(), nullptr);
+        QSignalSpy armed(&recording, &RecordingController::step_recording_changed);
+        controller->set_edit_cursor(0);
+        recording.set_step_recording(true);
+        REQUIRE(armed.count() == 1);
+        CHECK(armed.at(0).at(0).toBool());
+        controller->set_edit_cursor(3840); // the user clicks the ruler at bar 2
+        recording.live_note(60, 100, true);
+        recording.live_note(60, 0, false);
+        REQUIRE(controller->notes().notes.size() == 1);
+        CHECK(controller->notes().notes[0].start == 3840); // not at the cursor where it was armed
+        auto other = make_controller();
+        recording.set_target(other.get(), nullptr); // switching documents disarms
+        CHECK_FALSE(recording.step_recording());
+        CHECK_FALSE(armed.last().at(0).toBool());
+    }
+
+    TEST_CASE("full take chunks are journaled while recording, so a crash keeps the performance") {
+        test::TemporaryDirectory directory;
+        auto controller = make_controller();
+        auto journal = document::RecoveryJournal::create(directory.path(), controller->document(),
+                                                         document::SourceReference{"Take", {}, {}, {}});
+        REQUIRE(journal);
+        std::shared_ptr<document::RecoveryJournal> shared = std::move(*journal);
+        controller->attach_recovery(shared);
+        FakePlayback playback;
+        RecordingController recording(playback);
+        recording.set_target(controller.get(), nullptr);
+        recording.set_count_in_bars(0);
+        recording.toggle_recording();
+        for (int index = 0; index < 2100; ++index) { // 4200 messages: one full chunk of 4096
+            live(recording, playback, index * 10, 60 + index % 12, true);
+            live(recording, playback, index * 10 + 5, 60 + index % 12, false);
+        }
+        REQUIRE(shared->flush(true));
+        const Uuid session = shared->session_id();
+        shared.reset();
+        controller->attach_recovery(nullptr); // simulated crash: the journal is dropped, never closed
+        const auto recovered = document::recover_session(directory.path(), session);
+        REQUIRE_MESSAGE(recovered, (recovered ? "" : recovered.error().describe()));
+        REQUIRE(recovered->document.takes.size() == 1);
+        CHECK(recovered->document.takes[0].status == TakeStatus::interrupted);
+        REQUIRE(recovered->document.takes[0].chunks.size() == 1);
+        const auto raw = app::decode_take_chunk(recovered->document.takes[0].chunks[0].payload);
+        REQUIRE(raw);
+        CHECK(raw->size() == app::take_chunk_messages);
+    }
+}
+
+TEST_SUITE("window") {
+    TEST_CASE("playing mode plays from the keyboard while the track list has focus") {
+        WindowFixture fixture;
+        auto* tab = fixture.window->current_tab();
+        auto* player = fixture.window->findChild<ComputerKeyboardPlayer*>();
+        auto* mode = fixture.window->findChild<QAction*>("view.playing_mode");
+        REQUIRE(player);
+        REQUIRE(mode);
+        mode->trigger();
+        REQUIRE(player->enabled());
+        QSignalSpy on(player, &ComputerKeyboardPlayer::note_on);
+        QSignalSpy off(player, &ComputerKeyboardPlayer::note_off);
+        auto* table = tab->track_list().findChild<QTableWidget*>();
+        REQUIRE(table);
+        table->setCurrentCell(0, 0);
+        table->setFocus(Qt::MouseFocusReason);
+        const std::string name = tab->controller().active_sequence().tracks.front().name;
+        fixture.key(Qt::Key_A);
+        CHECK(on.count() == 1);
+        CHECK(off.count() == 1);
+        CHECK(tab->controller().active_sequence().tracks.front().name == name); // no rename, no type-ahead
+        mode->trigger(); // off again
+        CHECK_FALSE(player->enabled());
+    }
+
+    TEST_CASE("a ruler click while playing moves playback there") {
+        WindowFixture fixture;
+        auto* tab = fixture.window->current_tab();
+        auto* label = fixture.window->findChild<QLabel*>("transport.position");
+        REQUIRE(label);
+        tab->piano_roll().setFocus();
+        fixture.key(Qt::Key_Space);
+        REQUIRE(wait_until([&] { return label->text().contains("Play"); }, 3000));
+        emit tab->piano_roll().seek_requested(8 * 3840); // what a click on bar 9 of the ruler sends
+        REQUIRE(wait_until([&] { return label->text().startsWith("9.") || label->text().startsWith("10."); }, 3000));
+        fixture.key(Qt::Key_Space); // Space now stops back at the clicked position
+        QTest::qWait(100);
+        CHECK(label->text().startsWith("9.1.000"));
+    }
+}
+
+// Reviewer probes for batch 1 (append to tests/ui_tests.cpp at commit d31afc4; they use the
+// FakePlayback, live() and make_controller() helpers defined there). Both FAIL at d31afc4.
+
+TEST_SUITE("reviewer_probe") {
+    // R1: the engine clock counts loop passes since PLAYBACK started; a punch-in in pass >= 1 that
+    // punches out in the same pass keeps pass (stop_pass - 1), which the take never saw.
+    TEST_CASE("probe: punch-in while looping in the third pass keeps the notes played in that pass") {
+        auto controller = make_controller();
+        FakePlayback playback;
+        playback.loop_range = TimeRange{0, 1920};
+        playback.play(500); // the loop is in its third pass; the folded playhead is at 500
+        RecordingController recording(playback);
+        recording.set_target(controller.get(), nullptr);
+        recording.toggle_recording(); // punch in at 500
+        REQUIRE(recording.recording());
+        live(recording, playback, 2 * 1920 + 600, 60, true); // linear engine ticks: two passes played
+        live(recording, playback, 2 * 1920 + 900, 60, false);
+        playback.clock = 2 * 1920 + 1200; // punch out in the same pass
+        recording.toggle_recording();
+        CHECK(controller->notes().notes.size() == 1); // d31afc4: 0
+    }
+
+    // R2: stop during the count-in from bar 1 -> stop_tick < 0 -> RecordingTake::start_tick < 0,
+    // which native validation rejects: Save, Save As and recovery checkpoints fail until undo.
+    TEST_CASE("probe: stopping during the count-in from bar 1 leaves a savable document") {
+        auto controller = make_controller();
+        FakePlayback playback;
+        RecordingController recording(playback);
+        recording.set_target(controller.get(), nullptr);
+        recording.set_count_in_bars(1);
+        controller->set_edit_cursor(0);
+        recording.toggle_recording();
+        REQUIRE(recording.recording());
+        live(recording, playback, -1500, 60, true);
+        playback.clock = -1000; // the user stops during the count-in
+        recording.toggle_recording();
+        test::TemporaryDirectory directory;
+        const auto saved = document::save_native(controller->document(), directory.path() / "probe.mwb");
+        CHECK(saved.has_value()); // d31afc4: "recording take has an invalid range" (take start -1000)
+    }
+}
+
+TEST_SUITE("recording") {
+    TEST_CASE("a punch-in while looping takes its first pass from the engine clock at the punch") {
+        auto controller = make_controller();
+        FakePlayback playback;
+        playback.loop_range = TimeRange{0, 1920};
+        playback.play(500);
+        RecordingController recording(playback);
+        recording.set_target(controller.get(), nullptr);
+        playback.clock = 3 * 1920 + 500; // the engine is in pass 3 when Record is pressed
+        recording.toggle_recording();
+        live(recording, playback, 4 * 1920 + 100, 62, true); // pass 4, the only complete pass
+        live(recording, playback, 4 * 1920 + 300, 62, false);
+        playback.clock = 5 * 1920 + 50; // punch out early in pass 5
+        recording.toggle_recording();
+        REQUIRE(controller->notes().notes.size() == 1);
+        CHECK(controller->notes().notes[0].start == 100);
+    }
+
+    TEST_CASE("stopping during the count-in keeps no take and leaves no undo entry") {
+        auto controller = make_controller();
+        FakePlayback playback;
+        RecordingController recording(playback);
+        recording.set_target(controller.get(), nullptr);
+        recording.set_count_in_bars(1);
+        controller->set_edit_cursor(0);
+        recording.toggle_recording();
+        playback.clock = -500;
+        recording.toggle_recording();
+        CHECK(controller->document().takes.empty());
+        CHECK_FALSE(controller->can_undo());
+    }
+}
+
+TEST_SUITE("audio_device") {
+    TEST_CASE("losing the device during the count-in shows the loss and plays nothing") {
+        application();
+        auto playback = create_playback_service();
+        REQUIRE(wait_until([&] { return playback->has_device(); }, 5000));
+        playback->set_tempo_multiplier(0.25); // a long count-in
+        playback->publish_document(make_blank_document("Count-in loss"), 0, 1);
+        REQUIRE(playback->record(0, 2));
+        REQUIRE(wait_until([&] { return playback->transport_tick_at(steady_ns()).has_value(); }, 3000));
+        CHECK(playback->display().state == TransportDisplay::State::counting_in);
+        playback->simulate_device_loss();
+        REQUIRE(wait_until([&] { return playback->display().state == TransportDisplay::State::device_lost; }, 2000));
+        CHECK_FALSE(playback->has_device());
+        CHECK_FALSE(playback->transport_tick_at(steady_ns()));
+        playback->stop(0);
     }
 }

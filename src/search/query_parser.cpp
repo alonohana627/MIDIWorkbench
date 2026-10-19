@@ -338,20 +338,15 @@ std::optional<KeyValue> parse_key(std::string_view raw) {
     const auto root = parse_pitch_class(root_text);
     if (!root)
         return std::nullopt;
-    const auto mode_text = ascii_lower(trim(text.substr(position)));
+    const auto mode_text = trim(text.substr(position));
     KeyValue key;
     key.root = *root;
     if (mode_text.empty())
         return key;
-    if (mode_text == "m" || mode_text == "min" || mode_text == "minor" || mode_text == "aeolian")
-        key.mode = "minor";
-    else if (mode_text == "maj" || mode_text == "major" || mode_text == "ionian")
-        key.mode = "major";
-    else if (mode_text == "dorian" || mode_text == "phrygian" || mode_text == "lydian" ||
-             mode_text == "mixolydian" || mode_text == "locrian")
-        key.mode = mode_text;
-    else
+    auto mode = normalize_key_mode(mode_text);
+    if (!mode)
         return std::nullopt;
+    key.mode = std::move(*mode);
     return key;
 }
 
@@ -524,7 +519,11 @@ Comparator comparator_from_text(std::string_view text) {
 }
 
 // Local propagation helper for the converter's expected<void, QueryError> checks.
-#define MWB_TRY_QUERY(expression)                                                                      do {                                                                                                   if (auto mwb_query_check_ = (expression); !mwb_query_check_)                                           return std::unexpected(std::move(mwb_query_check_).error());                               } while (false)
+#define MWB_TRY_QUERY(expression)                                                                  \
+    do {                                                                                           \
+        if (auto mwb_query_check_ = (expression); !mwb_query_check_)                               \
+            return std::unexpected(std::move(mwb_query_check_).error());                           \
+    } while (false)
 
 /// Converts the PEGTL parse tree into the typed AST, enforcing node and depth limits.
 class TreeConverter {
@@ -619,16 +618,11 @@ private:
         return {};
     }
 
-// Local propagation helper for the converter's expected<void, QueryError> checks.
-#define MWB_TRY_QUERY(expression)                                                                  \
-    do {                                                                                           \
-        if (auto mwb_query_check_ = (expression); !mwb_query_check_)                               \
-            return std::unexpected(std::move(mwb_query_check_).error());                           \
-    } while (false)
-
     const QueryLimits& limits_;
     std::size_t nodes_ = 0;
 };
+
+#undef MWB_TRY_QUERY
 
 /// Rejects parenthesis nesting beyond the limit before recursive parsing starts.
 std::optional<QueryError> check_nesting(std::string_view text, std::size_t max_depth) {
@@ -1064,6 +1058,17 @@ Result<Query> query_from_json(std::string_view json, const QueryLimits& limits) 
     query.root = std::move(*root);
     query.node_count = nodes;
     return query;
+}
+
+std::optional<std::string> normalize_key_mode(std::string_view text) {
+    const auto mode = ascii_lower(trim(text));
+    if (mode == "m" || mode == "min" || mode == "minor" || mode == "aeolian")
+        return std::string("minor");
+    if (mode == "maj" || mode == "major" || mode == "ionian")
+        return std::string("major");
+    if (mode == "dorian" || mode == "phrygian" || mode == "lydian" || mode == "mixolydian" || mode == "locrian")
+        return mode;
+    return std::nullopt;
 }
 
 } // namespace mwb::search

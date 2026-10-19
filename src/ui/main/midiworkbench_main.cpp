@@ -14,10 +14,32 @@
 
 #include <QApplication>
 #include <QIcon>
+#include <QMessageBox>
 #include <QSettings>
 #include <QStringList>
 
+#include <algorithm>
 #include <cstdio>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace {
+
+/// The executable uses the GUI subsystem: started from Explorer or a shortcut it has no console,
+/// so errors and --help are also shown in a message box. Headless runs (QT_QPA_PLATFORM set, as in
+/// tests and CI) keep stderr only.
+void report(const std::string& text, bool error) {
+    std::fprintf(error ? stderr : stdout, "%s\n", text.c_str());
+    if (qEnvironmentVariableIsSet("QT_QPA_PLATFORM"))
+        return;
+    if (error)
+        QMessageBox::critical(nullptr, QStringLiteral("MIDI Workbench"), QString::fromStdString(text));
+    else
+        QMessageBox::information(nullptr, QStringLiteral("MIDI Workbench"), QString::fromStdString(text));
+}
+
+} // namespace
 
 int main(int argc, char** argv) {
     QApplication application(argc, argv);
@@ -47,7 +69,12 @@ int main(int argc, char** argv) {
     try {
         command_line.parse(arguments);
     } catch (const CLI::ParseError& error) {
-        return command_line.exit(error);
+        // --help and --version are "errors" with exit code 0; both are shown, not only printed.
+        std::ostringstream out;
+        std::ostringstream err;
+        const int code = command_line.exit(error, out, err);
+        report(code == 0 ? out.str() : err.str() + out.str(), code != 0);
+        return code;
     }
 
     mwb::ui::StartupOptions options;
@@ -60,7 +87,7 @@ int main(int argc, char** argv) {
 
     const auto directories = mwb::app::resolve_data_directories(options.workspace);
     if (auto created = mwb::app::ensure_data_directories(directories); !created) {
-        std::fprintf(stderr, "error: %s\n", created.error().describe().c_str());
+        report("error: the data folder could not be created: " + created.error().describe(), true);
         return 3;
     }
     if (auto logging = mwb::app::start_logging(directories.logs); !logging)

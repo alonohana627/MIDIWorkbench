@@ -31,6 +31,10 @@ public:
     /// Applies one MIDI short message immediately (frame offsets are handled by the caller, which
     /// renders sub-segments between events). Non-MIDI kinds are ignored.
     virtual void dispatch(const playback::RealtimeMidiEvent& event) noexcept = 0;
+    /// Applies a live-input (audition or monitored input) message. Synths with a private
+    /// audition channel play it there, so auditioning never changes a document channel's timbre,
+    /// controllers or sustain; the default treats it as an ordinary message.
+    virtual void dispatch_live(const playback::RealtimeMidiEvent& event) noexcept { dispatch(event); }
     /// Renders `frame_count` frames and ADDS them into `interleaved_stereo` (L, R, L, R, ...).
     virtual void render(float* interleaved_stereo, std::uint32_t frame_count) noexcept = 0;
     /// Silences every voice quickly and resets controllers that could hold notes (sustain).

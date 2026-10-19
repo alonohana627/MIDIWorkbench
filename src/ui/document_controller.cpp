@@ -75,12 +75,7 @@ void DocumentController::flush_recovery_async() {
     recovery_flush_running_ = true;
     auto journal = journal_;
     QPointer<DocumentController> guard(this);
-    recovery_thread().post([journal, guard](std::stop_token) {
-        QString error;
-        if (auto status = journal->flush(false); !status)
-            error = QString::fromStdString(status.error().describe());
-        else if (const auto failure = journal->last_error())
-            error = QString::fromStdString(failure->describe());
+    const auto deliver = [guard](QString error) {
         QMetaObject::invokeMethod(
             qApp, // context outlives the task; the lambda checks the guard
             [guard, error] {
@@ -91,7 +86,21 @@ void DocumentController::flush_recovery_async() {
                 emit guard->recovery_flushed(error);
             },
             Qt::QueuedConnection);
-    });
+    };
+    const bool queued = recovery_thread().post(
+        [journal, deliver](std::stop_token) {
+            QString error;
+            if (auto status = journal->flush(true); !status)
+                error = QString::fromStdString(status.error().describe());
+            else if (const auto failure = journal->last_error())
+                error = QString::fromStdString(failure->describe());
+            deliver(error);
+        },
+        // A throwing flush (a storage exception the journal did not wrap) must not block every
+        // later flush of this document: the flag is cleared and the failure shown.
+        [deliver] { deliver(tr("the recovery database reported an unexpected error")); });
+    if (!queued)
+        recovery_flush_running_ = false;
 }
 
 void DocumentController::close_recovery() {
@@ -331,9 +340,10 @@ void DocumentController::set_selection(std::set<EventId> notes) {
 }
 
 void DocumentController::set_edit_cursor(Tick tick) {
-    if (tick == edit_cursor_)
+    const Tick clamped = std::max<Tick>(0, tick); // compared after clamping: no signal without a change
+    if (clamped == edit_cursor_)
         return;
-    edit_cursor_ = std::max<Tick>(0, tick);
+    edit_cursor_ = clamped;
     emit edit_cursor_changed(); // not view_state_changed: panels need not rebuild while scrubbing
 }
 

@@ -57,6 +57,25 @@ struct SchedulerSettings {
     std::size_t route_capacity = 256;     ///< Must cover PlaybackOptions::max_routes.
 };
 
+/// The scheduler's mapping from absolute frames to the snapshot timeline, published by the audio
+/// engine so other threads can place input events on the transport clock (recording, section 8.4
+/// rule 2). `passes` counts loop wraps since the last start and is not reset when a snapshot swap
+/// re-anchors the loop, so loop passes stay distinguishable across edits.
+struct SchedulerClock {
+    std::int64_t anchor = 0;     ///< Absolute frame of song frame 0 (or of loop iteration 0).
+    std::int64_t iteration = 0;  ///< Loop iteration relative to `anchor`.
+    std::int64_t passes = 0;     ///< Loop wraps since playback started.
+    bool looping = false;
+    bool playing = false;
+};
+
+/// Linear transport tick heard at `absolute_frame` under `clock`: the snapshot tick, plus
+/// `pass * loop length` for loop passes after the first so later passes are not folded onto the
+/// first one (the recorder folds them, section 8.4 rule 6). Frames before the snapshot origin (a
+/// count-in before tick 0) give negative ticks at the tempo in effect at tick 0.
+[[nodiscard]] Tick linear_tick_at(const PlaybackSnapshot& snapshot, const SchedulerClock& clock,
+                                  std::int64_t absolute_frame) noexcept;
+
 /// Summary of one processed block.
 struct BlockResult {
     std::size_t events = 0;      ///< Events delivered to the sink (including cleanup and chase).
@@ -83,7 +102,10 @@ public:
     /// keeps the old snapshot) when the snapshot has more routes than the configured capacity.
     [[nodiscard]] bool set_snapshot(const PlaybackSnapshot* snapshot, IEventSink& sink) noexcept;
     /// Starts playback at `tick` with controller chase (and held-note chase when configured).
-    void start(Tick tick, IEventSink& sink, std::uint32_t offset = 0) noexcept;
+    /// With `count_in_bars`, that many bars of metronome clicks (in the meter and tempo at `tick`)
+    /// play first and the song starts after them, so a count-in also works from tick 0 (section
+    /// 13.3 CountingIn). Count-in clicks sound whether or not the metronome is enabled.
+    void start(Tick tick, IEventSink& sink, std::uint32_t offset = 0, std::uint32_t count_in_bars = 0) noexcept;
     /// Seek: increments the epoch, releases owned notes and sustain, restores channel state and
     /// restarts at `tick` when playing; when stopped it only moves the position.
     void seek(Tick tick, IEventSink& sink, std::uint32_t offset = 0) noexcept;
@@ -104,6 +126,12 @@ public:
     /// First tick not yet played (the transport position).
     [[nodiscard]] Tick position_tick() const noexcept;
     [[nodiscard]] std::uint64_t epoch() const noexcept { return epoch_; }
+    /// True while count-in clicks play before the song starts.
+    [[nodiscard]] bool in_count_in() const noexcept { return playing_ && absolute_frame_ < count_in_end_; }
+    /// Current frame-to-timeline mapping (see SchedulerClock).
+    [[nodiscard]] SchedulerClock clock() const noexcept {
+        return SchedulerClock{anchor_, iteration_, passes_, looping_, playing_};
+    }
     [[nodiscard]] std::int64_t loop_iteration() const noexcept { return iteration_; }
     [[nodiscard]] bool looping() const noexcept { return looping_; }
     /// Absolute frame where loop iteration `iteration` starts (meaningful while looping).
@@ -122,6 +150,15 @@ private:
     void release_owned(IEventSink& sink, std::uint32_t offset) noexcept;
     void sustain_off(IEventSink& sink, std::uint32_t offset) noexcept;
     void chase_to(std::size_t event_index, Tick tick, IEventSink& sink, std::uint32_t offset) noexcept;
+    void chase_differences(IEventSink& sink) noexcept;
+    void setup_count_in(Tick tick, std::uint32_t bars, std::int64_t begin) noexcept;
+    [[nodiscard]] std::int64_t count_in_click_frame(std::uint32_t beat) const noexcept;
+    void click_seek(Tick tick) noexcept;
+    void click_advance() noexcept;
+    [[nodiscard]] bool click_pending() const noexcept;
+    [[nodiscard]] Tick click_tick() const noexcept;
+    [[nodiscard]] std::int64_t click_absolute_frame() const noexcept;
+    void emit_click(IEventSink& sink, std::uint32_t accent, std::uint32_t offset) noexcept;
     void anchor_at(Tick tick, std::int64_t absolute) noexcept;
     [[nodiscard]] std::int64_t event_absolute_frame(std::size_t index) const noexcept;
     [[nodiscard]] std::int64_t song_frame_at(std::int64_t absolute) const noexcept;
@@ -146,6 +183,23 @@ private:
     Tick stopped_tick_ = 0;
     std::uint64_t epoch_ = 0;
     std::size_t dropped_note_ons_ = 0;
+    std::int64_t passes_ = 0;
+
+    // Lazily generated metronome clicks: the next beat of the snapshot's beat grid.
+    std::size_t click_segment_ = 0;
+    std::int64_t click_beat_ = 0;
+    bool clicks_done_ = true;
+
+    // Count-in: `count_in_beats_` clicks from `count_in_start_`, each beat lasting
+    // count_in_beat_numerator_ / count_in_beat_denominator_ frames; the song starts at count_in_end_.
+    std::int64_t count_in_start_ = 0;
+    std::int64_t count_in_end_ = 0;
+    __int128 count_in_beat_numerator_ = 0;
+    __int128 count_in_beat_denominator_ = 1;
+    std::uint32_t count_in_beats_ = 0;
+    std::uint32_t count_in_next_ = 0;
+    ClickSegment count_in_grid_;
+    Tick count_in_tick_ = 0;
 };
 
 } // namespace mwb::playback

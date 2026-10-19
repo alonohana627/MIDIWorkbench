@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -113,6 +114,10 @@ struct FeatureVector {
 
 /// Feature vectors per sequence (finite values only).
 [[nodiscard]] Result<std::vector<FeatureVector>> compute_feature_vectors(const DocumentData& document);
+/// The same from motif streams already extracted with compute_motif_streams (analysis computes
+/// them once for both the motif index and the features).
+[[nodiscard]] Result<std::vector<FeatureVector>> compute_feature_vectors(const DocumentData& document,
+                                                                         std::span<const search::MotifStream> streams);
 
 /// Motif streams of every sequence with the default extraction profile.
 [[nodiscard]] Result<std::vector<search::MotifStream>> compute_motif_streams(const DocumentData& document);

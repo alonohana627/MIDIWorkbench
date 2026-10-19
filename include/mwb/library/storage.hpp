@@ -71,7 +71,8 @@ class ObjectStore {
 public:
     explicit ObjectStore(std::filesystem::path library_root);
 
-    /// Path of an object; generated from the hash and a known extension only.
+    /// Path of an object; generated from the hash and a known extension only (an unknown
+    /// extension yields a path inside the object directory that never exists).
     [[nodiscard]] std::filesystem::path object_path(const Sha256Digest& sha256, std::string_view extension) const;
 
     /// Publishes a flushed staging file under its hash. If the object already exists its size is

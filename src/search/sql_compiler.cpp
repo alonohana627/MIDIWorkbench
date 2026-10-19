@@ -72,18 +72,28 @@ constexpr std::int64_t count_maximum = std::numeric_limits<std::int64_t>::max();
 const NumericCondition& numeric(const Predicate& predicate) { return std::get<NumericCondition>(predicate.value); }
 const std::string& text_value(const Predicate& predicate) { return std::get<std::string>(predicate.value); }
 
-/// Channel mask (bit c-1 for display channel c) selected by the condition.
-std::int64_t channel_mask(const NumericCondition& condition) {
-    const auto interval = integer_interval(condition, 1, 16);
-    std::int64_t mask = 0;
-    for (auto channel = interval.low; channel <= interval.high; ++channel)
-        mask |= std::int64_t{1} << (channel - 1);
-    return mask;
+/// `(s.revision_id, s.sequence_no) IN (sequence_fact rows of one kind ...)`: the list facts
+/// (event classes, meters, tempos, channels, programs) live in an indexed side table, so a
+/// selective fact drives the sequence lookup instead of parsing JSON for every summary row.
+void fact_condition_begin(SqlBuilder& builder, std::string_view kind) {
+    builder.append(std::format("(s.revision_id, s.sequence_no) IN (SELECT f.revision_id, f.sequence_no FROM "
+                               "sequence_fact AS f WHERE f.kind = '{}'",
+                               kind));
 }
 
-void json_member_equals(SqlBuilder& builder, std::string_view path, SqlValue value) {
-    builder.append(std::format("EXISTS (SELECT 1 FROM json_each(s.diagnostics_json, '{}') AS j WHERE j.value = ", path));
+void fact_equals(SqlBuilder& builder, std::string_view kind, SqlValue value) {
+    fact_condition_begin(builder, kind);
+    builder.append(" AND f.value = ");
     builder.parameter(std::move(value));
+    builder.append(")");
+}
+
+void fact_between(SqlBuilder& builder, std::string_view kind, std::int64_t low, std::int64_t high) {
+    fact_condition_begin(builder, kind);
+    builder.append(" AND f.value BETWEEN ");
+    builder.parameter(low);
+    builder.append(" AND ");
+    builder.parameter(high);
     builder.append(")");
 }
 
@@ -95,14 +105,14 @@ void sequence_predicate(SqlBuilder& builder, const Predicate& predicate) {
         return;
     case Field::tempo_any: {
         const auto interval = real_interval(numeric(predicate));
-        builder.append("(s.tempo_min IS NOT NULL AND EXISTS (SELECT 1 FROM json_each(s.diagnostics_json, '$.tempos') "
-                       "AS j WHERE 1");
+        builder.append("(s.tempo_min IS NOT NULL AND ");
+        fact_condition_begin(builder, "tempo");
         if (interval.has_low) {
-            builder.append(interval.low_open ? " AND j.value > " : " AND j.value >= ");
+            builder.append(interval.low_open ? " AND f.value > " : " AND f.value >= ");
             builder.parameter(interval.low);
         }
         if (interval.has_high) {
-            builder.append(interval.high_open ? " AND j.value < " : " AND j.value <= ");
+            builder.append(interval.high_open ? " AND f.value < " : " AND f.value <= ");
             builder.parameter(interval.high);
         }
         builder.append("))");
@@ -117,7 +127,8 @@ void sequence_predicate(SqlBuilder& builder, const Predicate& predicate) {
         builder.append("(s.key_root = ");
         builder.parameter(std::int64_t{key.root});
         if (!key.mode.empty()) {
-            builder.append(" AND s.key_mode = ");
+            // Two-valued like the browse index: a missing mode never matches, also under NOT.
+            builder.append(" AND coalesce(s.key_mode, '') = ");
             builder.parameter(key.mode);
         }
         builder.append(" AND s.key_origin <> 'unknown' AND (s.key_origin <> 'estimated' OR (s.key_confidence IS NOT "
@@ -141,7 +152,7 @@ void sequence_predicate(SqlBuilder& builder, const Predicate& predicate) {
         return;
     case Field::meter: {
         const auto& meter = std::get<MeterValue>(predicate.value);
-        json_member_equals(builder, "$.meter_names", std::format("{}/{}", meter.numerator, meter.denominator));
+        fact_equals(builder, "meter", std::format("{}/{}", meter.numerator, meter.denominator));
         return;
     }
     case Field::tracks:
@@ -157,15 +168,13 @@ void sequence_predicate(SqlBuilder& builder, const Predicate& predicate) {
         integer_condition(builder, "s.max_pitch", integer_interval(numeric(predicate), 0, 127));
         return;
     case Field::channel: {
-        const auto mask = channel_mask(numeric(predicate));
-        if (mask == 0) {
+        // Facts store display channels 1-16 (bit c-1 of track_summary.channel_mask).
+        const auto interval = integer_interval(numeric(predicate), 1, 16);
+        if (interval.empty()) {
             builder.append("0");
             return;
         }
-        builder.append("EXISTS (SELECT 1 FROM track_summary AS t WHERE t.revision_id = s.revision_id AND "
-                       "t.sequence_no = s.sequence_no AND (t.channel_mask & ");
-        builder.parameter(mask);
-        builder.append(") <> 0)");
+        fact_between(builder, "channel", interval.low, interval.high);
         return;
     }
     case Field::program: {
@@ -174,13 +183,7 @@ void sequence_predicate(SqlBuilder& builder, const Predicate& predicate) {
             builder.append("0");
             return;
         }
-        builder.append("EXISTS (SELECT 1 FROM track_summary AS t, json_each(t.program_json) AS j WHERE "
-                       "t.revision_id = s.revision_id AND t.sequence_no = s.sequence_no AND json_extract(j.value, '$.program') "
-                       "BETWEEN ");
-        builder.parameter(interval.low - 1);
-        builder.append(" AND ");
-        builder.parameter(interval.high - 1);
-        builder.append(")");
+        fact_between(builder, "program", interval.low - 1, interval.high - 1);
         return;
     }
     case Field::drums:
@@ -188,7 +191,7 @@ void sequence_predicate(SqlBuilder& builder, const Predicate& predicate) {
         builder.parameter(std::int64_t{std::get<bool>(predicate.value) ? 1 : 0});
         return;
     case Field::has:
-        json_member_equals(builder, "$.event_classes", text_value(predicate));
+        fact_equals(builder, "event", text_value(predicate));
         return;
     case Field::any_text:
     case Field::tag:
@@ -230,9 +233,17 @@ void sequence_expression(SqlBuilder& builder, const QueryNode& node) {
     }
 }
 
-/// EXISTS over the current head's sequences satisfying all `nodes` in the same sequence.
+/// True when the current head has a sequence satisfying all `nodes` in the same sequence.
+///
+/// Written as a membership test against an uncorrelated subquery rather than a correlated
+/// EXISTS: SQLite evaluates the subquery once (driven by summary_tempo, summary_key,
+/// summary_length, summary_notes, summary_duration or the sequence_fact key when a selective term
+/// allows) into an ephemeral index, and the keyset walk over the covering *_head index probes it
+/// per row without reading asset or summary rows. A correlated EXISTS read two random rows per
+/// asset and made zero-match queries walk the whole catalog at disk speed (0.6-1.3 s at L100K).
+/// coalesce keeps head-less assets two-valued (false, and true under NOT) as before.
 void sequence_exists(SqlBuilder& builder, const std::vector<const QueryNode*>& nodes) {
-    builder.append("EXISTS (SELECT 1 FROM sequence_summary AS s WHERE s.revision_id = a.current_revision_id");
+    builder.append("coalesce(a.current_revision_id, 0) IN (SELECT s.revision_id FROM sequence_summary AS s WHERE 1");
     for (const auto* node : nodes) {
         builder.append(" AND ");
         sequence_expression(builder, *node);
@@ -404,16 +415,17 @@ struct SortColumns {
 };
 
 SortColumns sort_columns(SortField field) {
+    // The *_head indexes cover current_revision_id for the musical membership tests.
     switch (field) {
     case SortField::modified:
-        return {"a.modified_ms", "asset_modified"};
+        return {"a.modified_ms", "asset_modified_head"};
     case SortField::created:
-        return {"a.created_ms", "asset_created"};
+        return {"a.created_ms", "asset_created_head"};
     case SortField::title:
     case SortField::relevance:
         break;
     }
-    return {"a.sort_title", "asset_browse"};
+    return {"a.sort_title", "asset_browse_head"};
 }
 
 } // namespace

@@ -13,7 +13,9 @@
 
 #include <algorithm>
 #include <map>
+#include <cmath>
 #include <memory>
+#include <optional>
 #include <tuple>
 #include <vector>
 
@@ -702,5 +704,150 @@ TEST_SUITE("transport") {
         REQUIRE(transport.apply(TransportCommand::reconfigure));
         CHECK(transport.state() == TransportState::stopped);
         CHECK_FALSE(transport.seek(-5));
+    }
+}
+
+TEST_SUITE("scheduler") {
+    TEST_CASE("metronome clicks are generated while playing, so a huge time span stays small") {
+        DocumentData document = make_blank_document();
+        const TrackId track = first_track(document);
+        add_note(document, track, 0, 100, 60);
+        // A crafted file can place an event billions of ticks later; the snapshot must not hold one
+        // click per beat of that span.
+        add_note(document, track, Tick{960} * 4 * 1'000'000'000, Tick{960} * 4 * 1'000'000'000 + 10, 62);
+        PlaybackOptions options;
+        options.sample_rate = 48000;
+        const auto snapshot = compile(document, options);
+        CHECK(snapshot->events.size() <= 5); // two notes plus the tempo
+        CHECK(snapshot->click_segments.size() == 1);
+
+        SchedulerSettings settings;
+        settings.metronome = true;
+        Scheduler scheduler(settings);
+        NullSink ignore;
+        REQUIRE(scheduler.set_snapshot(snapshot.get(), ignore));
+        RecordingSink sink;
+        scheduler.start(0, sink);
+        run_blocks(scheduler, sink, 512, 96000 / 512 + 1); // just over two seconds at 120 BPM
+        std::vector<Received> clicks;
+        for (const Received& received : sink.events)
+            if (received.event.kind == RealtimeEventKind::metronome_click)
+                clicks.push_back(received);
+        REQUIRE(clicks.size() == 5);
+        CHECK(clicks[0].absolute == 0);
+        CHECK(clicks[1].absolute == 24000);
+        CHECK(clicks[4].absolute == 96000);
+        CHECK(clicks[0].event.value == 2); // bar start
+        CHECK(clicks[1].event.value == 0);
+        CHECK(clicks[4].event.value == 2);
+    }
+
+    TEST_CASE("metronome clicks restart inside the loop on every iteration") {
+        DocumentData document = make_blank_document();
+        add_note(document, first_track(document), 0, 100, 60);
+        PlaybackOptions options;
+        options.sample_rate = 48000;
+        options.session.loop = TimeRange{960, 2880}; // beats 2 and 3 of bar 1
+        const auto snapshot = compile(document, options);
+        SchedulerSettings settings;
+        settings.metronome = true;
+        Scheduler scheduler(settings);
+        RecordingSink sink;
+        REQUIRE(scheduler.set_snapshot(snapshot.get(), sink));
+        scheduler.start(960, sink);
+        run_blocks(scheduler, sink, 480, 200); // two seconds = two loop iterations
+        std::vector<std::int64_t> frames;
+        for (const Received& received : sink.events)
+            if (received.event.kind == RealtimeEventKind::metronome_click)
+                frames.push_back(received.absolute);
+        REQUIRE(frames.size() >= 4);
+        CHECK(frames[0] == 0);
+        CHECK(frames[1] == 24000);
+        CHECK(frames[2] == 48000); // next iteration starts with the loop's first beat again
+        CHECK(frames[3] == 72000);
+    }
+
+    TEST_CASE("a count-in plays bar clicks before the song, also from tick 0") {
+        DocumentData document = make_blank_document();
+        add_note(document, first_track(document), 0, 480, 60);
+        PlaybackOptions options;
+        options.sample_rate = 48000;
+        const auto snapshot = compile(document, options);
+        Scheduler scheduler; // metronome off: count-in clicks still sound
+        RecordingSink sink;
+        REQUIRE(scheduler.set_snapshot(snapshot.get(), sink));
+        scheduler.start(0, sink, 0, 1);
+        CHECK(scheduler.in_count_in());
+        CHECK(scheduler.position_tick() == 0);
+        // Before the song starts the clock maps to ticks before 0 at the tempo of tick 0.
+        CHECK(linear_tick_at(*snapshot, scheduler.clock(), 0) == -3840);
+        CHECK(linear_tick_at(*snapshot, scheduler.clock(), 96000) == 0);
+        run_blocks(scheduler, sink, 512, 200);
+        std::vector<Received> clicks;
+        std::optional<std::int64_t> note_on;
+        for (const Received& received : sink.events) {
+            if (received.event.kind == RealtimeEventKind::metronome_click)
+                clicks.push_back(received);
+            else if (received.event.kind == RealtimeEventKind::midi && received.event.message() == 0x90 && !note_on)
+                note_on = received.absolute;
+        }
+        REQUIRE(clicks.size() == 4);
+        CHECK(clicks[0].event.value == 2);
+        CHECK(clicks[3].absolute == 72000);
+        REQUIRE(note_on);
+        CHECK(*note_on == 96000);
+        CHECK_FALSE(scheduler.in_count_in());
+    }
+
+    TEST_CASE("a snapshot swap while playing sends an edited program, and nothing when unchanged") {
+        DocumentData document = make_blank_document();
+        const TrackId track = first_track(document);
+        add_note(document, track, 0, 100000, 60);
+        insert_event(document, track, events::program_change(0, 0, 5));
+        const auto before = compile(document);
+        for (Event& event : document.sequences.front().tracks.front().events)
+            if (event.is_channel() && event.message() == ChannelMessage::program_change)
+                event.payload = Payload{40};
+        const auto after = compile(document);
+
+        Scheduler scheduler;
+        RecordingSink sink;
+        REQUIRE(scheduler.set_snapshot(before.get(), sink));
+        scheduler.start(0, sink);
+        run_blocks(scheduler, sink, 1024, 8);
+        sink.events.clear();
+        REQUIRE(scheduler.set_snapshot(after.get(), sink));
+        CHECK(std::ranges::any_of(sink.events, [](const Received& received) {
+            return received.event.message() == 0xC0 && received.event.data1() == 40;
+        }));
+        CHECK_FALSE(std::ranges::any_of(sink.events, [](const Received& received) {
+            return received.event.message() == 0xB0 && received.event.data1() == 7; // unchanged volume
+        }));
+        CHECK(scheduler.owned_notes().size() == 1);
+    }
+
+    TEST_CASE("the transport clock unfolds loop passes, also across a snapshot swap") {
+        DocumentData document = make_blank_document();
+        add_note(document, first_track(document), 0, 100, 60);
+        PlaybackOptions options;
+        options.sample_rate = 48000;
+        options.session.loop = TimeRange{0, 1920};
+        const auto snapshot = compile(document, options);
+        const auto recompiled = compile(document, options);
+        Scheduler scheduler;
+        NullSink ignore;
+        REQUIRE(scheduler.set_snapshot(snapshot.get(), ignore));
+        scheduler.start(0, ignore);
+        while (scheduler.loop_iteration() < 2)
+            std::ignore = scheduler.process_block(480, ignore); // Position is checked below.
+        for (int index = 0; index < 20; ++index)
+            std::ignore = scheduler.process_block(480, ignore); // into pass 3
+        const Tick expected = 2 * 1920 + scheduler.position_tick();
+        CHECK(std::abs(linear_tick_at(*snapshot, scheduler.clock(), scheduler.absolute_frame()) - expected) <= 1);
+        REQUIRE(scheduler.set_snapshot(recompiled.get(), ignore)); // re-anchors inside the pass
+        CHECK(std::abs(linear_tick_at(*recompiled, scheduler.clock(), scheduler.absolute_frame()) - expected) <= 1);
+        // Half a second earlier is still in the same pass.
+        CHECK(std::abs(linear_tick_at(*recompiled, scheduler.clock(), scheduler.absolute_frame() - 24000) -
+                       (expected - 960)) <= 1);
     }
 }

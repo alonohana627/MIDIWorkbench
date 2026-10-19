@@ -204,7 +204,7 @@ EditorTab::EditorTab(std::unique_ptr<DocumentController> controller, QWidget* pa
     controller_->setParent(nullptr);
     track_list_ = new TrackListWidget(*controller_, this);
     piano_roll_ = new PianoRollPanel(*controller_, this);
-    drum_grid_ = new DrumGridView(*controller_, this);
+    drum_grid_ = new DrumGridPanel(*controller_, this);
     center_ = new QStackedWidget(this);
     center_->addWidget(piano_roll_);
     center_->addWidget(drum_grid_);
@@ -239,8 +239,8 @@ EditorTab::EditorTab(std::unique_ptr<DocumentController> controller, QWidget* pa
     add_lane(LaneTarget{LaneTarget::Kind::velocity, 0, 0});
     connect(&piano_roll_->view(), &PianoRollView::mapping_changed, this, &EditorTab::sync_lanes);
     connect(controller_.get(), &DocumentController::document_changed, this, &EditorTab::sync_lanes);
-    connect(drum_grid_, &DrumGridView::status_message, this, &EditorTab::status_message);
-    connect(drum_grid_, &DrumGridView::open_in_piano_roll, this, [this](Tick tick, int) {
+    connect(&drum_grid_->view(), &DrumGridView::status_message, this, &EditorTab::status_message);
+    connect(&drum_grid_->view(), &DrumGridView::open_in_piano_roll, this, [this](Tick tick, int) {
         show_drum_grid(false);
         piano_roll_->view().scroll_to_tick(tick);
     });
@@ -269,6 +269,18 @@ EditorTab::~EditorTab() {
 void EditorTab::show_drum_grid(bool show) {
     center_->setCurrentWidget(show ? static_cast<QWidget*>(drum_grid_) : piano_roll_);
     lanes_container_->setVisible(!show); // lanes follow the piano roll's time axis, not the grid's
+}
+
+DrumGridView& EditorTab::drum_grid() { return drum_grid_->view(); }
+
+void EditorTab::set_playhead(std::optional<Tick> tick) {
+    piano_roll().set_playhead(tick);
+    drum_grid_->view().set_playhead(tick);
+}
+
+void EditorTab::set_follow_playhead(bool follow) {
+    piano_roll().set_follow_playhead(follow);
+    drum_grid_->view().set_follow_playhead(follow);
 }
 
 bool EditorTab::showing_drum_grid() const { return center_->currentWidget() == drum_grid_; }

@@ -176,6 +176,10 @@ MainWindow::MainWindow(StartupOptions options, app::DataDirectories directories,
         QStringList messages;
         if (!profile.isEmpty() && !apply_shortcuts_json(commands_, profile, &messages))
             statusBar()->showMessage(tr("Saved shortcuts could not be read; defaults are used"), 8000);
+        // Profiles saved before Space became Play/Stop bound Ctrl+Space to Stop; it is now Pause/Resume.
+        if (!profile.contains("transport.pause_resume"))
+            if (auto* stop = command("transport.stop"); stop && stop->shortcut() == QKeySequence(Qt::CTRL | Qt::Key_Space))
+                stop->setShortcut({});
     }
 
     cursor_label_ = new QLabel(this);
@@ -201,7 +205,16 @@ MainWindow::MainWindow(StartupOptions options, app::DataDirectories directories,
         label->setContentsMargins(4, 0, 4, 0);
         statusBar()->addPermanentWidget(label);
     }
-    statusBar()->showMessage(tr("Tip: Ctrl+Shift+P finds any command; press 2 to draw notes"), 15000);
+    {
+        // The tip names the current bindings (they can be changed in Keyboard Shortcuts).
+        const auto key = [this](const char* id) {
+            const auto* action = command(id);
+            return action ? action->shortcut().toString(QKeySequence::NativeText) : QString();
+        };
+        statusBar()->showMessage(tr("Tip: %1 finds any command; %2 plays and stops; press %3 to draw notes")
+                                     .arg(key("view.command_palette"), key("transport.play_stop"), key("tool.draw")),
+                                 15000);
+    }
 
     connect(tabs_, &QTabWidget::currentChanged, this, &MainWindow::current_tab_changed);
     connect(tabs_, &QTabWidget::tabCloseRequested, this, &MainWindow::close_tab);
@@ -347,13 +360,13 @@ void MainWindow::build_actions() {
     add_command("edit.degree_down", tr("Move Down a Scale Degree"), QKeySequence(Qt::CTRL | Qt::Key_Down),
                 [this] { transpose_selection_by_degree(-1); });
     // Left/Right: with notes selected they move the notes; otherwise they move the red transport
-    // line (the play position) one grid step, also while playing.
+    // line (the play position) by a step that follows the zoom, also while playing.
     add_command("edit.move_left", tr("Move Notes or Play Position Left"), QKeySequence(Qt::Key_Left),
                 [this] { move_selection_by_grid(-1); });
     add_command("edit.move_right", tr("Move Notes or Play Position Right"), QKeySequence(Qt::Key_Right),
                 [this] { move_selection_by_grid(1); });
-    // Ctrl+Left/Right always move the play position one grid cell (Space then plays from there),
-    // whether or not notes are selected.
+    // Ctrl+Left/Right always move the play position (Space then plays from there), whether or not
+    // notes are selected. The step follows the zoom and grows while the key is held.
     add_command("transport.position_left", tr("Play Position Left"), QKeySequence(Qt::CTRL | Qt::Key_Left),
                 [this] { move_play_position(-1); });
     add_command("transport.position_right", tr("Play Position Right"), QKeySequence(Qt::CTRL | Qt::Key_Right),
@@ -506,18 +519,16 @@ void MainWindow::build_actions() {
     });
     playing_mode_action_->setCheckable(true);
 
-    add_command("transport.play_pause", tr("Play/Pause"), QKeySequence(Qt::Key_Space), [this] { toggle_play(); });
+    // Space plays and stops (returning to where playback started), as in a DAW; Ctrl+Space pauses
+    // and resumes in place.
+    add_command("transport.play_stop", tr("Play/Stop"), QKeySequence(Qt::Key_Space), [this] { play_stop(); });
+    add_command("transport.pause_resume", tr("Pause/Resume"), QKeySequence(Qt::CTRL | Qt::Key_Space),
+                [this] { pause_resume(); });
     add_command("transport.play_selection", tr("Play from Selection"), QKeySequence(Qt::SHIFT | Qt::Key_Space),
                 [this] { play_from_selection(); });
-    add_command("transport.stop", tr("Stop and Return"), QKeySequence(Qt::CTRL | Qt::Key_Space), [this] { stop_transport(); });
-    add_command("transport.go_to_start", tr("Go to Start"), QKeySequence(Qt::Key_Home), [this] {
-        if (auto* tab = current_tab()) {
-            if (!transport_display_is_stopped(playback_->display()))
-                playback_->stop(0);
-            tab->controller().set_edit_cursor(0);
-            tab->piano_roll().scroll_to_tick(0);
-        }
-    });
+    add_command("transport.stop", tr("Stop and Return"), {}, [this] { stop_transport(); });
+    add_command("transport.go_to_start", tr("Go to Start"), QKeySequence(Qt::Key_Home), [this] { go_to_start(); });
+    add_command("transport.go_to_end", tr("Go to End"), QKeySequence(Qt::Key_End), [this] { go_to_end(); });
     loop_action_ = add_command("transport.loop", tr("Loop"), QKeySequence(Qt::Key_L), [this] { publish_playback(); });
     loop_action_->setCheckable(true);
     loop_action_->setChecked(true);
@@ -655,8 +666,9 @@ void MainWindow::build_menus() {
     view->addAction(library_dock_->toggleViewAction());
     view->addAction(inspector_dock_->toggleViewAction());
     view->addAction(events_dock_->toggleViewAction());
-    add(menuBar()->addMenu(tr("T&ransport")), {"transport.play_pause", "transport.play_selection", "transport.stop",
-                                                "transport.go_to_start", "transport.position_left", "transport.position_right",
+    add(menuBar()->addMenu(tr("T&ransport")), {"transport.play_stop", "transport.pause_resume", "transport.play_selection",
+                                                "transport.stop", "transport.go_to_start", "transport.go_to_end",
+                                                "transport.position_left", "transport.position_right",
                                                 nullptr, "transport.loop", "transport.metronome",
                                                 nullptr, "transport.record", "transport.count_in_0", "transport.count_in_1",
                                                 "transport.count_in_2", "transport.midi_input", nullptr,
@@ -777,13 +789,15 @@ void MainWindow::build_toolbar() {
     });
     transport_bar_->addSeparator();
     add("transport.go_to_start", IconId::rewind);
-    add("transport.stop", IconId::stop);
-    if (auto* play = add("transport.play_pause", IconId::play)) {
+    if (auto* play = add("transport.play_stop", IconId::play)) {
         if (auto* button = qobject_cast<QToolButton*>(transport_bar_->widgetForAction(play))) {
             button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
         }
         play->setIconText(tr("Play"));
+        play->setProperty("mwb_keep_tooltip", true); // says what Space does now (update_status_from_transport)
+        play->setToolTip(tr("Play from the edit cursor (%1)").arg(play->shortcut().toString(QKeySequence::NativeText)));
     }
+    add("transport.pause_resume", IconId::pause);
     add("transport.record", IconId::record);
     add("transport.loop", IconId::loop);
     add("transport.metronome", IconId::metronome);
@@ -1485,19 +1499,83 @@ void MainWindow::transpose_selection_by_degree(int degrees) {
     controller.apply(preview->changes);
 }
 
+Tick MainWindow::play_position_step(EditorTab& tab, Tick from, int direction, int acceleration) const {
+    // Units from fine to coarse; the first one at least this wide on screen is used, so a step is
+    // always visible at the current zoom. Holding the key moves up one or two units.
+    constexpr double min_step_pixels = 48.0;
+    auto& controller = tab.controller();
+    const auto grid = tab.piano_roll().grid();
+    const double ticks_per_pixel = std::max(1e-6, tab.piano_roll().mapping().ticks_per_pixel);
+    const auto& meter = controller.meter_map();
+    const auto& segment = meter.segment_at(from);
+    const double lengths[] = {grid.step(), static_cast<double>(meter.ticks_per_beat(segment)),
+                              static_cast<double>(meter.ticks_per_bar(segment)),
+                              4.0 * static_cast<double>(meter.ticks_per_bar(segment)),
+                              16.0 * static_cast<double>(meter.ticks_per_bar(segment))};
+    constexpr int unit_count = 5;
+    int unit = unit_count - 1;
+    for (int index = 0; index < unit_count; ++index)
+        if (lengths[index] / ticks_per_pixel >= min_step_pixels) {
+            unit = index;
+            break;
+        }
+    unit = std::min(unit_count - 1, unit + std::max(0, acceleration));
+    if (unit == 0) // the snap grid
+        return direction < 0 ? std::max<Tick>(0, grid.floor(from > 0 ? from - 1 : 0)) : grid.next(from);
+    if (unit == 1) {
+        // Beats of the meter segment at the position; a step never crosses a meter change.
+        const Tick beat = std::max<Tick>(1, meter.ticks_per_beat(segment));
+        const Tick offset = from - segment.tick;
+        if (direction > 0) {
+            Tick next = segment.tick + (offset / beat + 1) * beat;
+            if (meter.segment_at(next).tick != segment.tick)
+                next = meter.segment_at(next).tick;
+            return next;
+        }
+        if (offset <= 0) {
+            if (from <= 0)
+                return 0;
+            const auto& previous = meter.segment_at(from - 1);
+            const Tick previous_beat = std::max<Tick>(1, meter.ticks_per_beat(previous));
+            return previous.tick + ((from - 1 - previous.tick) / previous_beat) * previous_beat;
+        }
+        return segment.tick + ((offset - 1) / beat) * beat;
+    }
+    // Bars, or groups of 4 or 16 bars counted from bar 1.
+    const std::int64_t bars = unit == 2 ? 1 : unit == 3 ? 4 : 16;
+    const std::int64_t bar = meter.position(from).bar;
+    if (direction > 0)
+        return meter.bar_start((bar / bars + 1) * bars);
+    std::int64_t group = bar / bars;
+    if (meter.bar_start(group * bars) >= from)
+        --group;
+    return group < 0 ? 0 : meter.bar_start(group * bars);
+}
+
 void MainWindow::move_play_position(int direction) {
     auto* tab = current_tab();
     if (!tab)
         return;
     auto& controller = tab->controller();
-    const auto grid = tab->piano_roll().grid();
     const auto display = playback_->display();
     const bool rolling = !transport_display_is_stopped(display) && transport_owner_ == &controller;
+    if (rolling && recording_->recording()) {
+        statusBar()->showMessage(tr("Stop recording to move the playhead"), 4000); // section 13.3
+        return;
+    }
+    // Holding the key accelerates: after 0.4 s one unit coarser, after 1.2 s two units coarser.
+    int acceleration = 0;
+    if (held_position_key_ != 0) {
+        const auto held = std::chrono::steady_clock::now() - position_key_down_;
+        acceleration = held >= std::chrono::milliseconds(1200) ? 2 : held >= std::chrono::milliseconds(400) ? 1 : 0;
+    }
     const Tick from = rolling ? display.position : controller.edit_cursor();
-    const Tick to = direction < 0 ? std::max<Tick>(0, grid.floor(from > 0 ? from - 1 : 0)) : grid.next(from);
+    const Tick to = std::max<Tick>(0, play_position_step(*tab, from, direction, acceleration));
     if (rolling)
         playback_->seek(to); // the playhead jumps; playback continues from there
     controller.set_edit_cursor(to);
+    if (rolling)
+        play_started_from_ = to; // Space now stops back here
     tab->piano_roll().scroll_to_tick(to);
 }
 
@@ -1589,21 +1667,59 @@ void MainWindow::publish_playback() {
                                 transport_owner_->generation());
 }
 
-void MainWindow::toggle_play() {
+void MainWindow::start_playback(EditorTab& tab, Tick from) {
+    if (transport_owner_ != &tab.controller()) {
+        playback_->stop(0); // another document owned the transport
+        transport_owner_ = &tab.controller();
+    }
+    publish_playback();
+    play_started_from_ = from;
+    paused_cursor_.reset();
+    playback_->play(from);
+}
+
+void MainWindow::play_stop() {
     auto* tab = current_tab();
     if (!tab)
         return;
-    const auto state = playback_->display().state;
-    if (state == TransportDisplay::State::playing) {
-        playback_->pause();
+    const auto display = playback_->display();
+    if (transport_display_is_stopped(display)) {
+        start_playback(*tab, tab->controller().edit_cursor());
         return;
     }
-    if (transport_owner_ != &tab->controller()) {
-        playback_->stop(0);
-        transport_owner_ = &tab->controller();
+    // Rolling or paused: stop and return the playhead to where playback started (a DAW's Space).
+    stop_transport();
+}
+
+void MainWindow::pause_resume() {
+    auto* tab = current_tab();
+    if (!tab)
+        return;
+    const auto display = playback_->display();
+    if (display.state == TransportDisplay::State::playing) {
+        playback_->pause();
+        paused_cursor_ = tab->controller().edit_cursor();
+        return;
     }
-    publish_playback();
-    playback_->play(state == TransportDisplay::State::paused ? playback_->display().position : tab->controller().edit_cursor());
+    if (display.state == TransportDisplay::State::recording || display.state == TransportDisplay::State::counting_in) {
+        statusBar()->showMessage(tr("Recording cannot pause; press %1 to stop")
+                                     .arg(command("transport.play_stop")->shortcut().toString(QKeySequence::NativeText)),
+                                 4000);
+        return;
+    }
+    if (display.state == TransportDisplay::State::paused && transport_owner_ == &tab->controller()) {
+        // Resume where it paused, unless the edit cursor was moved meanwhile: then play from there.
+        const Tick cursor = tab->controller().edit_cursor();
+        const bool moved = paused_cursor_ && *paused_cursor_ != cursor;
+        const Tick from = moved ? cursor : display.position;
+        const Tick started = play_started_from_;
+        publish_playback();
+        paused_cursor_.reset();
+        playback_->play(from);
+        play_started_from_ = moved ? from : started; // a plain resume still stops back at the start
+        return;
+    }
+    start_playback(*tab, tab->controller().edit_cursor());
 }
 
 void MainWindow::play_from_selection() {
@@ -1614,29 +1730,81 @@ void MainWindow::play_from_selection() {
     Tick start = tab->controller().edit_cursor();
     if (!notes.empty())
         start = DragSnapshot::capture(notes).earliest_start;
-    transport_owner_ = &tab->controller();
-    publish_playback();
-    playback_->play(start);
+    if (transport_owner_ == &tab->controller() && playback_->display().state == TransportDisplay::State::playing) {
+        if (recording_->recording())
+            return; // no seek while recording (section 13.3)
+        playback_->seek(start); // play() would be ignored while playing
+        play_started_from_ = start;
+        return;
+    }
+    start_playback(*tab, start);
 }
 
 void MainWindow::stop_transport() {
+    if (recording_->recording())
+        recording_->toggle_recording(); // Stop ends the take; it lands before the transport stops
     auto* tab = current_tab();
-    playback_->stop(tab ? tab->controller().edit_cursor() : 0);
+    const bool owned = tab && transport_owner_ == &tab->controller();
+    const Tick home = owned ? play_started_from_ : (tab ? tab->controller().edit_cursor() : 0);
+    playback_->stop(home);
+    paused_cursor_.reset();
+    if (owned)
+        tab->controller().set_edit_cursor(home);
+}
+
+void MainWindow::go_to_start() {
+    auto* tab = current_tab();
+    if (!tab)
+        return;
+    const bool rolling = !transport_display_is_stopped(playback_->display()) && transport_owner_ == &tab->controller();
+    if (rolling && recording_->recording()) {
+        statusBar()->showMessage(tr("Stop recording to move the playhead"), 4000);
+        return;
+    }
+    if (rolling) {
+        playback_->seek(0); // keeps playing from the start (section 13.3 accepts seeks while playing)
+        play_started_from_ = 0;
+    }
+    tab->controller().set_edit_cursor(0);
+    tab->piano_roll().scroll_to_tick(0);
+}
+
+void MainWindow::go_to_end() {
+    auto* tab = current_tab();
+    if (!tab)
+        return;
+    const bool rolling = !transport_display_is_stopped(playback_->display()) && transport_owner_ == &tab->controller();
+    if (rolling && recording_->recording()) {
+        statusBar()->showMessage(tr("Stop recording to move the playhead"), 4000);
+        return;
+    }
+    // The end of the song: the last note end, or the sequence end when it is later.
+    Tick end = tab->controller().active_sequence().effective_end();
+    for (const auto& note : tab->controller().notes().notes)
+        end = std::max(end, note.end);
+    if (rolling) {
+        playback_->seek(end);
+        play_started_from_ = end;
+    }
+    tab->controller().set_edit_cursor(end);
+    tab->piano_roll().scroll_to_tick(end);
 }
 
 void MainWindow::update_status_from_transport() {
     const auto display = playback_->display();
-    // The Play button shows what pressing it does: Pause while the transport runs.
-    const bool rolling = display.state == TransportDisplay::State::playing ||
-                         display.state == TransportDisplay::State::recording ||
-                         display.state == TransportDisplay::State::counting_in;
-    if (rolling != showing_pause_) {
-        showing_pause_ = rolling;
-        if (auto* play = command("transport.play_pause")) {
-            const IconId icon = rolling ? IconId::pause : IconId::play;
+    // The Play button shows what Space does now: Stop (and return) while the transport runs or is
+    // paused, Play when stopped.
+    const bool stoppable = !transport_display_is_stopped(display);
+    if (stoppable != showing_pause_) {
+        showing_pause_ = stoppable;
+        if (auto* play = command("transport.play_stop")) {
+            const IconId icon = stoppable ? IconId::stop : IconId::play;
+            const QString key = play->shortcut().toString(QKeySequence::NativeText);
             play->setIcon(make_icon(icon));
             play->setProperty("mwb_icon", static_cast<int>(icon));
-            play->setIconText(rolling ? tr("Pause") : tr("Play"));
+            play->setIconText(stoppable ? tr("Stop") : tr("Play"));
+            play->setToolTip(stoppable ? tr("Stop and return to %1 (%2)").arg(tr("where playback started"), key)
+                                       : tr("Play from the edit cursor (%1)").arg(key));
         }
     }
     QString state;
@@ -1681,6 +1849,21 @@ void MainWindow::update_status_from_transport() {
 // --- Keyboard playing mode -----------------------------------------------------------------------
 
 bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
+    // Holding Left/Right accelerates play-position steps: remember when the key went down (the
+    // first non-repeated event) and forget it on the real release.
+    if (event->type() == QEvent::ShortcutOverride || event->type() == QEvent::KeyPress ||
+        event->type() == QEvent::KeyRelease) {
+        const auto* key = static_cast<QKeyEvent*>(event);
+        if (key->key() == Qt::Key_Left || key->key() == Qt::Key_Right) {
+            if (event->type() == QEvent::KeyRelease) {
+                if (!key->isAutoRepeat())
+                    held_position_key_ = 0;
+            } else if (held_position_key_ != key->key()) {
+                held_position_key_ = key->key(); // a repeat without a seen press still starts the hold
+                position_key_down_ = std::chrono::steady_clock::now();
+            }
+        }
+    }
     // The mouse wheel over a spin box or combo box that is not being edited scrolls the panel
     // instead of silently changing the value (each change would be a document edit).
     if (event->type() == QEvent::Wheel) {
@@ -1738,8 +1921,10 @@ void MainWindow::keyReleaseEvent(QKeyEvent* event) {
 }
 
 void MainWindow::changeEvent(QEvent* event) {
-    if (event->type() == QEvent::ActivationChange && !isActiveWindow())
+    if (event->type() == QEvent::ActivationChange && !isActiveWindow()) {
         computer_keyboard_->release_all(); // deactivation releases only playing-mode notes
+        held_position_key_ = 0;            // a release may never arrive
+    }
     QMainWindow::changeEvent(event);
 }
 

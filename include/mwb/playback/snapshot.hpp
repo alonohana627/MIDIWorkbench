@@ -46,7 +46,7 @@ struct PlaybackOptions {
     SessionSettings session;
     bool include_muted_tracks = false;       ///< Offline render option: ignore mute/solo.
     bool master_mute = false;                ///< Master mute always wins (section 12).
-    bool metronome_clicks = true;            ///< Compile beat clicks (the scheduler decides whether to emit).
+    bool metronome_clicks = true;            ///< Compile the beat grid (the scheduler decides whether to click).
     std::size_t max_events_per_block = 8192; ///< Real-time budget (section 20.2).
     std::uint32_t preflight_block_frames = 4096; ///< Largest audio block the live engine renders.
     std::size_t max_routes = 256;            ///< Upper bound on distinct routes.
@@ -120,6 +120,12 @@ public:
     [[nodiscard]] std::int64_t frame_at(Tick tick) const noexcept;
     /// Smallest tick whose frame is >= `frame` (the first tick not yet played at that frame).
     [[nodiscard]] Tick first_tick_at_or_after_frame(std::int64_t frame) const noexcept;
+    /// Exact frame length of `ticks` ticks played at the tempo in effect at `at` (count-in beats
+    /// before a position, which have no tempo map of their own).
+    [[nodiscard]] ExactFrame frames_for_ticks_at(Tick at, Tick ticks) const noexcept;
+    /// Ticks (rounded down) that `frames` frames span at the tempo in effect at `at`; inverse of
+    /// frames_for_ticks_at, used to extend the timeline before tick 0 (count-in).
+    [[nodiscard]] Tick ticks_for_frames_at(Tick at, std::int64_t frames) const noexcept;
     [[nodiscard]] std::uint32_t sample_rate() const noexcept { return sample_rate_; }
     [[nodiscard]] const TempoMap& tempo_map() const noexcept { return tempo_map_; }
     [[nodiscard]] Rational tempo_multiplier() const noexcept { return multiplier_; }
@@ -141,6 +147,24 @@ struct LoopInfo {
     __int128 length_denominator = 1;
     std::size_t first_event = 0;     ///< First event index with tick >= start_tick.
     std::size_t end_event = 0;       ///< First event index with tick >= end_tick.
+};
+
+/// One meter segment of the metronome beat grid. Clicks are generated lazily by the scheduler from
+/// these segments (one click every `beat_length` ticks from `start` up to `end`), so a long or
+/// sparse timeline never materializes one event per beat (a crafted file with a huge delta at PPQ
+/// 1 would otherwise need hundreds of millions of events).
+struct ClickSegment {
+    Tick start = 0;
+    Tick end = 0;                 ///< Exclusive.
+    Tick beat_length = 1;         ///< Ticks per displayed beat (> 0).
+    std::int32_t numerator = 4;   ///< Beats per bar (> 0).
+    bool compound = false;        ///< 6/8, 9/8, 12/8: every third beat is a group accent.
+
+    /// Accent of beat `beat` of the segment: 2 bar start, 1 compound group start, 0 other beats.
+    [[nodiscard]] std::uint32_t accent(std::int64_t beat) const noexcept {
+        const std::int64_t in_bar = beat % numerator;
+        return in_bar == 0 ? 2u : (compound && in_bar % 3 == 0 ? 1u : 0u);
+    }
 };
 
 /// Diagnostics gathered while compiling.
@@ -173,6 +197,7 @@ struct PlaybackSnapshot {
     std::vector<ChannelState> baseline_states;   ///< Per route, before any event.
     std::vector<std::size_t> checkpoint_events;  ///< Event index of each checkpoint (first is 0).
     std::vector<ChannelState> checkpoint_states; ///< checkpoint count x route count.
+    std::vector<ClickSegment> click_segments;    ///< Metronome beat grid, ordered and disjoint.
     std::optional<LoopInfo> loop;
     Tick end_tick = 0;
     std::int64_t end_frame = 0;
@@ -188,6 +213,9 @@ struct PlaybackSnapshot {
     /// (which must hold routes.size() entries). Bounded work: one checkpoint copy plus at most
     /// checkpoint_interval events. Real-time safe.
     void state_before(std::size_t event_index, std::span<ChannelState> states) const noexcept;
+    /// Beat-grid segment in effect at `tick` (the last one starting at or before it), or null when
+    /// there is no grid (SMPTE timing or clicks not compiled).
+    [[nodiscard]] const ClickSegment* click_segment_at(Tick tick) const noexcept;
 };
 
 /// Compiles a playback snapshot (section 19.2 sketch). Runs off the real-time thread; checks the

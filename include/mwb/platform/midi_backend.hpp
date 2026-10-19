@@ -87,8 +87,13 @@ public:
     [[nodiscard]] virtual const MidiPortInfo& info() const noexcept = 0;
     /// Moves up to output.size() queued messages into `output`; returns the count.
     [[nodiscard]] virtual std::size_t drain(std::span<MidiInputMessage> output) noexcept = 0;
+    /// Like drain(), but first waits up to `timeout` for a message (input router thread), so the
+    /// consumer reacts as soon as a message arrives instead of polling.
+    [[nodiscard]] virtual std::size_t wait_drain(std::span<MidiInputMessage> output,
+                                                 std::chrono::milliseconds timeout) noexcept = 0;
     [[nodiscard]] virtual MidiInputStatistics statistics() const noexcept = 0;
-    /// False after the endpoint disappeared.
+    /// False after the endpoint disappeared (checked by a background watcher; WinMM itself never
+    /// reports removal of an open input).
     [[nodiscard]] virtual bool connected() const noexcept = 0;
 };
 
@@ -103,6 +108,7 @@ struct MidiOutputStatistics {
     std::uint64_t send_errors = 0;
     std::uint64_t sysex_sent = 0;
     std::int64_t max_lateness_ns = 0;   ///< Worst measured delivery lateness versus the due time.
+    bool high_resolution_timer = false; ///< Due times are waited with a high-resolution timer.
 };
 
 /// An open output endpoint served by its own MIDI-output thread with its own queue (section 14.1):

@@ -3,6 +3,7 @@
 #include "mwb/core/utility.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -137,6 +138,25 @@ Status apply_event_batch(DocumentData& document, const std::vector<const EditOpe
         std::sort(positions.begin(), positions.end());
         if (std::adjacent_find(positions.begin(), positions.end()) != positions.end())
             return make_error(ErrorCode::invalid_data, "the same event is changed twice in one command");
+        if (!batch.insertions.empty()) {
+            // A stale or replayed change set must not create a second event with an identity the
+            // track still holds (a move removes the old copy first, so removed identities are free).
+            std::unordered_set<EventId, UuidHash> inserted;
+            inserted.reserve(batch.insertions.size());
+            for (const Event* insertion : batch.insertions)
+                if (!inserted.insert(insertion->id).second)
+                    return make_error(ErrorCode::invalid_data, "two inserted events share one identity");
+            std::size_t next_removal = 0;
+            const auto& events = batch.track->events;
+            for (std::size_t index = 0; index < events.size(); ++index) {
+                if (next_removal < positions.size() && positions[next_removal] == index) {
+                    ++next_removal;
+                    continue;
+                }
+                if (inserted.contains(events[index].id))
+                    return make_error(ErrorCode::conflict, "inserted event identity already exists in the track");
+            }
+        }
         std::vector<const Event*> sorted = batch.insertions;
         std::sort(sorted.begin(), sorted.end(), [](const Event* a, const Event* b) { return order_less(*a, *b); });
         for (std::size_t index = 1; index < sorted.size(); ++index)
@@ -326,6 +346,23 @@ std::size_t event_memory(const Event& event) {
     return sizeof(Event) + (event.payload.size() > Payload::inline_capacity ? event.payload.size() : 0);
 }
 
+/// Events including heap payloads (SysEx, long text), so whole-track operations count what
+/// they really hold against the undo budget.
+std::size_t track_memory(const Track& track) {
+    std::size_t total = sizeof(Track) + track.name.size();
+    for (const auto& event : track.events)
+        total += event_memory(event);
+    return total;
+}
+
+/// A recording take carries its raw capture evidence (possibly megabytes for long takes).
+std::size_t take_memory(const RecordingTake& take) {
+    std::size_t total = sizeof(RecordingTake) + take.capture_json.size();
+    for (const auto& chunk : take.chunks)
+        total += sizeof(chunk) + chunk.payload.size();
+    return total;
+}
+
 } // namespace
 
 std::size_t ChangeSet::memory_estimate() const {
@@ -338,16 +375,18 @@ std::size_t ChangeSet::memory_estimate() const {
                        [&](const EventReplace& replace) {
                            total += event_memory(replace.before) + event_memory(replace.after);
                        },
-                       [&](const TrackInsert& insert) { total += insert.track.events.size() * sizeof(Event); },
-                       [&](const TrackRemove& remove) { total += remove.track.events.size() * sizeof(Event); },
+                       [&](const TrackInsert& insert) { total += track_memory(insert.track); },
+                       [&](const TrackRemove& remove) { total += track_memory(remove.track); },
                        [&](const SequenceInsert& insert) {
                            for (const auto& track : insert.sequence.tracks)
-                               total += track.events.size() * sizeof(Event);
+                               total += track_memory(track);
                        },
                        [&](const SequenceRemove& remove) {
                            for (const auto& track : remove.sequence.tracks)
-                               total += track.events.size() * sizeof(Event);
+                               total += track_memory(track);
                        },
+                       [&](const TakeInsert& insert) { total += take_memory(insert.take); },
+                       [&](const TakeRemove& remove) { total += take_memory(remove.take); },
                        [](const auto&) {},
                    },
                    operation);
@@ -410,42 +449,89 @@ ChangeBuilder::WorkingTrack* ChangeBuilder::touch(TrackId track) {
     const auto location = find_track(document_, track);
     if (!location)
         return nullptr;
-    working_.push_back(WorkingTrack{*location, document_.sequences[location->sequence].tracks[location->track]});
+    working_.push_back(
+        WorkingTrack{*location, document_.sequences[location->sequence].tracks[location->track], {}, {}, false});
     return &working_.back();
 }
 
-std::uint64_t ChangeBuilder::allocate_order_key(Track& track, Tick tick, OrderPlacement placement,
+std::vector<Event>& ChangeBuilder::group(WorkingTrack& working, Tick tick) {
+    auto [entry, created] = working.groups.try_emplace(tick);
+    if (created) {
+        const auto& events = working.track.events;
+        const auto lower = std::ranges::lower_bound(events, tick, std::less<>{}, &Event::tick);
+        const auto upper = std::ranges::upper_bound(lower, events.end(), tick, std::less<>{}, &Event::tick);
+        entry->second.assign(lower, upper);
+    }
+    return entry->second;
+}
+
+std::optional<Tick> ChangeBuilder::tick_of(WorkingTrack& working, EventId id) {
+    if (!working.ticks_built) {
+        materialize(working);
+        working.ticks.reserve(working.track.events.size());
+        for (const auto& event : working.track.events)
+            working.ticks.emplace(event.id, event.tick);
+        working.ticks_built = true;
+    }
+    const auto found = working.ticks.find(id);
+    if (found == working.ticks.end())
+        return std::nullopt;
+    return found->second;
+}
+
+void ChangeBuilder::materialize(WorkingTrack& working) {
+    if (working.groups.empty())
+        return;
+    auto& events = working.track.events;
+    std::size_t extra = 0;
+    for (const auto& [tick, events_at_tick] : working.groups)
+        extra += events_at_tick.size();
+    std::vector<Event> merged;
+    merged.reserve(events.size() + extra);
+    auto group_it = working.groups.begin();
+    std::size_t index = 0;
+    while (index < events.size() || group_it != working.groups.end()) {
+        if (group_it != working.groups.end() && (index == events.size() || group_it->first <= events[index].tick)) {
+            // The changed group replaces the track's events at that tick.
+            while (index < events.size() && events[index].tick == group_it->first)
+                ++index;
+            for (auto& event : group_it->second)
+                merged.push_back(std::move(event));
+            ++group_it;
+        } else {
+            merged.push_back(std::move(events[index++]));
+        }
+    }
+    events = std::move(merged);
+    working.groups.clear();
+}
+
+std::uint64_t ChangeBuilder::allocate_order_key(std::vector<Event>& group, OrderPlacement placement,
                                                 std::size_t& insert_position) {
-    auto& events = track.events;
-    auto lower = std::lower_bound(events.begin(), events.end(), tick,
-                                  [](const Event& event, Tick value) { return event.tick < value; });
-    auto upper = std::upper_bound(lower, events.end(), tick,
-                                  [](Tick value, const Event& event) { return value < event.tick; });
-    std::size_t begin = static_cast<std::size_t>(lower - events.begin());
-    std::size_t end = static_cast<std::size_t>(upper - events.begin());
+    const std::size_t end = group.size();
     std::size_t position = end;
     if (placement == OrderPlacement::before_existing) {
-        position = begin;
+        position = 0;
     } else if (placement == OrderPlacement::before_note_starts) {
-        position = begin;
-        while (position < end && !events[position].is_note_start())
+        position = 0;
+        while (position < end && !group[position].is_note_start())
             ++position;
     }
-    const auto key_below = [&](std::size_t at) -> std::uint64_t { return at > begin ? events[at - 1].order_key : 0; };
+    const auto key_below = [&](std::size_t at) -> std::uint64_t { return at > 0 ? group[at - 1].order_key : 0; };
     const auto key_above = [&](std::size_t at) -> std::uint64_t {
-        return at < end ? events[at].order_key : key_below(at) + 2 * order_key_spacing;
+        return at < end ? group[at].order_key : key_below(at) + 2 * order_key_spacing;
     };
     std::uint64_t below = key_below(position);
     std::uint64_t above = key_above(position);
     if (above - below < 2) {
         // No room: renumber the tick group (a semantic no-op recorded by the diff).
-        for (std::size_t index = begin; index < end; ++index)
-            events[index].order_key = (index - begin + 1) * order_key_spacing * 2;
+        for (std::size_t index = 0; index < end; ++index)
+            group[index].order_key = (index + 1) * order_key_spacing * 2;
         below = key_below(position);
         above = key_above(position);
     }
     insert_position = position;
-    if (position == end && end > begin)
+    if (position == end && end > 0)
         return below + order_key_spacing;
     if (position == end)
         return order_key_spacing;
@@ -458,10 +544,13 @@ EventId ChangeBuilder::insert(TrackId track, Event event, OrderPlacement placeme
         return EventId{};
     if (event.id.is_nil())
         event.id = EventId::generate();
+    auto& events = group(*working, event.tick);
     std::size_t position = 0;
-    event.order_key = allocate_order_key(working->track, event.tick, placement, position);
+    event.order_key = allocate_order_key(events, placement, position);
     const EventId id = event.id;
-    working->track.events.insert(working->track.events.begin() + static_cast<std::ptrdiff_t>(position), std::move(event));
+    if (working->ticks_built)
+        working->ticks.insert_or_assign(id, event.tick);
+    events.insert(events.begin() + static_cast<std::ptrdiff_t>(position), std::move(event));
     return id;
 }
 
@@ -469,10 +558,15 @@ bool ChangeBuilder::remove(TrackId track, EventId event) {
     WorkingTrack* working = touch(track);
     if (!working)
         return false;
-    const auto position = find_event(working->track, event);
-    if (!position)
+    const auto tick = tick_of(*working, event);
+    if (!tick)
         return false;
-    working->track.events.erase(working->track.events.begin() + static_cast<std::ptrdiff_t>(*position));
+    auto& events = group(*working, *tick);
+    const auto found = std::ranges::find(events, event, &Event::id);
+    if (found == events.end())
+        return false;
+    events.erase(found);
+    working->ticks.erase(event);
     return true;
 }
 
@@ -480,21 +574,26 @@ bool ChangeBuilder::replace(TrackId track, EventId event, Event updated, OrderPl
     WorkingTrack* working = touch(track);
     if (!working)
         return false;
-    const auto position = find_event(working->track, event);
-    if (!position)
+    const auto tick = tick_of(*working, event);
+    if (!tick)
         return false;
-    Event& current = working->track.events[*position];
-    updated.id = current.id;
-    if (updated.tick == current.tick) {
-        updated.order_key = current.order_key;
-        current = std::move(updated);
+    auto& events = group(*working, *tick);
+    const auto found = std::ranges::find(events, event, &Event::id);
+    if (found == events.end())
+        return false;
+    updated.id = found->id;
+    if (updated.tick == found->tick) {
+        updated.order_key = found->order_key;
+        *found = std::move(updated);
         return true;
     }
-    working->track.events.erase(working->track.events.begin() + static_cast<std::ptrdiff_t>(*position));
+    events.erase(found);
+    // Map nodes are stable, so the source group reference above stays valid.
+    auto& destination = group(*working, updated.tick);
     std::size_t insert_position = 0;
-    updated.order_key = allocate_order_key(working->track, updated.tick, placement, insert_position);
-    working->track.events.insert(working->track.events.begin() + static_cast<std::ptrdiff_t>(insert_position),
-                                 std::move(updated));
+    updated.order_key = allocate_order_key(destination, placement, insert_position);
+    working->ticks.insert_or_assign(updated.id, updated.tick);
+    destination.insert(destination.begin() + static_cast<std::ptrdiff_t>(insert_position), std::move(updated));
     return true;
 }
 
@@ -502,14 +601,19 @@ EventId ChangeBuilder::add_note(TrackId track, Tick start, Tick end, std::uint8_
                                 std::uint8_t velocity, std::uint8_t release_velocity) {
     const EventId id = insert(track, events::note_on(start, channel, pitch, std::max<std::uint8_t>(velocity, 1)),
                               OrderPlacement::after_existing);
+    // A zero-length note's end goes after its own start (it would otherwise precede it and
+    // never close it, section 16.4); a positive-length end goes before note starts at its tick.
     insert(track, events::note_off(std::max(end, start), channel, pitch, release_velocity),
-           OrderPlacement::before_note_starts);
+           end <= start ? OrderPlacement::after_existing : OrderPlacement::before_note_starts);
     return id;
 }
 
 const Track* ChangeBuilder::working_track(TrackId track) {
     WorkingTrack* working = touch(track);
-    return working ? &working->track : nullptr;
+    if (!working)
+        return nullptr;
+    materialize(*working);
+    return &working->track;
 }
 
 void ChangeBuilder::set_track_properties(TrackId track, const Track& updated) {
@@ -536,6 +640,9 @@ bool ChangeBuilder::edit_track(TrackId track, BulkTrackEdit edit) {
     WorkingTrack* working = touch(track);
     if (!working)
         return false;
+    materialize(*working);
+    working->ticks.clear(); // ticks and identities change wholesale; rebuilt on demand
+    working->ticks_built = false;
     auto& events = working->track.events;
     std::vector<Event> kept;
     kept.reserve(events.size() + edit.insert.size());
@@ -660,6 +767,9 @@ void ChangeBuilder::set_events(TrackId track, std::vector<Event> events) {
         if (event.id.is_nil())
             event.id = EventId::generate();
     std::stable_sort(events.begin(), events.end(), order_less);
+    working->groups.clear();
+    working->ticks.clear();
+    working->ticks_built = false;
     // Renumber only tick groups that contain duplicate order positions.
     std::size_t begin = 0;
     while (begin < events.size()) {
@@ -681,6 +791,8 @@ void ChangeBuilder::set_events(TrackId track, std::vector<Event> events) {
 void ChangeBuilder::append(EditOperation operation) { explicit_operations_.push_back(std::move(operation)); }
 
 ChangeSet ChangeBuilder::finish() {
+    for (auto& working : working_)
+        materialize(working);
     ChangeSet changes;
     changes.label = label_;
     changes.operations = std::move(explicit_operations_);

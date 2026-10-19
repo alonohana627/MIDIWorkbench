@@ -178,6 +178,10 @@ struct RealInterval {
 inline constexpr double real_epsilon = 0.005;
 [[nodiscard]] RealInterval real_interval(const NumericCondition& condition);
 
+/// Stored mode name ("minor", "major" or a church mode) of user text such as "m", "Minor" or
+/// "aeolian"; nullopt when the text names no supported mode. Shared by `key:` and key overrides.
+[[nodiscard]] std::optional<std::string> normalize_key_mode(std::string_view text);
+
 /// Default minimum confidence for estimated keys to satisfy `key:` (section 25.2).
 inline constexpr double estimated_key_min_confidence = 0.60;
 

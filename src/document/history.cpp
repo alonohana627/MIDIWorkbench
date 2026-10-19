@@ -72,11 +72,18 @@ void CommandHistory::clear() {
     entries_.clear();
     cursor_ = 0;
     memory_bytes_ = 0;
+    evicted_entries_ = 0; // nothing older is missing from an empty history
+}
+
+const ChangeSet* CommandHistory::newest_undo_changes() const {
+    return can_undo() ? &entries_[cursor_ - 1].forward : nullptr;
 }
 
 void CommandHistory::evict_to_budget() {
     // Redo entries are only dropped by a new edit; eviction removes whole oldest undo entries.
-    while (memory_bytes_ > budget_bytes_ && cursor_ > 0) {
+    // The newest undo entry always stays, even when it alone exceeds the budget: the edit just
+    // made must remain undoable.
+    while (memory_bytes_ > budget_bytes_ && cursor_ > 1) {
         memory_bytes_ -= entries_.front().memory;
         entries_.pop_front();
         --cursor_;

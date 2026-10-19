@@ -4,6 +4,9 @@
 #include "mwb/core/model.hpp"
 
 #include <cstddef>
+#include <deque>
+#include <map>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -128,9 +131,6 @@ enum class OrderPlacement {
     before_note_starts, ///< After non-note-start events but before the first sounding note-on.
 };
 
-/// Builds change sets from intuitive edits. Touched tracks are copied on first touch, edited
-/// freely, and the result is diffed by event identity in finish(). Track end ticks are extended
-/// automatically to cover moved or inserted events (invariant 4).
 /// A batch of edits to one track, applied by ChangeBuilder::edit_track in one pass.
 struct BulkTrackEdit {
     /// Content replacements that keep the event's tick and order position (tick fields ignored).
@@ -142,6 +142,14 @@ struct BulkTrackEdit {
     std::vector<std::pair<Event, OrderPlacement>> insert;
 };
 
+/// Builds change sets from intuitive edits. Touched tracks are copied on first touch, edited
+/// freely, and the result is diffed by event identity in finish(). Track end ticks are extended
+/// automatically to cover moved or inserted events (invariant 4).
+///
+/// Cost: the single-event operations (insert, remove, replace, add_note) edit only the tick
+/// group they touch, O(log n + group size) each after a one-time O(n) identity index of the
+/// track, so loops over many events stay linear overall. Bulk edits should still prefer
+/// edit_track, which also merges in one pass.
 class ChangeBuilder {
 public:
     ChangeBuilder(const DocumentData& document, std::string label);
@@ -155,7 +163,8 @@ public:
     bool replace(TrackId track, EventId event, Event updated,
                  OrderPlacement placement = OrderPlacement::after_existing);
     /// Adds a note as a note-on/note-off pair. Note-offs are ordered before note starts at their
-    /// tick so a note ending where a same-pitch note begins stays well formed (section 16.6).
+    /// tick so a note ending where a same-pitch note begins stays well formed (section 16.6); the
+    /// end of a zero-length note (end <= start) is placed after its own start instead.
     EventId add_note(TrackId track, Tick start, Tick end, std::uint8_t channel, std::uint8_t pitch,
                      std::uint8_t velocity, std::uint8_t release_velocity = 0);
     /// Replaces a track's whole event list (bulk transformations). Events are stably sorted by
@@ -169,7 +178,8 @@ public:
     /// only tick groups that receive insertions can get new order keys. Returns false when the
     /// track does not exist.
     bool edit_track(TrackId track, BulkTrackEdit edit);
-    /// Current working copy of a track (after edits made through this builder).
+    /// Current working copy of a track (after edits made through this builder). The pointer stays
+    /// valid until finish(); its events reflect later edits.
     [[nodiscard]] const Track* working_track(TrackId track);
     /// Records track property changes (events in `updated` are ignored).
     void set_track_properties(TrackId track, const Track& updated);
@@ -184,15 +194,26 @@ public:
 private:
     struct WorkingTrack {
         TrackLocation location;
-        Track track;
+        Track track;   ///< Events are current once materialize() merged `groups` back.
+        /// Tick groups changed by single-event operations, merged into `track` on demand.
+        std::map<Tick, std::vector<Event>> groups;
+        /// Identity -> tick of every current event, built on the first remove/replace.
+        std::unordered_map<EventId, Tick, UuidHash> ticks;
+        bool ticks_built = false;
     };
     WorkingTrack* touch(TrackId track);
-    std::uint64_t allocate_order_key(Track& track, Tick tick, OrderPlacement placement,
-                                     std::size_t& insert_position);
+    /// The editable tick group at `tick` (copied from the track on first use).
+    static std::vector<Event>& group(WorkingTrack& working, Tick tick);
+    /// Tick of a current event, or nullopt when the track does not hold it.
+    static std::optional<Tick> tick_of(WorkingTrack& working, EventId id);
+    /// Merges changed tick groups back into the track's event list.
+    static void materialize(WorkingTrack& working);
+    static std::uint64_t allocate_order_key(std::vector<Event>& group, OrderPlacement placement,
+                                            std::size_t& insert_position);
 
     const DocumentData& document_;
     std::string label_;
-    std::vector<WorkingTrack> working_;
+    std::deque<WorkingTrack> working_;   ///< Deque: working_track() pointers survive later touches.
     std::vector<EditOperation> explicit_operations_;
     std::vector<std::pair<SequenceId, Sequence>> sequence_updates_;
     std::vector<std::pair<TrackId, Track>> track_updates_;

@@ -36,7 +36,9 @@ recording, organizing and searching MIDI. It needs no account and never goes onl
 2. Choose the **Draw** tool (the pencil on the toolbar, or press **2**) and click in the piano roll
    to add notes; drag to set their length. Double-click empty space in the Select tool to add a
    note too. The toolbar also holds the snap grid, transport, loop, metronome and a command search.
-3. Press **Space** to play and stop. The loop bracket in the ruler repeats the first four bars.
+3. Press **Space** to play from the edit cursor and again to stop; the playhead returns to where
+   playback started. **Ctrl+Space** pauses and resumes in place. The loop bracket in the ruler
+   repeats the first four bars.
 4. In the **Inspector**, pick a root and scale and tick **Highlight scale rows** to see the scale.
 5. **File > Save** writes a `.mwb` document; **File > Export MIDI** writes a `.mid` for your DAW.
 6. To build a library, open the Library panel (books icon or **Ctrl+1**), click **Create or Open
@@ -67,7 +69,9 @@ multi-sequence file.
 
 | Keys | Action |
 |---|---|
-| Space / Shift+Space / Ctrl+Space | Play–pause / play from selection / stop and return |
+| Space | Play from the edit cursor / stop and return to where playback started |
+| Ctrl+Space / Shift+Space | Pause and resume in place / play from the selection |
+| Home / End | Go to the start / the end of the song (also while playing) |
 | R | Record (with the count-in chosen in the Transport menu) |
 | 1 / 2 / 3 / 4 / 5 | Select / Draw / Erase / Split / Audition tool |
 | B | Toggle Draw and Select |
@@ -77,8 +81,8 @@ multi-sequence file.
 | Ctrl+A | Select all |
 | Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste at the edit cursor |
 | Ctrl+D | Duplicate the selection right after itself |
-| ← / → | Move the selected notes by one grid step; with nothing selected, move the play position |
-| Ctrl+← / Ctrl+→ | Move the play position (red line) one grid step; Space then plays from there |
+| ← / → | Move the selected notes by one grid step; with nothing selected, move the play position like Ctrl+← / Ctrl+→ |
+| Ctrl+← / Ctrl+→ | Move the play position (red line); Space then plays from there. The step follows the zoom (the smallest of grid step, beat, bar, 4 bars and 16 bars that is at least about 48 px wide) and grows while the key is held (one unit coarser after 0.4 s, two after 1.2 s). While playing, the playhead jumps |
 | ↑ / ↓, Shift+↑ / Shift+↓ | Transpose by a semitone / an octave |
 | Ctrl+↑ / Ctrl+↓ | Move by one degree of the scale |
 | Q / Ctrl+Q | Apply last quantize / open the quantize tool |

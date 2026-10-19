@@ -104,7 +104,7 @@ void BlockRenderer::dispatch_live(const playback::RealtimeMidiEvent& event, bool
     render_until(event.frame_offset);
     ++block_events_;
     if (ISynth* synth = synth_for(to_soundfont ? Destination::soundfont_synth : Destination::builtin_synth))
-        synth->dispatch(event);
+        synth->dispatch_live(event);
 }
 
 void BlockRenderer::finish() noexcept { render_until(frames_); }

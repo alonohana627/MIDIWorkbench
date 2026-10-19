@@ -18,6 +18,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <format>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
@@ -428,6 +429,7 @@ struct Library::State {
                 insert_sequence_summary(database, revision_id, effective);
             }
             result["keys"] = std::move(keys);
+            insert_sequence_facts(database, revision_id);
         }
         Statement run(database, "INSERT OR REPLACE INTO analysis_run(revision_id, analyzer, version, settings_sha256, "
                                 "status, completed_ms, result_json) VALUES (?1, 'basic', ?2, ?3, ?4, ?5, ?6)");
@@ -438,6 +440,25 @@ struct Library::State {
         run.bind(5, now_utc_ms());
         run.bind(6, result.dump());
         run.exec();
+    }
+
+    /// Derives the indexed search facts (sequence_fact, schema v2) of one revision from its
+    /// stored summaries, with the same SQL the migration backfill uses.
+    void insert_sequence_facts(SQLite::Database& database, std::int64_t revision_id) {
+        const auto sql = sequence_fact_sql(true);
+        std::size_t begin = 0;
+        while (begin < sql.size()) {
+            auto end = sql.find(';', begin);
+            if (end == std::string::npos)
+                end = sql.size();
+            const auto text = trim(std::string_view(sql).substr(begin, end - begin));
+            begin = end + 1;
+            if (text.empty())
+                continue;
+            Statement insert(database, std::string(text));
+            insert.bind(1, revision_id);
+            insert.exec();
+        }
     }
 
     void insert_sequence_summary(SQLite::Database& database, std::int64_t revision_id, const SequenceSummary& summary) {
@@ -523,6 +544,7 @@ struct Library::State {
         runs.bind(1, from);
         runs.bind(2, to);
         runs.exec();
+        insert_sequence_facts(database, to);
     }
 
     /// Rebuilds the asset's FTS row from catalog metadata and the head's stored analysis text.
@@ -708,6 +730,8 @@ Result<std::unique_ptr<Library>> Library::open(const std::filesystem::path& root
         return std::unexpected(std::move(database).error());
     state->writer = std::move(*database);
     MWB_TRY(check_catalog_header(*state->writer));
+    // Older catalogs gain the search facts and covering indexes the SQL compiler relies on.
+    MWB_TRY(migrate_catalog(*state->writer));
     auto library_uuid = read_catalog_uuid(*state->writer);
     if (!library_uuid)
         return std::unexpected(std::move(library_uuid).error());
@@ -2161,13 +2185,17 @@ class CatalogMotifIndex final : public search::MotifIndexReader {
 public:
     explicit CatalogMotifIndex(SQLite::Database& database) : database_(database) {}
 
-    Result<std::uint64_t> count_postings(const search::GramKey& key) override {
+    Result<std::uint64_t> count_postings(const search::GramKey& key, std::uint64_t cap) override {
         return sqlite_support::guarded("motif postings", [&]() -> Result<std::uint64_t> {
-            Statement query(database_, "SELECT count(*) FROM motif_gram AS g JOIN motif_stream AS s ON s.id = g.stream_id "
-                                       "JOIN asset AS a ON a.current_revision_id = s.revision_id WHERE g.family = ?1 AND "
-                                       "g.gram_length = ?2 AND g.gram_hash = ?3 AND s.profile_version = ?4 AND "
-                                       "a.deleted_ms IS NULL");
-            bind_key(query, key);
+            // Ranking estimate from the covering index alone, capped: no join per posting, and a
+            // ubiquitous gram costs at most `cap` index steps. postings() still filters to heads.
+            Statement query(database_, "SELECT count(*) FROM (SELECT 1 FROM motif_gram INDEXED BY gram_lookup WHERE "
+                                       "family = ?1 AND gram_length = ?2 AND gram_hash = ?3 LIMIT ?4)");
+            query.bind(1, std::string(search::token_family_name(key.family)));
+            query.bind(2, static_cast<std::int64_t>(key.length));
+            const auto bytes = search::gram_hash_bytes(key.hash);
+            sqlite_support::bind_bytes(query, 3, bytes);
+            query.bind(4, static_cast<std::int64_t>(std::min<std::uint64_t>(cap, std::numeric_limits<std::int64_t>::max())));
             query.executeStep();
             return static_cast<std::uint64_t>(query.getColumn(0).getInt64());
         });
@@ -2314,7 +2342,10 @@ Result<AnalyzeReport> Library::analyze(const AnalyzeOptions& options, std::stop_
             } else if (midi::detect_container(*bytes) == midi::Container::unknown) {
                 failure = "unsupported content";
             } else {
-                auto imported = midi::import_midi(*bytes, "analysis", {}, stop);
+                // The same untrusted bytes as import: parse them through the caller's parser (the
+                // isolated worker in the application, section 28.2), never unconditionally in process.
+                auto imported = options.parser ? options.parser(*bytes, "analysis", options.limits, stop)
+                                               : midi::import_midi(*bytes, "analysis", options.limits, stop);
                 if (imported)
                     document = std::move(imported->document);
                 else
@@ -2435,6 +2466,8 @@ Result<AnalyzeReport> Library::analyze(const AnalyzeOptions& options, std::stop_
             } else {
                 ++report.revisions_failed;
             }
+            if (options.progress)
+                options.progress(report.revisions_analyzed + report.revisions_failed);
         }
     }
     return report;

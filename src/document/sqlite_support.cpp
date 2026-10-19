@@ -37,6 +37,16 @@ void bind_bytes(SQLite::Statement& statement, int index, std::span<const std::ui
     statement.bind(index, bytes.data(), static_cast<int>(bytes.size()));
 }
 
+void bind_bytes_no_copy(SQLite::Statement& statement, int index, std::span<const std::uint8_t> bytes) {
+    if (bytes.empty()) {
+        statement.bindNoCopy(index, &empty_blob_marker, 0);
+        return;
+    }
+    if (bytes.size() > static_cast<std::size_t>(INT_MAX))
+        throw std::length_error("BLOB larger than SQLite can bind");
+    statement.bindNoCopy(index, bytes.data(), static_cast<int>(bytes.size()));
+}
+
 std::vector<std::uint8_t> column_bytes(const SQLite::Statement& statement, int index) {
     const SQLite::Column column = statement.getColumn(index);
     if (column.isNull())
@@ -123,6 +133,10 @@ Status harden_untrusted_connection(SQLite::Database& database, std::int64_t max_
     MWB_TRY(configure(SQLITE_DBCONFIG_ENABLE_TRIGGER, 0, "enable_trigger"));
     MWB_TRY(configure(SQLITE_DBCONFIG_ENABLE_VIEW, 0, "enable_view"));
     database.exec("PRAGMA trusted_schema = OFF");
+    // SQLite's guidance for untrusted database files: verify cell sizes while reading b-tree
+    // pages (catches crafted pages earlier) and never memory-map the file.
+    database.exec("PRAGMA cell_size_check = ON");
+    database.exec("PRAGMA mmap_size = 0");
     database.exec("PRAGMA query_only = ON");
     return ok();
 }

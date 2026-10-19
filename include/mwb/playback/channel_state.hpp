@@ -34,6 +34,8 @@ struct ChannelState {
     bool channel_pressure_touched = false;
     std::uint8_t parameter_msb = 127; ///< Selected registered parameter (127/127 = null).
     std::uint8_t parameter_lsb = 127;
+    std::uint8_t nrpn_msb = 127;      ///< Selected non-registered parameter (CC99/98).
+    std::uint8_t nrpn_lsb = 127;
     bool parameter_is_registered = true; ///< False after NRPN selection (data entry is then ignored).
     std::uint8_t bend_range_semitones = 2;
     std::uint8_t bend_range_cents = 0;
@@ -69,5 +71,11 @@ struct ChannelState {
 /// Returns the number of messages written (at most max_chase_messages and output.size()).
 [[nodiscard]] std::size_t write_chase_messages(const ChannelState& target, const ChannelState& live,
                                                std::uint8_t channel, std::span<ShortMessage> output) noexcept;
+
+/// Like write_chase_messages, but writes only what differs between `live` (what the device has)
+/// and `target`: used after a snapshot swap during playback, where resending every controller
+/// would be audible. Returns 0 when the states sound the same.
+[[nodiscard]] std::size_t write_chase_differences(const ChannelState& target, const ChannelState& live,
+                                                  std::uint8_t channel, std::span<ShortMessage> output) noexcept;
 
 } // namespace mwb::playback

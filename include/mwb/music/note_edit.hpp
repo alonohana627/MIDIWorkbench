@@ -7,9 +7,11 @@
 #include "mwb/core/time.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace mwb::music {
@@ -64,18 +66,28 @@ struct NoteValues {
 /// Pure editing session over an immutable document snapshot. It pairs the notes of one
 /// sequence, lets a transformation update, remove or add notes and other events by identity,
 /// and produces one ChangeSet. Events whose time or pitch changed are re-ordered within their
-/// tick so that note ends precede note starts (section 16.6); untouched tick groups keep their
-/// order keys. The document must outlive the editor.
+/// tick so that note ends precede note starts (section 16.6), except that the end of a
+/// zero-length note stays after its own start; untouched tick groups keep their order keys.
+/// The document must outlive the editor.
+///
+/// Cost: opening pairs the sequence once (or borrows a pairing the caller already holds);
+/// everything else is proportional to the touched tracks and notes, so a one-note nudge on a
+/// large document does not copy or index the whole sequence.
 class NoteEditor {
 public:
     /// Opens the sequence named by `sequence`.
     [[nodiscard]] static Result<NoteEditor> open(const DocumentData& document, SequenceId sequence);
+    /// Opens the sequence with a pairing the caller already computed with pair_notes for exactly
+    /// this document state (for example the editor view's cache). The pairing is borrowed and
+    /// must outlive the editor; a stale pairing is detected for the selected notes and rejected.
+    [[nodiscard]] static Result<NoteEditor> open(const DocumentData& document, SequenceId sequence,
+                                                 const NotePairing& pairing);
 
     [[nodiscard]] const DocumentData& document() const noexcept { return *document_; }
     [[nodiscard]] const Sequence& sequence() const noexcept { return document_->sequences[sequence_index_]; }
     [[nodiscard]] std::int32_t ppq() const noexcept;
     /// Notes of the original sequence (pair_notes order).
-    [[nodiscard]] const std::vector<NoteSpan>& notes() const noexcept { return pairing_.notes; }
+    [[nodiscard]] const std::vector<NoteSpan>& notes() const noexcept { return pairing_->notes; }
 
     /// Indices into notes() matching the selection, ordered by (start, track, pitch, note order).
     /// Fails when the selection names unknown tracks or notes.
@@ -124,32 +136,42 @@ private:
         Tick original_tick = 0;
         std::uint64_t original_order = 0;
         std::uint64_t creation = 0;   ///< Creation order for new events (0 for existing).
+        int rank = 1;                 ///< Order rank inside a tick, set by finish().
     };
-    /// Position of an original event in the sequence.
-    struct EventLocation {
-        std::size_t track = 0;
-        std::size_t index = 0;
+    /// Positions of a note's events in their tracks' original (and working) event lists.
+    struct NotePositions {
+        std::optional<std::size_t> on;
+        std::optional<std::size_t> off;
     };
 
     NoteEditor() = default;
+    [[nodiscard]] static Result<NoteEditor> open_with(const DocumentData& document, SequenceId sequence,
+                                                      std::shared_ptr<const NotePairing> pairing, bool borrowed);
     /// Working copy of a track's events, created on first touch (indices match the original).
     std::vector<WorkingEvent>& working(std::size_t track_index);
-    /// Working copy of an original event, or nullptr for unknown identities.
-    WorkingEvent* working_event(EventId id);
-    /// Current state of an original event without creating a working copy.
-    [[nodiscard]] const Event* current_event(EventId id) const;
+    /// Position of an original event found by its original tick (binary search, then a scan of
+    /// that tick group), so no whole-sequence identity index is needed.
+    [[nodiscard]] std::optional<std::size_t> original_position(std::size_t track_index, EventId id, Tick tick) const;
+    /// Event positions of a note, cached for touched notes.
+    [[nodiscard]] NotePositions positions(std::size_t note) const;
+    /// Current state of an original event (working copy when the track has one).
+    [[nodiscard]] const Event* current_event(std::size_t track_index, std::optional<std::size_t> position) const;
+    void touch_note(std::size_t note);
 
     const DocumentData* document_ = nullptr;
     std::size_t sequence_index_ = 0;
-    NotePairing pairing_;
-    std::unordered_map<EventId, EventLocation, UuidHash> locations_;
+    std::shared_ptr<const NotePairing> pairing_;
+    bool borrowed_pairing_ = false;
     std::unordered_map<std::size_t, std::vector<WorkingEvent>> working_;
-    std::unordered_map<EventId, std::size_t, UuidHash> note_index_;
+    mutable std::unordered_map<std::size_t, NotePositions> note_positions_;
+    std::vector<std::size_t> touched_notes_;   ///< Notes updated or removed, in first-touch order.
     std::vector<std::pair<std::size_t, NoteValues>> added_notes_;
+    std::unordered_set<EventId, UuidHash> zero_length_added_ends_;
     std::vector<bool> note_touched_;
     std::vector<bool> note_removed_;
     std::uint64_t creation_counter_ = 0;
     bool chronological_ = false;
+    bool retimed_ = false;   ///< retime_event was used; untouched notes may have moved.
     std::vector<std::pair<std::size_t, Track>> track_headers_;
     std::optional<Sequence> sequence_header_;
 };
@@ -193,8 +215,10 @@ struct PreparedTransform {
 
 /// Opens the editor and resolves the selection. `require_ppq` rejects SMPTE sequences for tools
 /// that need a musical grid (section 17.4: convert explicitly first).
+/// `pairing`, when given, is the caller's pairing of the selection's sequence for exactly this
+/// document state (see NoteEditor::open); it saves re-pairing the whole sequence per edit.
 [[nodiscard]] Result<PreparedTransform> prepare_transform(const DocumentData& document,
                                                           const TargetSelection& selection, std::string_view tool,
-                                                          bool require_ppq);
+                                                          bool require_ppq, const NotePairing* pairing = nullptr);
 
 } // namespace mwb::music

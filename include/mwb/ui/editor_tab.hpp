@@ -19,6 +19,7 @@ namespace mwb::ui {
 
 class DocumentController;
 class DrumGridView;
+class DrumGridPanel;
 
 /// Track list beside the editor: name, mute, solo and color per track (section 12). All are
 /// document edits (undoable); recording goes to the selected (active) track.
@@ -53,6 +54,13 @@ public:
 
     [[nodiscard]] DocumentController& controller() { return *controller_; }
     [[nodiscard]] PianoRollView& piano_roll() { return piano_roll_->view(); }
+    [[nodiscard]] DrumGridView& drum_grid();
+    /// Transport playhead for this document's editors (contract C1): forwards to the piano roll
+    /// and the drum grid, which page to follow it while following is on.
+    void set_playhead(std::optional<Tick> tick);
+    void set_follow_playhead(bool follow);
+    /// Loop Selection command: loops the grid-aligned extent of the selected notes.
+    void loop_selection() { piano_roll().loop_selection(); }
     [[nodiscard]] KeyboardWidget& keyboard() { return *keyboard_; }
     void set_keyboard_visible(bool visible) { keyboard_->setVisible(visible); }
     [[nodiscard]] TrackListWidget& track_list() { return *track_list_; }
@@ -76,7 +84,7 @@ private:
     TrackListWidget* track_list_ = nullptr;
     QStackedWidget* center_ = nullptr;
     PianoRollPanel* piano_roll_ = nullptr;
-    DrumGridView* drum_grid_ = nullptr;
+    DrumGridPanel* drum_grid_ = nullptr;
     QWidget* lanes_container_ = nullptr;
     std::vector<ControllerLane*> lanes_;
     KeyboardWidget* keyboard_ = nullptr;

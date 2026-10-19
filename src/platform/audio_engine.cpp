@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <thread>
 
 namespace mwb::platform {
 
@@ -24,9 +25,11 @@ struct AudioEngine::Queues {
     explicit Queues(const AudioEngineSettings& settings)
         : control(settings.control_queue_capacity),
           live(settings.live_queue_capacity),
+          monitor(settings.live_queue_capacity),
           external(settings.external_queue_capacity) {}
     moodycamel::ReaderWriterQueue<EngineCommand> control;               ///< Owner -> render.
-    moodycamel::ReaderWriterQueue<playback::RealtimeMidiEvent> live;    ///< Input router -> render.
+    moodycamel::ReaderWriterQueue<playback::RealtimeMidiEvent> live;    ///< Owner (auditions) -> render.
+    moodycamel::ReaderWriterQueue<playback::RealtimeMidiEvent> monitor; ///< Input monitor -> render.
     moodycamel::BlockingReaderWriterQueue<ExternalMidiEvent> external;  ///< Render -> MIDI output.
 };
 
@@ -126,6 +129,12 @@ Result<NegotiatedFormat> AudioEngine::open(IAudioOutput& output, const AudioOutp
     volume_coefficient_ =
         1.0f - std::exp(-1.0f / std::max(settings_.volume_ramp_seconds * static_cast<float>(rate), 1.0f));
     output_ = &output;
+    output_latency_ns_ = static_cast<std::int64_t>(format->buffer_latency_ms() * 1'000'000.0);
+    // The render thread is not running yet: live input queued while no device was open is stale
+    // (it would sound all at once), so it is discarded here.
+    playback::RealtimeMidiEvent stale;
+    while (queues_->live.try_dequeue(stale) || queues_->monitor.try_dequeue(stale)) {
+    }
     if (auto started = output.start(); !started) {
         output_ = nullptr;
         return fail(started.error());
@@ -139,9 +148,10 @@ void AudioEngine::close() {
     std::ignore = output_->stop(); // Closing below releases the device whatever stop reported.
     output_->close();
     output_ = nullptr;
-    // The render thread has stopped: release owned notes (external routes get their note-offs).
+    // The render thread has stopped: release owned notes and panic every used route, so external
+    // MIDI gets its note-offs, sustain-off, all-notes-off and bend reset before the router drains.
     renderer_.begin(nullptr, 0);
-    scheduler_.stop(renderer_);
+    scheduler_.panic(renderer_);
     if (builtin_ != nullptr)
         builtin_->panic();
     if (soundfont_ != nullptr)
@@ -149,6 +159,8 @@ void AudioEngine::close() {
     std::ignore = scheduler_.set_snapshot(nullptr, renderer_); // Clearing never fails.
     std::ignore = renderer_.bind(nullptr);                     // Same.
     playing_.store(false, std::memory_order_release);
+    counting_in_.store(false, std::memory_order_relaxed);
+    clock_playing_.store(false, std::memory_order_relaxed);
 }
 
 Status AudioEngine::publish(std::shared_ptr<const playback::PlaybackSnapshot> snapshot) {
@@ -160,6 +172,9 @@ Status AudioEngine::publish(std::shared_ptr<const playback::PlaybackSnapshot> sn
         return make_error(ErrorCode::invalid_argument, "the snapshot was compiled for a different sample rate");
     if (snapshot->routes.size() > settings_.scheduler.route_capacity)
         return make_error(ErrorCode::limit_exceeded, "the snapshot has more routes than the engine supports");
+    recent_.push_back(snapshot);
+    while (recent_.size() > 8)
+        recent_.pop_front();
     return handoff_.publish(std::move(snapshot));
 }
 
@@ -175,6 +190,13 @@ Status AudioEngine::post(EngineCommand command) {
 
 bool AudioEngine::post_live(const playback::RealtimeMidiEvent& event) noexcept {
     if (queues_->live.try_enqueue(event))
+        return true;
+    live_dropped_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+bool AudioEngine::post_monitor(const playback::RealtimeMidiEvent& event) noexcept {
+    if (queues_->monitor.try_enqueue(event))
         return true;
     live_dropped_.fetch_add(1, std::memory_order_relaxed);
     return false;
@@ -204,9 +226,51 @@ EngineTelemetry AudioEngine::telemetry() const noexcept {
     telemetry.song_frame = song_frame_.load(std::memory_order_relaxed);
     telemetry.position = position_.load(std::memory_order_relaxed);
     telemetry.epoch = epoch_.load(std::memory_order_relaxed);
+    telemetry.run = clock_run_.load(std::memory_order_relaxed);
     telemetry.playing = playing_.load(std::memory_order_relaxed);
+    telemetry.counting_in = counting_in_.load(std::memory_order_relaxed);
     telemetry.reached_end = reached_end_.load(std::memory_order_relaxed);
     return telemetry;
+}
+
+EngineClock AudioEngine::clock() const noexcept {
+    EngineClock clock;
+    for (;;) {
+        const std::uint64_t before = clock_sequence_.load(std::memory_order_acquire);
+        if ((before & 1u) != 0) {
+            std::this_thread::yield();
+            continue;
+        }
+        clock.steady_ns = clock_steady_ns_.load(std::memory_order_relaxed);
+        clock.absolute_frame = clock_absolute_.load(std::memory_order_relaxed);
+        clock.scheduler.anchor = clock_anchor_.load(std::memory_order_relaxed);
+        clock.scheduler.iteration = clock_iteration_.load(std::memory_order_relaxed);
+        clock.scheduler.passes = clock_passes_.load(std::memory_order_relaxed);
+        clock.scheduler.looping = clock_looping_.load(std::memory_order_relaxed);
+        clock.scheduler.playing = clock_playing_.load(std::memory_order_relaxed);
+        clock.snapshot_generation = clock_generation_.load(std::memory_order_relaxed);
+        clock.run = clock_run_.load(std::memory_order_relaxed);
+        clock.counting_in = clock_counting_in_.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (clock_sequence_.load(std::memory_order_relaxed) == before)
+            return clock;
+    }
+}
+
+std::optional<Tick> AudioEngine::transport_tick_at(std::int64_t steady_ns, std::uint64_t run) const {
+    const EngineClock clock = this->clock();
+    if (!clock.scheduler.playing || clock.run != run || sample_rate_ == 0)
+        return std::nullopt;
+    const playback::PlaybackSnapshot* snapshot = nullptr;
+    for (const auto& candidate : recent_)
+        if (candidate->snapshot_generation == clock.snapshot_generation)
+            snapshot = candidate.get();
+    if (snapshot == nullptr)
+        return std::nullopt;
+    // The frame being heard at `steady_ns` was rendered one output latency earlier.
+    const __int128 elapsed_ns = static_cast<__int128>(steady_ns) - clock.steady_ns - output_latency_ns_;
+    const auto absolute = clock.absolute_frame + static_cast<std::int64_t>(elapsed_ns * sample_rate_ / 1'000'000'000);
+    return playback::linear_tick_at(*snapshot, clock.scheduler, absolute);
 }
 
 bool AudioEngine::device_lost() const noexcept { return output_ != nullptr && output_->device_lost(); }
@@ -218,7 +282,8 @@ void AudioEngine::apply_command(const EngineCommand& command) noexcept {
     case EngineCommandKind::play:
         reached_end_.store(false, std::memory_order_relaxed);
         stop_pending_ = false;
-        scheduler_.start(command.tick, renderer_);
+        ++runs_;
+        scheduler_.start(command.tick, renderer_, 0, command.count_in_bars);
         return;
     case EngineCommandKind::stop:
         scheduler_.stop(renderer_);
@@ -269,6 +334,10 @@ void AudioEngine::render_slice(float* output, std::uint32_t frames, std::int64_t
         live.frame_offset = 0;
         renderer_.dispatch_live(live);
     }
+    for (std::size_t count = 0; count < max_live_events_per_block && queues_->monitor.try_dequeue(live); ++count) {
+        live.frame_offset = 0;
+        renderer_.dispatch_live(live);
+    }
     const playback::BlockResult result = scheduler_.process_block(frames, renderer_);
     if (result.reached_end && scheduler_.playing())
         stop_pending_ = true;
@@ -285,6 +354,7 @@ void AudioEngine::render_slice(float* output, std::uint32_t frames, std::int64_t
 
 void AudioEngine::render(float* interleaved_stereo, std::uint32_t frame_count) noexcept {
     const std::int64_t start_ns = steady_now_ns();
+    const std::int64_t start_frame = scheduler_.absolute_frame();
     std::uint32_t done = 0;
     while (done < frame_count) {
         const std::uint32_t slice = std::min(frame_count - done, settings_.max_block_frames);
@@ -302,6 +372,21 @@ void AudioEngine::render(float* interleaved_stereo, std::uint32_t frame_count) n
     song_frame_.store(scheduler_.song_frame(), std::memory_order_relaxed);
     position_.store(scheduler_.position_tick(), std::memory_order_relaxed);
     epoch_.store(scheduler_.epoch(), std::memory_order_relaxed);
+    counting_in_.store(scheduler_.in_count_in(), std::memory_order_relaxed);
+    // Clock seqlock write (wait-free for the render thread).
+    const playback::SchedulerClock scheduler_clock = scheduler_.clock();
+    clock_sequence_.fetch_add(1, std::memory_order_acq_rel);
+    clock_steady_ns_.store(start_ns, std::memory_order_relaxed);
+    clock_absolute_.store(start_frame, std::memory_order_relaxed);
+    clock_anchor_.store(scheduler_clock.anchor, std::memory_order_relaxed);
+    clock_iteration_.store(scheduler_clock.iteration, std::memory_order_relaxed);
+    clock_passes_.store(scheduler_clock.passes, std::memory_order_relaxed);
+    clock_looping_.store(scheduler_clock.looping, std::memory_order_relaxed);
+    clock_playing_.store(scheduler_clock.playing, std::memory_order_relaxed);
+    clock_generation_.store(snapshot_generation_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    clock_run_.store(runs_, std::memory_order_relaxed);
+    clock_counting_in_.store(scheduler_.in_count_in(), std::memory_order_relaxed);
+    clock_sequence_.fetch_add(1, std::memory_order_release);
     playing_.store(scheduler_.playing(), std::memory_order_release);
     if (end_reached_in_callback_) {
         reached_end_.store(true, std::memory_order_release);

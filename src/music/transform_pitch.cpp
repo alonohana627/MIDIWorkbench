@@ -18,7 +18,7 @@ bool on_drum_track(const NoteEditor& editor, std::size_t note) {
 // --- Transpose -----------------------------------------------------------------------------------
 
 Result<TransformPreview> transpose(const DocumentData& document, const TargetSelection& selection,
-                                   const TransposeParameters& parameters) {
+                                   const TransposeParameters& parameters, const NotePairing* pairing) {
     const int limit = parameters.mode == TransposeMode::octaves ? 10 : parameters.mode == TransposeMode::semitones ? 127 : 128;
     if (parameters.amount < -limit || parameters.amount > limit)
         return make_error(ErrorCode::invalid_argument, "transposition amount is out of range");
@@ -29,7 +29,7 @@ Result<TransformPreview> transpose(const DocumentData& document, const TargetSel
             return std::unexpected(parsed.error());
         scale = *parsed;
     }
-    auto prepared = prepare_transform(document, selection, "transpose", false);
+    auto prepared = prepare_transform(document, selection, "transpose", false, pairing);
     if (!prepared)
         return std::unexpected(prepared.error());
     auto& [editor, selected, report] = *prepared;
@@ -49,7 +49,17 @@ Result<TransformPreview> transpose(const DocumentData& document, const TargetSel
             return scale->transpose_by_degrees(pitch, amount, parameters.out_of_scale, parameters.tie);
         return pitch + amount;
     };
+    // Chromatic modes shift every pitch equally, so the extremes decide; only degree mode needs
+    // the per-note check (keeps constrained transposition of large selections linear).
+    int lowest = 127;
+    int highest = 0;
+    for (const auto note : affected) {
+        lowest = std::min(lowest, editor.values(note).pitch);
+        highest = std::max(highest, editor.values(note).pitch);
+    }
     const auto fits = [&](int amount) {
+        if (!scale)
+            return affected.empty() || (lowest + amount >= 0 && highest + amount <= 127);
         for (const auto note : affected) {
             const int pitch = target_pitch(note, amount);
             if (pitch < 0 || pitch > 127)

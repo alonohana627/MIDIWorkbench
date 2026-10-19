@@ -159,8 +159,10 @@ struct GramPosting {
 class MotifIndexReader {
 public:
     virtual ~MotifIndexReader() = default;
-    /// Number of postings of a key.
-    [[nodiscard]] virtual Result<std::uint64_t> count_postings(const GramKey& key) = 0;
+    /// Number of postings of a key, counted up to `cap` (a result equal to `cap` means "at least
+    /// cap"): ranking only needs to know which grams are rare, and a full count of a ubiquitous
+    /// gram would cost as much as reading its postings.
+    [[nodiscard]] virtual Result<std::uint64_t> count_postings(const GramKey& key, std::uint64_t cap) = 0;
     /// Postings ordered by (stream_id, start_ordinal), at most `limit`.
     [[nodiscard]] virtual Result<std::vector<GramPosting>> postings(const GramKey& key, std::size_t limit) = 0;
     /// Loads and decodes one stream; nullopt when it no longer exists.
@@ -175,7 +177,7 @@ public:
     /// Adds a stream (stream_id must be unique) and indexes its grams.
     void add(StoredMotifStream stream);
 
-    [[nodiscard]] Result<std::uint64_t> count_postings(const GramKey& key) override;
+    [[nodiscard]] Result<std::uint64_t> count_postings(const GramKey& key, std::uint64_t cap) override;
     [[nodiscard]] Result<std::vector<GramPosting>> postings(const GramKey& key, std::size_t limit) override;
     [[nodiscard]] Result<std::optional<StoredMotifStream>> load_stream(std::int64_t stream_id) override;
     [[nodiscard]] Result<std::vector<std::int64_t>> stream_ids(std::int64_t after_id, std::size_t limit) override;
@@ -205,6 +207,8 @@ struct ExactQuery {
     /// Allowed deviation of each scaled candidate inter-onset interval, in candidate ticks.
     Tick rhythm_tolerance = 0;
     std::size_t result_limit = 100;
+    /// Continue after this occurrence (the previous result's `next`). A scan cut short by
+    /// scan_stream_limit also yields `next`, so short queries can always continue.
     std::optional<ExactContinuation> after;
     /// Bound on postings read per gram and on streams scanned for short queries.
     std::size_t posting_limit = 1'000'000;
@@ -315,6 +319,7 @@ struct ApproximateSearchResult {
     std::size_t windows_aligned = 0;
     bool candidate_budget_reached = false;
     bool partial = false;
+    std::string partial_reason;
     std::string label; ///< "approximate search (budget: N streams, M windows per stream)".
 };
 

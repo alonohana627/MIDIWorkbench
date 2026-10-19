@@ -10,6 +10,7 @@
 #include <QPointer>
 #include <QTimer>
 
+#include <chrono>
 #include <filesystem>
 #include <map>
 #include <functional>
@@ -122,9 +123,22 @@ private:
     void duplicate_selection();
     void copy_selection(bool cut);
     void paste_at_cursor();
-    void toggle_play();
+    /// Space: stopped -> play from the edit cursor; rolling (or paused) -> stop and return to
+    /// where playback started, like a DAW.
+    void play_stop();
+    /// Ctrl+Space: pause a running transport, resume a paused one (from the edit cursor when it
+    /// was moved meanwhile), or start when stopped.
+    void pause_resume();
     void stop_transport();
     void play_from_selection();
+    void go_to_start();
+    void go_to_end();
+    /// Next (direction +1) or previous (-1) play position from `from`, by a unit that follows the
+    /// zoom: the smallest of grid step, beat, bar, 4 bars and 16 bars that is at least
+    /// `min_step_pixels` wide, raised by `acceleration` units (holding the key).
+    [[nodiscard]] Tick play_position_step(EditorTab& tab, Tick from, int direction, int acceleration) const;
+    /// Starts the transport for `tab` at `from` and remembers it as the return position.
+    void start_playback(EditorTab& tab, Tick from);
     void connect_tab(EditorTab* tab);
     void publish_playback();
     void write_screenshot_and_exit();
@@ -166,6 +180,14 @@ private:
     QTimer transport_timer_;
     QTimer recovery_timer_;
     QPointer<DocumentController> transport_owner_;
+    /// Where the current playback started; Space (stop) returns the playhead here.
+    Tick play_started_from_ = 0;
+    /// Edit cursor when the transport paused; a different cursor on resume means "play from here".
+    std::optional<Tick> paused_cursor_;
+    /// Left/Right (with or without Ctrl) held down: the key and when it was first pressed, so
+    /// auto-repeat accelerates the play-position step (reset on release).
+    int held_position_key_ = 0;
+    std::chrono::steady_clock::time_point position_key_down_{};
     /// Library item and revision each tab was opened from (for saving new revisions).
     std::map<const EditorTab*, std::pair<std::int64_t, std::int64_t>> library_sources_;
     /// MIDI parsing in the isolated worker process, shared with the library panel.

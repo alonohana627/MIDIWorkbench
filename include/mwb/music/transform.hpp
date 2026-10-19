@@ -100,8 +100,11 @@ struct TransposeParameters {
 /// Chromatic transposition moves every note by the same amount; with constrain the amount is
 /// reduced (toward zero) until every selected note fits 0..127. Degree mode moves by ordered
 /// scale degrees; with constrain the degree count is reduced until every note fits.
+/// `pairing` (optional) is the caller's current pair_notes result for the selection's sequence;
+/// passing it keeps per-keystroke edits on large documents from re-pairing the whole sequence.
 [[nodiscard]] Result<TransformPreview> transpose(const DocumentData& document, const TargetSelection& selection,
-                                                 const TransposeParameters& parameters);
+                                                 const TransposeParameters& parameters,
+                                                 const NotePairing* pairing = nullptr);
 
 struct MoveParameters {
     Tick ticks = 0;
@@ -110,9 +113,11 @@ struct MoveParameters {
     friend bool operator==(const MoveParameters&, const MoveParameters&) = default;
 };
 /// Moves the selection preserving internal timing and intervals. A move that would cross tick 0
-/// or pitch 0/127 constrains the entire displacement of that axis (section 7.3).
+/// or pitch 0/127 constrains the entire displacement of that axis (section 7.3). `pairing` as in
+/// transpose (the arrow-key nudge and transpose path).
 [[nodiscard]] Result<TransformPreview> move_notes(const DocumentData& document, const TargetSelection& selection,
-                                                  const MoveParameters& parameters);
+                                                  const MoveParameters& parameters,
+                                                  const NotePairing* pairing = nullptr);
 
 // --- Velocity ----------------------------------------------------------------------------------
 

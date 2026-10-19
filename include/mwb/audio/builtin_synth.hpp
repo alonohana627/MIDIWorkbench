@@ -46,6 +46,9 @@ public:
 
     [[nodiscard]] Status prepare(std::uint32_t sample_rate, std::uint32_t max_block_frames) override;
     void dispatch(const playback::RealtimeMidiEvent& event) noexcept override;
+    /// Plays every live message on the private audition channel (index 16, after the sixteen MIDI
+    /// channels), whatever channel its status byte names.
+    void dispatch_live(const playback::RealtimeMidiEvent& event) noexcept override;
     void render(float* interleaved_stereo, std::uint32_t frame_count) noexcept override;
     void panic() noexcept override;
     [[nodiscard]] SynthIdentity identity() const override;
@@ -53,6 +56,10 @@ public:
 
     /// Forces a timbre on a channel (nullopt returns to the program mapping). Real-time safe.
     void set_channel_timbre(std::uint8_t channel, std::optional<Timbre> timbre) noexcept;
+    /// Timbre of the private audition channel (any thread).
+    void set_audition_timbre(std::optional<Timbre> timbre) noexcept;
+    /// Index of the private audition channel.
+    static constexpr std::uint8_t audition_channel = 16;
     /// Voices taken from sounding notes since prepare().
     [[nodiscard]] std::uint64_t steal_count() const noexcept { return steals_.load(std::memory_order_relaxed); }
     /// Note-ons that could not get any voice (only when a stolen voice could not be reused).
@@ -67,14 +74,16 @@ private:
     void note_on(std::uint8_t channel, std::uint8_t note, std::uint8_t velocity) noexcept;
     void note_off(std::uint8_t channel, std::uint8_t note) noexcept;
     void control_change(std::uint8_t channel, std::uint8_t controller, std::uint8_t value) noexcept;
+    void dispatch_on(std::uint8_t channel, const playback::RealtimeMidiEvent& event) noexcept;
     void start_voice(Voice& voice, std::uint8_t channel, std::uint8_t note, std::uint8_t velocity) noexcept;
     Voice* allocate_voice() noexcept;
 
     BuiltinSynthSettings settings_;
     std::vector<Voice> voices_;       ///< Main pool.
     std::vector<Voice> fade_voices_;  ///< Ramp-out slots for stolen voices.
-    std::unique_ptr<std::array<Channel, 16>> channels_;
-    std::array<std::atomic<int>, 16> timbre_override_{};
+    /// Sixteen MIDI channels plus the private audition channel.
+    std::unique_ptr<std::array<Channel, 17>> channels_;
+    std::array<std::atomic<int>, 17> timbre_override_{};
     std::uint32_t sample_rate_ = 48000;
     std::uint64_t voice_serial_ = 0;
     std::atomic<std::uint64_t> steals_{0};

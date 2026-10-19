@@ -141,7 +141,6 @@ private:
     };
     void finish_save(std::shared_ptr<PendingSave> pending);
     std::shared_ptr<PendingSave> pending_save_;
-    std::jthread save_thread_; // declared last: joined before the members it uses are destroyed
 
     mutable std::uint64_t cache_generation_ = UINT64_MAX;
     mutable std::size_t cache_sequence_ = SIZE_MAX;
@@ -149,6 +148,8 @@ private:
     mutable NoteIndex index_;
     mutable std::optional<TempoMap> tempo_;
     mutable std::optional<MeterMap> meter_;
+
+    std::jthread save_thread_; // declared last: joined before the members it uses are destroyed
 };
 
 } // namespace mwb::ui

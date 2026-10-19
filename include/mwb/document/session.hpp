@@ -22,7 +22,10 @@ enum class SessionEventKind : std::uint8_t {
     edited,  ///< A new command was applied.
     undone,  ///< An undo was applied (a new transition with a new generation).
     redone,  ///< A redo was applied (a new transition with a new generation).
-    saved,   ///< A save completed; dirty state may have changed.
+    saved,   ///< A save completed; dirty state may have changed. Both generations are the saved one.
+    /// The undo memory budget evicted older entries: the oldest undoable state is no longer the
+    /// original one (section 21.1 history boundary). No change set; both generations are current.
+    history_trimmed,
 };
 
 /// Notification delivered synchronously to listeners. References are valid only during the call;
@@ -78,7 +81,9 @@ public:
     [[nodiscard]] std::optional<StateId> saved_state() const { return saved_state_; }
 
     /// Applies one command (one undo entry). Returns the new generation; an empty change set
-    /// leaves everything unchanged and returns the current generation.
+    /// leaves everything unchanged and returns the current generation. A change set that would
+    /// grow the document beyond DocumentLimits::max_events_per_document is refused with
+    /// ErrorCode::limit_exceeded (larger documents are inspection/export only, section 28.3).
     [[nodiscard]] Result<Generation> apply(ChangeSet changes);
     /// Undoes the newest entry; returns the new (increased) generation.
     [[nodiscard]] Result<Generation> undo();
@@ -104,7 +109,7 @@ public:
     void remove_listener(ListenerId id);
 
 private:
-    void notify(SessionEventKind kind, const ChangeSet& applied, Generation base);
+    void notify(SessionEventKind kind, const ChangeSet& applied, Generation base, Generation result);
 
     DocumentData document_;
     CommandHistory history_;

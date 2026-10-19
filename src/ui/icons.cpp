@@ -3,9 +3,14 @@
 #include "mwb/ui/theme.hpp"
 
 #include <QApplication>
+#include <QIconEngine>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPixmap>
+#include <QPixmapCache>
+
+#include <algorithm>
+#include <cmath>
 
 namespace mwb::ui {
 
@@ -218,6 +223,13 @@ void paint_icon(QPainter& painter, IconId id, const QColor& ink) {
         fill(bars, ink);
         break;
     }
+    case IconId::more:
+        // Two chevrons: the toolbar overflow ("more controls") button.
+        painter.drawLine(QPointF(6, 6), QPointF(12, 12));
+        painter.drawLine(QPointF(12, 12), QPointF(6, 18));
+        painter.drawLine(QPointF(12, 6), QPointF(18, 12));
+        painter.drawLine(QPointF(18, 12), QPointF(12, 18));
+        break;
     case IconId::close:
         pen.setWidthF(1.8);
         painter.setPen(pen);
@@ -240,30 +252,81 @@ void paint_icon(QPainter& painter, IconId id, const QColor& ink) {
     }
 }
 
-QPixmap render(IconId id, int size, const QColor& ink, qreal ratio) {
-    QPixmap pixmap(QSize(size, size) * ratio);
+QPixmap render(IconId id, QSize size, const QColor& ink, qreal ratio) {
+    const int side = std::max(1, std::min(size.width(), size.height()));
+    QPixmap pixmap(QSize(static_cast<int>(std::lround(size.width() * ratio)), static_cast<int>(std::lround(size.height() * ratio))));
     pixmap.setDevicePixelRatio(ratio);
     pixmap.fill(Qt::transparent);
     QPainter painter(&pixmap);
     painter.setRenderHint(QPainter::Antialiasing);
-    painter.scale(size / 24.0, size / 24.0);
+    // Centered square design grid, so a non-square request never distorts the glyph.
+    painter.translate((size.width() - side) / 2.0, (size.height() - side) / 2.0);
+    painter.scale(side / 24.0, side / 24.0);
     paint_icon(painter, id, ink);
     return pixmap;
 }
 
+/// Ink for one icon mode and state, read from the palette in effect now.
+QColor ink_for(QIcon::Mode mode, QIcon::State state) {
+    const QPalette palette = QApplication::palette();
+    if (mode == QIcon::Disabled)
+        return palette.color(QPalette::Disabled, QPalette::WindowText); // checked or not: never white on a light window
+    if (mode == QIcon::Selected || state == QIcon::On)
+        return palette.color(QPalette::HighlightedText); // drawn on the highlight
+    return palette.color(QPalette::WindowText);
+}
+
+/// Paints icons on demand (see make_icon). Pixmaps are cached by id, size, ratio and ink, so a
+/// theme change simply produces new keys.
+class PaintedIconEngine final : public QIconEngine {
+public:
+    explicit PaintedIconEngine(IconId id) : id_(id) {}
+
+    void paint(QPainter* painter, const QRect& rect, QIcon::Mode mode, QIcon::State state) override {
+        const qreal ratio = painter->device() ? painter->device()->devicePixelRatio() : 1.0;
+        painter->drawPixmap(rect, scaledPixmap(rect.size(), mode, state, ratio));
+    }
+
+    QSize actualSize(const QSize& size, QIcon::Mode, QIcon::State) override { return size; }
+
+    QPixmap pixmap(const QSize& size, QIcon::Mode mode, QIcon::State state) override {
+        return scaledPixmap(size, mode, state, 1.0);
+    }
+
+    QPixmap scaledPixmap(const QSize& size, QIcon::Mode mode, QIcon::State state, qreal scale) override {
+        if (size.isEmpty())
+            return {};
+        const qreal ratio = scale > 0 ? scale : 1.0;
+        const QColor ink = ink_for(mode, state);
+        // The record dot uses the danger color, which also follows the theme.
+        const QString key = QStringLiteral("mwb-icon/%1/%2x%3/%4/%5/%6")
+                                .arg(static_cast<int>(id_))
+                                .arg(size.width())
+                                .arg(size.height())
+                                .arg(ratio)
+                                .arg(ink.rgba())
+                                .arg(danger_color().rgba());
+        QPixmap cached;
+        if (QPixmapCache::find(key, &cached))
+            return cached;
+        QPixmap rendered = render(id_, size, ink, ratio);
+        QPixmapCache::insert(key, rendered);
+        return rendered;
+    }
+
+    [[nodiscard]] QIconEngine* clone() const override { return new PaintedIconEngine(id_); }
+    [[nodiscard]] QString key() const override { return QStringLiteral("mwb-painted"); }
+    QList<QSize> availableSizes(QIcon::Mode, QIcon::State) override {
+        return {QSize(16, 16), QSize(20, 20), QSize(24, 24), QSize(32, 32)};
+    }
+    bool isNull() override { return false; }
+
+private:
+    IconId id_;
+};
+
 } // namespace
 
-QIcon make_icon(IconId id) {
-    const QPalette palette = QApplication::palette();
-    const qreal ratio = qApp ? qApp->devicePixelRatio() : 1.0;
-    QIcon icon;
-    for (const int size : {16, 20, 24, 32}) {
-        icon.addPixmap(render(id, size, palette.color(QPalette::WindowText), ratio), QIcon::Normal, QIcon::Off);
-        icon.addPixmap(render(id, size, palette.color(QPalette::HighlightedText), ratio), QIcon::Normal, QIcon::On);
-        icon.addPixmap(render(id, size, palette.color(QPalette::Disabled, QPalette::WindowText), ratio), QIcon::Disabled,
-                       QIcon::Off);
-    }
-    return icon;
-}
+QIcon make_icon(IconId id) { return QIcon(new PaintedIconEngine(id)); } // QIcon owns the engine
 
 } // namespace mwb::ui

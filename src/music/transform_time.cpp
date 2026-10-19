@@ -194,8 +194,8 @@ Result<TransformPreview> humanize(const DocumentData& document, const TargetSele
 // --- Move ------------------------------------------------------------------------------------------
 
 Result<TransformPreview> move_notes(const DocumentData& document, const TargetSelection& selection,
-                                    const MoveParameters& parameters) {
-    auto prepared = prepare_transform(document, selection, "move", false);
+                                    const MoveParameters& parameters, const NotePairing* pairing) {
+    auto prepared = prepare_transform(document, selection, "move", false, pairing);
     if (!prepared)
         return std::unexpected(prepared.error());
     auto& [editor, selected, report] = *prepared;

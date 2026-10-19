@@ -33,6 +33,11 @@ void apply_theme(Theme theme);
 [[nodiscard]] QFont mono_font();
 /// Color for destructive or warning accents (record, errors, clipping).
 [[nodiscard]] QColor danger_color();
+/// Color for cautions that are not errors (out-of-scale notes, unsaved warnings); 3:1 or better on
+/// the theme's grid and window.
+[[nodiscard]] QColor warning_color();
+/// Translucent color for regions (markers, loop and selection ranges) on the ruler and grid.
+[[nodiscard]] QColor region_color();
 
 /// Every color the piano roll, keyboard gutter, ruler and lanes paint with, for the active theme.
 struct RollColors {

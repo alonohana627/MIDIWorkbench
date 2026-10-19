@@ -294,6 +294,14 @@ std::vector<std::uint8_t> FeatureVector::payload() const {
 }
 
 Result<std::vector<FeatureVector>> compute_feature_vectors(const DocumentData& document) {
+    auto streams = compute_motif_streams(document);
+    if (!streams)
+        return std::unexpected(std::move(streams).error());
+    return compute_feature_vectors(document, *streams);
+}
+
+Result<std::vector<FeatureVector>> compute_feature_vectors(const DocumentData& document,
+                                                           std::span<const search::MotifStream> all_streams) {
     std::vector<FeatureVector> vectors;
     for (std::size_t index = 0; index < document.sequences.size(); ++index) {
         const auto& sequence = document.sequences[index];
@@ -318,11 +326,10 @@ Result<std::vector<FeatureVector>> compute_feature_vectors(const DocumentData& d
         if (total_duration > 0)
             for (std::size_t pitch_class = 0; pitch_class < 12; ++pitch_class)
                 vector.values[pitch_class] = static_cast<float>(vector.values[pitch_class] / total_duration);
-        auto streams = search::extract_motif_streams(sequence, static_cast<std::uint32_t>(index));
-        if (!streams)
-            return std::unexpected(std::move(streams).error());
         std::size_t interval_total = 0;
-        for (const auto& stream : *streams) {
+        for (const auto& stream : all_streams) {
+            if (stream.sequence_no != index)
+                continue;
             for (std::size_t note = 1; note < stream.notes.size(); ++note) {
                 const auto interval =
                     std::clamp(static_cast<int>(stream.notes[note].pitch) - stream.notes[note - 1].pitch, -6, 6);

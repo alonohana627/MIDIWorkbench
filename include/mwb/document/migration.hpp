@@ -7,8 +7,9 @@
 #include <string_view>
 
 /// Schema migration rules of specification section 23.4 for the native and recovery databases.
-/// Only version 1 exists, so there are no migration steps yet; the structures below are the hook
-/// that later versions fill in. A newer schema than the application knows is always refused.
+/// The native format has only version 1; the recovery database has version 2 (in-progress capture
+/// chunks) with one in-place step from version 1. A newer schema than the application knows is
+/// always refused.
 namespace mwb::document::migration {
 
 /// Which database family a schema version belongs to.
@@ -40,6 +41,7 @@ struct MigrationStep {
 [[nodiscard]] std::span<const SchemaChecksum> recorded_checksums(SchemaFamily family);
 
 /// Migration steps of a family, ordered by from_version (empty while only version 1 exists).
+/// Native documents are migrated read-only into a new file; the recovery database in place.
 [[nodiscard]] std::span<const MigrationStep> migration_steps(SchemaFamily family);
 
 /// Verifies the shipped DDL of the current version against its recorded checksum and every

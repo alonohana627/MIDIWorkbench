@@ -1,10 +1,12 @@
 #pragma once
 
+#include "mwb/core/change_set.hpp"
 #include "mwb/core/notes.hpp"
 #include "mwb/core/time.hpp"
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <vector>
 
 /// Qt-free editor arithmetic: grids, snapping and drag mathematics of specification section 7.3.
@@ -31,6 +33,14 @@ struct Grid {
     /// Approximate length of one grid step (display only).
     [[nodiscard]] double step() const;
 };
+
+/// One selectable grid value: the fraction of a whole note as text ("1/16") and its label. The
+/// toolbar and the inspector share this list so both show every value the other can set.
+struct SnapChoice {
+    const char* value;
+    const char* label;
+};
+[[nodiscard]] std::span<const SnapChoice> snap_choices();
 
 /// Snap modes named in section 7.3.
 enum class SnapMode : std::uint8_t {
@@ -74,6 +84,10 @@ struct MoveResult {
 /// The smallest grid-aligned range containing the notes including their ends (section 7.6
 /// duplicate-to-end when no explicit range is selected).
 [[nodiscard]] TimeRange grid_aligned_extent(const std::vector<NoteSpan>& notes, const Grid& grid);
+
+/// Identities of the note-ons a change set inserts, in operation order: the notes a draw, insert or
+/// paste created, without diffing the whole note list.
+[[nodiscard]] std::vector<EventId> inserted_note_starts(const ChangeSet& changes);
 
 /// Maps between musical coordinates and pixels with 64-bit time (section 7.4).
 struct ViewMapping {

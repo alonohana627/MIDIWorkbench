@@ -6,9 +6,13 @@
 #include "mwb/music/scale.hpp"
 #include "mwb/ui/document_controller.hpp"
 
+#include <QAction>
 #include <QApplication>
 #include <QContextMenuEvent>
 #include <QHBoxLayout>
+#include <QImage>
+#include <QKeySequence>
+#include <QLineF>
 #include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
@@ -19,15 +23,23 @@
 
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <cmath>
+#include <functional>
 
 namespace mwb::ui {
 
 namespace {
 
 constexpr double handle_zone = 6.0;          // DIP, section 7.2
+/// Hard cap for per-note painting; below it the pixel density decides (see paint_notes).
 constexpr std::size_t density_threshold = 30000;
+/// Visible notes per pixel column above which notes are summarized (level of detail, section 7.4).
+constexpr double density_per_column = 6.0;
+/// Above this many visible notes each note is a plain rectangle (no rounding, outline or label).
+constexpr std::size_t simple_note_threshold = 4000;
 constexpr int scrollbar_resolution = 100000;
+constexpr std::size_t zoom_history_limit = 50;
 
 bool is_black_key(int pitch) {
     switch (pitch % 12) {
@@ -44,7 +56,67 @@ QColor channel_color(int channel) {
     return QColor::fromHsv((channel * 37) % 360, 150, 220);
 }
 
+/// True when the segment from `a` to `b` touches `rect` (erase strokes between mouse samples).
+bool segment_hits_rect(QPointF a, QPointF b, const QRectF& rect) {
+    if (rect.contains(a) || rect.contains(b))
+        return true;
+    const QLineF segment(a, b);
+    const QLineF edges[] = {QLineF(rect.topLeft(), rect.topRight()), QLineF(rect.topRight(), rect.bottomRight()),
+                            QLineF(rect.bottomRight(), rect.bottomLeft()), QLineF(rect.bottomLeft(), rect.topLeft())};
+    for (const auto& edge : edges)
+        if (segment.intersects(edge) == QLineF::BoundedIntersection)
+            return true;
+    return false;
+}
+
 } // namespace
+
+std::uint8_t default_channel_for(const DocumentController& controller) {
+    const auto active = controller.active_track_index();
+    if (!active)
+        return 0;
+    for (const auto& note : controller.notes().notes)
+        if (note.on_track == *active)
+            return note.channel; // continue the track's own channel
+    // No notes yet: the track's channel events decide (a program change or controller on channel 11).
+    for (const auto& event : controller.active_sequence().tracks[*active].events)
+        if (event.is_channel())
+            return event.channel();
+    return controller.active_sequence().tracks[*active].is_drum ? 9 : 0;
+}
+
+bool set_loop_range(DocumentController& controller, TimeRange range) {
+    if (range.end <= range.begin || range.begin < 0)
+        return false;
+    const auto& sequence = controller.active_sequence();
+    Sequence updated = sequence_header(sequence); // properties only, no events
+    Region* loop = nullptr;
+    if (updated.settings.loop_region)
+        for (auto& region : updated.regions)
+            if (region.id == *updated.settings.loop_region)
+                loop = &region;
+    if (!loop) // reuse a loop region that was switched off, if any
+        for (auto& region : updated.regions)
+            if (region.is_loop) {
+                loop = &region;
+                break;
+            }
+    if (!loop) {
+        Region region;
+        region.id = RegionId::generate();
+        region.name = "Loop";
+        region.is_loop = true;
+        updated.regions.push_back(std::move(region));
+        loop = &updated.regions.back();
+    }
+    loop->start_tick = range.begin;
+    loop->end_tick = range.end;
+    updated.settings.loop_region = loop->id;
+    ChangeBuilder builder(controller.document(), "Set loop");
+    builder.set_sequence_properties(sequence.id, updated);
+    auto changes = builder.finish();
+    return !changes.empty() && controller.apply(changes);
+}
 
 PianoRollView::PianoRollView(DocumentController& controller, QWidget* parent)
     : QWidget(parent), controller_(controller) {
@@ -85,7 +157,10 @@ void PianoRollView::set_color_mode(NoteColorMode mode) {
     update();
 }
 
-void PianoRollView::set_snap_mode(SnapMode mode) { snap_mode_ = mode; }
+void PianoRollView::set_snap_mode(SnapMode mode) {
+    snap_mode_ = mode;
+    update();
+}
 
 void PianoRollView::set_grid_override(std::optional<Rational> fraction) {
     grid_override_ = fraction;
@@ -100,31 +175,69 @@ int PianoRollView::visible_row_count() const {
     return std::max(1, static_cast<int>(note_area().height() / std::max(1.0, mapping_.row_height)));
 }
 
-std::uint8_t PianoRollView::default_channel() const {
-    const auto active = controller_.active_track_index();
-    if (!active)
-        return 0;
-    for (const auto& note : controller_.notes().notes)
-        if (note.on_track == *active)
-            return note.channel; // continue the track's own channel
-    return controller_.active_sequence().tracks[*active].is_drum ? 9 : 0;
-}
-
 Grid PianoRollView::grid() const {
     const auto& sequence = controller_.active_sequence();
     const std::int32_t ppq = sequence.division.is_ppq() ? sequence.division.ppq : default_ppq;
     return Grid::make(grid_override_.value_or(sequence.settings.snap), ppq);
 }
 
+void PianoRollView::update_playhead_area(std::optional<Tick> tick) {
+    if (!tick)
+        return;
+    // The line in the note area plus the triangle marker in the ruler (5 px each side).
+    const double x = keyboard_width + mapping_.tick_to_x(*tick);
+    if (x < keyboard_width - 8 || x > width() + 8)
+        return;
+    update(QRect(static_cast<int>(std::floor(x)) - 7, 0, 15, height()));
+}
+
 void PianoRollView::set_playhead(std::optional<Tick> tick) {
     if (playhead_ == tick)
         return;
+    const bool state_change = playhead_.has_value() != tick.has_value();
+    const auto previous = playhead_;
     playhead_ = tick;
-    update();
+    if (!tick)
+        follow_suspended_ = false; // the next Play follows again
+    if (tick && follow_playhead_ && !follow_suspended_ && gesture_ == Gesture::none) {
+        // Page the view when the playhead leaves the window (or wraps back at a loop start).
+        const Tick visible = visible_ticks();
+        if (*tick < mapping_.origin_tick || *tick > mapping_.origin_tick + visible * 9 / 10) {
+            mapping_.origin_tick = std::max<Tick>(0, *tick - visible / 10);
+            emit mapping_changed();
+            update();
+            return;
+        }
+    }
+    if (state_change) {
+        update(); // the edit cursor changes style between stopped and playing
+        return;
+    }
+    // Only the old and new playhead columns repaint at the transport rate.
+    update_playhead_area(previous);
+    update_playhead_area(tick);
+}
+
+void PianoRollView::set_follow_playhead(bool follow) {
+    follow_playhead_ = follow;
+    follow_suspended_ = false;
+}
+
+void PianoRollView::suspend_follow() {
+    if (playhead_)
+        follow_suspended_ = true; // a manual scroll while playing keeps the user's view
 }
 
 void PianoRollView::set_sounding_pitches(std::set<int> pitches) {
+    if (pitches == sounding_)
+        return;
     sounding_ = std::move(pitches);
+    update();
+}
+
+void PianoRollView::set_preview_notes(std::vector<NoteSpan> notes, std::uint64_t generation) {
+    preview_notes_ = std::move(notes);
+    preview_generation_ = generation;
     update();
 }
 
@@ -166,10 +279,18 @@ Tick PianoRollView::default_note_length() const {
 
 std::uint8_t PianoRollView::default_velocity() const { return controller_.active_sequence().settings.default_velocity; }
 
-SnapMode PianoRollView::effective_snap(const QMouseEvent* event) const {
-    if (event && (event->modifiers() & Qt::AltModifier))
+SnapMode PianoRollView::effective_snap(Qt::KeyboardModifiers modifiers) const {
+    if (modifiers & Qt::AltModifier)
         return SnapMode::off; // Alt bypasses time snapping during a drag (section 7.2)
     return snap_mode_;
+}
+
+Tick PianoRollView::snap_floor(Tick tick, Qt::KeyboardModifiers modifiers) const {
+    return effective_snap(modifiers) == SnapMode::off ? tick : grid().floor(tick);
+}
+
+Tick PianoRollView::snap_nearest(Tick tick, Qt::KeyboardModifiers modifiers) const {
+    return effective_snap(modifiers) == SnapMode::off ? tick : grid().nearest(tick);
 }
 
 PianoRollView::Hit PianoRollView::hit_test(QPointF widget_point) const {
@@ -185,11 +306,14 @@ PianoRollView::Hit PianoRollView::hit_test(QPointF widget_point) const {
     const auto candidates = index.query(TimeRange{tick - slack, tick + slack + 1},
                                         static_cast<std::uint8_t>(std::clamp(pitch, 0, 127)),
                                         static_cast<std::uint8_t>(std::clamp(pitch, 0, 127)));
-    // Prefer editable notes and the most recently starting one under the pointer.
+    // Prefer editable notes and the most recently starting one under the pointer. Hidden ghosts
+    // (Show Other Tracks off) are never hit.
     std::optional<std::size_t> best;
     for (const auto position : candidates) {
         const auto& note = index.notes()[position];
         if (note.pitch != pitch)
+            continue;
+        if (!note_editable(note) && !controller_.show_ghost_tracks())
             continue;
         const double left = mapping_.tick_to_x(note.start);
         const double right = std::max(left + 2.0, mapping_.tick_to_x(note.end));
@@ -206,16 +330,15 @@ PianoRollView::Hit PianoRollView::hit_test(QPointF widget_point) const {
     const double left = mapping_.tick_to_x(note.start);
     const double right = mapping_.tick_to_x(note.end);
     const double width_pixels = right - left;
-    // If the note is too narrow for both zones, body selection wins (section 7.2).
+    hit.zone = HitZone::body;
     if (width_pixels >= 3 * handle_zone) {
         if (point.x() >= right - handle_zone)
             hit.zone = HitZone::right_edge;
         else if (point.x() <= left + handle_zone)
             hit.zone = HitZone::left_edge;
-        else
-            hit.zone = HitZone::body;
-    } else {
-        hit.zone = HitZone::body;
+    } else if (width_pixels >= 6.0 && point.x() >= right - width_pixels / 3.0) {
+        // Short notes (a 1/16 at default zoom) keep an end-resize zone: their rightmost third.
+        hit.zone = HitZone::right_edge;
     }
     return hit;
 }
@@ -225,13 +348,11 @@ PianoRollView::Hit PianoRollView::hit_test(QPointF widget_point) const {
 void PianoRollView::rebuild_fold_rows() const {
     const auto& sequence = controller_.active_sequence();
     // Cached per document generation, sequence and scale: painting calls this for every row.
-    const std::uint64_t key = (controller_.generation() << 20) ^ (controller_.active_sequence_index() << 16) ^
-                              (static_cast<std::uint64_t>(sequence.scale_mask) << 4) ^ sequence.root_pc ^
-                              (sequence.settings.fold_to_scale ? (1ull << 63) : 0);
-    if (key == fold_key_ && fold_key_valid_)
+    const FoldKey key{controller_.generation(), controller_.active_sequence_index(), sequence.scale_mask,
+                      sequence.root_pc, sequence.settings.fold_to_scale};
+    if (fold_key_ && *fold_key_ == key)
         return;
     fold_key_ = key;
-    fold_key_valid_ = true;
     fold_rows_.clear();
     if (!sequence.settings.fold_to_scale)
         return;
@@ -260,6 +381,25 @@ double PianoRollView::row_y(int pitch) const {
     return (row - static_cast<double>(top_row_index())) * mapping_.row_height;
 }
 
+std::array<double, 128> PianoRollView::row_table() const {
+    std::array<double, 128> table{};
+    rebuild_fold_rows();
+    if (fold_rows_.empty()) {
+        for (int pitch = 0; pitch < 128; ++pitch)
+            table[static_cast<std::size_t>(pitch)] = mapping_.pitch_to_y(pitch);
+        return table;
+    }
+    const auto top = static_cast<double>(top_row_index());
+    std::size_t row = fold_rows_.size(); // pitches below the lowest row sit past the last row
+    for (int pitch = 0; pitch < 128; ++pitch) {
+        // Descending rows: the first row <= pitch (as row_y finds it), walking up from the bottom.
+        while (row > 0 && fold_rows_[row - 1] <= pitch)
+            --row;
+        table[static_cast<std::size_t>(pitch)] = (static_cast<double>(row) - top) * mapping_.row_height;
+    }
+    return table;
+}
+
 int PianoRollView::pitch_at_y(double y) const {
     rebuild_fold_rows();
     if (fold_rows_.empty())
@@ -285,7 +425,71 @@ std::vector<int> PianoRollView::visible_rows(double height) const {
     return rows;
 }
 
+int PianoRollView::step_rows(int pitch, int rows) const {
+    rebuild_fold_rows();
+    if (fold_rows_.empty())
+        return std::clamp(pitch + rows, 0, 127);
+    const auto found = std::find_if(fold_rows_.begin(), fold_rows_.end(), [pitch](int row) { return row <= pitch; });
+    const auto index = std::clamp<std::int64_t>(static_cast<std::int64_t>(found - fold_rows_.begin()) - rows, 0,
+                                                static_cast<std::int64_t>(fold_rows_.size()) - 1);
+    return fold_rows_[static_cast<std::size_t>(index)];
+}
+
+int PianoRollView::clamp_top(int pitch) const {
+    rebuild_fold_rows();
+    const int visible = visible_row_count();
+    if (fold_rows_.empty())
+        return std::clamp(pitch, std::min(127, visible - 1), 127);
+    // Folded: the top row index may not pass the point where the last row fills the bottom.
+    const auto found = std::find_if(fold_rows_.begin(), fold_rows_.end(), [pitch](int row) { return row <= pitch; });
+    const auto last_top = std::max<std::int64_t>(0, static_cast<std::int64_t>(fold_rows_.size()) - visible);
+    const auto index = std::clamp<std::int64_t>(found - fold_rows_.begin(), 0, last_top);
+    return fold_rows_[static_cast<std::size_t>(index)];
+}
+
+int PianoRollView::row_count() const {
+    rebuild_fold_rows();
+    return fold_rows_.empty() ? 128 : static_cast<int>(fold_rows_.size());
+}
+
+int PianoRollView::top_row() const {
+    rebuild_fold_rows();
+    return fold_rows_.empty() ? 127 - std::clamp(mapping_.top_pitch, 0, 127) : static_cast<int>(top_row_index());
+}
+
+void PianoRollView::set_top_row(int row) {
+    rebuild_fold_rows();
+    if (fold_rows_.empty()) {
+        set_top_pitch(127 - row);
+        return;
+    }
+    const auto index = static_cast<std::size_t>(std::clamp(row, 0, static_cast<int>(fold_rows_.size()) - 1));
+    set_top_pitch(fold_rows_[index]);
+}
+
 // --- Painting ------------------------------------------------------------------------------------
+
+QString PianoRollView::empty_hint() const {
+    // Built from the live bindings so a rebound shortcut never makes the hint wrong.
+    const auto shortcut = [this](const char* id) {
+        const auto* action = window() ? window()->findChild<QAction*>(QString::fromLatin1(id)) : nullptr;
+        return action ? action->shortcut().toString(QKeySequence::NativeText) : QString();
+    };
+    QStringList first;
+    QStringList second;
+    if (const QString draw = shortcut("tool.draw"); !draw.isEmpty())
+        first << tr("Press %1 (Draw) and click to add notes").arg(draw);
+    else
+        first << tr("Double-click to add notes");
+    if (const QString play = shortcut("transport.play_pause"); !play.isEmpty())
+        first << tr("%1 plays").arg(play);
+    if (const QString open = shortcut("file.open"); !open.isEmpty())
+        second << tr("%1 opens a MIDI file").arg(open);
+    second << tr("drop .mid files here");
+    if (const QString palette = shortcut("view.command_palette"); !palette.isEmpty())
+        second << tr("%1 finds any command").arg(palette);
+    return first.join(QStringLiteral("  ·  ")) + '\n' + second.join(QStringLiteral("  ·  "));
+}
 
 void PianoRollView::paintEvent(QPaintEvent*) {
     QPainter painter(this);
@@ -299,6 +503,7 @@ void PianoRollView::paintEvent(QPaintEvent*) {
     paint_rows(painter, local);
     paint_grid(painter, local);
     paint_notes(painter, local);
+    paint_transform_preview(painter, local);
     paint_drag_preview(painter, local);
     if (hasFocus() && controller_.selection().empty()) {
         // Keyboard entry position: the edit cursor on the entry pitch row.
@@ -329,9 +534,7 @@ void PianoRollView::paintEvent(QPaintEvent*) {
         QFont hint_font = font();
         hint_font.setPointSizeF(hint_font.pointSizeF() + 1);
         painter.setFont(hint_font);
-        painter.drawText(local, Qt::AlignCenter,
-                         tr("Press 2 (Draw) and click to add notes  ·  Space plays\n"
-                            "Ctrl+O opens a MIDI file  ·  drop .mid files here  ·  Ctrl+Shift+P finds any command"));
+        painter.drawText(local, Qt::AlignCenter, empty_hint());
     }
     painter.restore();
     paint_keyboard(painter);
@@ -373,7 +576,7 @@ void PianoRollView::paint_grid(QPainter& painter, const QRectF& area) {
     const QColor grid_color = colors.snap;
     // Snap grid (only when far enough apart to read; a quiet color so bars stand out).
     const Grid snap = grid();
-    if (snap.step() / mapping_.ticks_per_pixel >= 8.0) {
+    if (snap_mode_ != SnapMode::off && snap.step() / mapping_.ticks_per_pixel >= 8.0) {
         painter.setPen(QPen(grid_color, 1));
         for (Tick tick = snap.floor(first); tick <= last; tick = snap.next(tick)) {
             const double x = mapping_.tick_to_x(tick);
@@ -443,7 +646,9 @@ void PianoRollView::paint_notes(QPainter& painter, const QRectF& area) {
     const int high = std::clamp(mapping_.top_pitch, 0, 127);
     const auto visible = index.query(TimeRange{first, last}, static_cast<std::uint8_t>(low),
                                      static_cast<std::uint8_t>(high));
-    if (visible.size() > density_threshold) {
+    // Level of detail by pixel density, not only by count: many notes per column are summarized.
+    if (visible.size() > density_threshold ||
+        static_cast<double>(visible.size()) > std::max(1.0, area.width()) * density_per_column) {
         paint_density(painter, area, visible);
         return;
     }
@@ -452,9 +657,15 @@ void PianoRollView::paint_notes(QPainter& painter, const QRectF& area) {
     const bool highlight_scale = controller_.active_sequence().settings.highlight_scale;
     const bool hide_originals = gesture_ == Gesture::move || gesture_ == Gesture::resize_end ||
                                 gesture_ == Gesture::resize_start;
+    const bool erasing = gesture_ == Gesture::erase && !erase_hits_.empty();
+    const bool simple = visible.size() > simple_note_threshold;
+    const auto ys = row_table();
+    // Labels only where they are readable (about 7 pt and up).
+    const bool labels = !simple && mapping_.row_height >= 11;
     QFont label_font = font();
-    label_font.setPointSizeF(std::max(6.0, mapping_.row_height * 0.55));
+    label_font.setPointSizeF(std::max(7.0, mapping_.row_height * 0.6));
     painter.setFont(label_font);
+    const QColor danger = danger_color();
     for (const auto position : visible) {
         const auto& note = index.notes()[position];
         const bool editable = note_editable(note);
@@ -463,7 +674,7 @@ void PianoRollView::paint_notes(QPainter& painter, const QRectF& area) {
         const bool selected = selection.contains(note.on_id);
         const double left = mapping_.tick_to_x(note.start);
         const double right = std::max(left + 2.0, mapping_.tick_to_x(note.end));
-        const QRectF body(left, row_y(note.pitch) + 1, right - left, mapping_.row_height - 2);
+        const QRectF body(left, ys[note.pitch] + 1, right - left, mapping_.row_height - 2);
         QColor fill = color_mode_ == NoteColorMode::velocity ? note_color(note) : note_fill(note_color(note), note.velocity);
         if (selected)
             fill = fill.lighter(135);
@@ -473,6 +684,19 @@ void PianoRollView::paint_notes(QPainter& painter, const QRectF& area) {
             fill.setAlpha(60);
         if (note.flags & note_flag::muted)
             fill = fill.lighter(150);
+        const bool erase_target = erasing && erase_hits_.contains(note.on_id);
+        if (erase_target)
+            fill.setAlpha(60); // will be removed on release
+        if (simple || body.width() < 4) {
+            // Narrow or numerous notes: one plain rectangle each (no rounding, outline or label).
+            painter.fillRect(body, fill);
+            if (selected || erase_target) {
+                painter.setPen(QPen(erase_target ? danger : colors.selected_outline, 1));
+                painter.setBrush(Qt::NoBrush);
+                painter.drawRect(body);
+            }
+            continue;
+        }
         painter.setPen(Qt::NoPen);
         painter.setBrush(fill);
         painter.drawRoundedRect(body, 2, 2);
@@ -495,11 +719,13 @@ void PianoRollView::paint_notes(QPainter& painter, const QRectF& area) {
             outline = QPen(QColor(230, 120, 30), 2, Qt::DashLine); // out of scale: shape, not only color
         }
         if (note.flags & (note_flag::unterminated | note_flag::zero_length))
-            outline = QPen(QColor(210, 40, 40), 2, Qt::DotLine); // invalid/orphan-derived
+            outline = QPen(danger, 2, Qt::DotLine); // invalid/orphan-derived
+        if (erase_target)
+            outline = QPen(danger, 2);
         painter.setPen(outline);
         painter.setBrush(Qt::NoBrush);
         painter.drawRoundedRect(body, 2, 2);
-        if (body.width() > 28 && mapping_.row_height >= 9) {
+        if (labels && body.width() > 28) {
             // Label color by relative luminance, so labels keep contrast on light and dark fills.
             const double luminance = 0.2126 * fill.redF() + 0.7152 * fill.greenF() + 0.0722 * fill.blueF();
             painter.setPen(luminance > 0.45 ? Qt::black : Qt::white);
@@ -518,38 +744,76 @@ void PianoRollView::paint_notes(QPainter& painter, const QRectF& area) {
 }
 
 void PianoRollView::paint_density(QPainter& painter, const QRectF& area, const std::vector<std::size_t>& visible) {
-    // Occupancy summary: one column per pixel and pitch row, no per-note rectangles (section 7.4).
-    const int columns = static_cast<int>(area.width());
-    const int rows = 128;
-    std::vector<std::uint16_t> occupancy(static_cast<std::size_t>(columns) * rows, 0);
+    // Occupancy summary (section 7.4): one pixel per (column, visible row) accumulated with a
+    // difference array per row, then drawn as a single scaled image.
+    const int columns = std::max(1, static_cast<int>(area.width()));
+    const auto rows = visible_rows(area.height());
+    if (rows.empty())
+        return;
+    std::array<int, 128> row_of{};
+    row_of.fill(-1);
+    for (std::size_t row = 0; row < rows.size(); ++row)
+        row_of[static_cast<std::size_t>(rows[row])] = static_cast<int>(row);
+    const auto stride = static_cast<std::size_t>(columns) + 1;
+    std::vector<std::int32_t> difference(stride * rows.size(), 0);
     const auto& notes = controller_.note_index().notes();
     for (const auto position : visible) {
         const auto& note = notes[position];
+        const int row = row_of[note.pitch];
+        if (row < 0)
+            continue;
         const int x0 = std::clamp(static_cast<int>(mapping_.tick_to_x(note.start)), 0, columns - 1);
         const int x1 = std::clamp(static_cast<int>(mapping_.tick_to_x(note.end)), x0, columns - 1);
-        for (int x = x0; x <= x1; ++x) {
-            auto& cell = occupancy[static_cast<std::size_t>(x) * rows + note.pitch];
-            if (cell < 65535)
-                ++cell;
-        }
+        auto* line = difference.data() + static_cast<std::size_t>(row) * stride;
+        ++line[x0];
+        --line[x1 + 1];
     }
+    QImage image(columns, static_cast<int>(rows.size()), QImage::Format_ARGB32_Premultiplied);
+    image.fill(Qt::transparent);
     const QColor base = palette().color(QPalette::Highlight);
-    for (int x = 0; x < columns; ++x) {
-        for (int pitch = 0; pitch < rows; ++pitch) {
-            const auto count = occupancy[static_cast<std::size_t>(x) * rows + static_cast<std::size_t>(pitch)];
-            if (count == 0)
+    for (std::size_t row = 0; row < rows.size(); ++row) {
+        auto* pixels = reinterpret_cast<QRgb*>(image.scanLine(static_cast<int>(row)));
+        const auto* line = difference.data() + row * stride;
+        std::int32_t count = 0;
+        for (int x = 0; x < columns; ++x) {
+            count += line[x];
+            if (count <= 0)
                 continue;
-            QColor color = base;
-            color.setAlpha(std::min(255, 60 + count * 20));
-            painter.fillRect(QRectF(x, row_y(pitch), 1, mapping_.row_height), color);
+            const int alpha = std::min(255, 60 + count * 20);
+            pixels[x] = qPremultiply(qRgba(base.red(), base.green(), base.blue(), alpha));
         }
     }
+    const double top = row_y(rows.front());
+    painter.drawImage(QRectF(0, top, columns, static_cast<double>(rows.size()) * mapping_.row_height), image);
     painter.setPen(palette().color(QPalette::Text));
     painter.drawText(area.adjusted(6, 4, -6, -4), Qt::AlignTop | Qt::AlignRight,
                      tr("Density view: %1 notes — zoom in to edit").arg(visible.size()));
 }
 
-void PianoRollView::paint_drag_preview(QPainter& painter, const QRectF&) {
+void PianoRollView::paint_transform_preview(QPainter& painter, const QRectF& area) {
+    if (preview_notes_.empty() || preview_generation_ != controller_.generation())
+        return;
+    // Result of the pending transform: outlined ghosts, so the change is judged before Apply.
+    const Tick first = mapping_.origin_tick;
+    const Tick last = mapping_.x_to_tick(area.width()) + 1;
+    const auto ys = row_table();
+    QColor outline = palette().color(QPalette::Highlight);
+    painter.setPen(QPen(outline, 1.5, Qt::DashLine));
+    outline.setAlpha(50);
+    painter.setBrush(outline);
+    for (const auto& note : preview_notes_) {
+        if (note.end < first || note.start > last)
+            continue;
+        const double left = mapping_.tick_to_x(note.start);
+        const double right = std::max(left + 2, mapping_.tick_to_x(note.end));
+        const double y = ys[note.pitch];
+        if (y < -mapping_.row_height || y > area.height())
+            continue;
+        painter.drawRect(QRectF(left, y + 1, right - left, mapping_.row_height - 2));
+    }
+}
+
+void PianoRollView::paint_drag_preview(QPainter& painter, const QRectF& area) {
     if (gesture_ != Gesture::move && gesture_ != Gesture::duplicate_move && gesture_ != Gesture::resize_end &&
         gesture_ != Gesture::resize_start && gesture_ != Gesture::draw)
         return;
@@ -557,13 +821,20 @@ void PianoRollView::paint_drag_preview(QPainter& painter, const QRectF&) {
     fill.setAlpha(170);
     painter.setPen(QPen(fill.darker(150), 1));
     painter.setBrush(fill);
+    const auto ys = row_table();
     if (gesture_ == Gesture::draw && handle_note_) {
         const auto& note = *handle_note_;
         const double left = mapping_.tick_to_x(note.start);
         const double right = std::max(left + 2, mapping_.tick_to_x(note.end));
-        painter.drawRect(QRectF(left, row_y(note.pitch) + 1, right - left, mapping_.row_height - 2));
+        painter.drawRect(QRectF(left, ys[note.pitch] + 1, right - left, mapping_.row_height - 2));
         return;
     }
+    // Only displaced notes inside the window are drawn; large selections become plain rectangles.
+    const Tick first = mapping_.origin_tick;
+    const Tick last = mapping_.x_to_tick(area.width()) + 1;
+    const bool simple = snapshot_.notes.size() > simple_note_threshold;
+    if (simple)
+        painter.setPen(Qt::NoPen);
     for (const auto& note : snapshot_.notes) {
         Tick start = note.start;
         Tick end = note.end;
@@ -577,23 +848,17 @@ void PianoRollView::paint_drag_preview(QPainter& painter, const QRectF&) {
         } else {
             start += preview_resize_delta_;
         }
+        if (end < first || start > last || pitch < 0 || pitch > 127)
+            continue;
+        const double y = ys[static_cast<std::size_t>(pitch)];
+        if (y < -mapping_.row_height || y > area.height())
+            continue;
         const double left = mapping_.tick_to_x(start);
         const double right = std::max(left + 2, mapping_.tick_to_x(end));
-        painter.drawRect(QRectF(left, row_y(pitch) + 1, right - left, mapping_.row_height - 2));
-    }
-    if (gesture_ == Gesture::move || gesture_ == Gesture::duplicate_move) {
-        // Report only when the preview changes, not on every repaint.
-        const std::pair<Tick, int> move{preview_move_.delta_ticks, preview_move_.delta_pitch};
-        if (move != reported_move_) {
-            reported_move_ = move;
-            QMetaObject::invokeMethod(this, [this, count = snapshot_.notes.size(), move, constrained = preview_move_.constrained] {
-                emit status_message(tr("Move %1 note(s) by %2 ticks, %3 semitones%4")
-                                        .arg(count)
-                                        .arg(move.first)
-                                        .arg(move.second)
-                                        .arg(constrained ? tr(" (limited at the edge of the range)") : QString()));
-            }, Qt::QueuedConnection);
-        }
+        if (simple)
+            painter.fillRect(QRectF(left, y + 1, right - left, mapping_.row_height - 2), fill);
+        else
+            painter.drawRect(QRectF(left, y + 1, right - left, mapping_.row_height - 2));
     }
 }
 
@@ -606,11 +871,13 @@ void PianoRollView::paint_keyboard(QPainter& painter) {
     const RollColors colors = roll_colors();
     for (const int pitch : visible_rows(gutter.height())) {
         const QRectF key(0, row_y(pitch), keyboard_width - 1, mapping_.row_height);
-        QColor color = is_black_key(pitch) ? colors.key_black : colors.key_white;
-        if (sounding_.contains(pitch))
+        const bool black = is_black_key(pitch);
+        QColor color = black ? colors.key_black : colors.key_white;
+        if (sounding_.contains(pitch) || (audition_pitch_ && *audition_pitch_ == pitch))
             color = palette().color(QPalette::Highlight);
         painter.fillRect(key, color);
-        painter.setPen(colors.c_line);
+        // Divider in the opposite key color, so it reads on white keys in every theme.
+        painter.setPen(black ? colors.key_white : colors.key_black);
         painter.drawLine(QPointF(key.left(), key.bottom() - 0.5), QPointF(key.right(), key.bottom() - 0.5)); // inside this key
         if (sequence.settings.highlight_scale && in_scale(pitch)) {
             // Shape marker in addition to color: filled square for the root, dot for members.
@@ -632,6 +899,16 @@ void PianoRollView::paint_keyboard(QPainter& painter) {
     painter.restore();
 }
 
+std::optional<TimeRange> PianoRollView::loop_range() const {
+    const auto& sequence = controller_.active_sequence();
+    if (!sequence.settings.loop_region)
+        return std::nullopt;
+    for (const auto& region : sequence.regions)
+        if (region.id == *sequence.settings.loop_region)
+            return TimeRange{region.start_tick, region.end_tick};
+    return std::nullopt;
+}
+
 void PianoRollView::paint_ruler(QPainter& painter) {
     const QRectF ruler(keyboard_width, 0, width() - keyboard_width, ruler_height);
     const RollColors colors = roll_colors();
@@ -642,20 +919,30 @@ void PianoRollView::paint_ruler(QPainter& painter) {
     painter.setClipRect(ruler);
     painter.translate(keyboard_width, 0);
     const auto& sequence = controller_.active_sequence();
+    const bool loop_gesture = gesture_ == Gesture::loop_create || gesture_ == Gesture::loop_move ||
+                              gesture_ == Gesture::loop_move_start || gesture_ == Gesture::loop_move_end;
     // Loop bracket and named regions.
     for (const auto& region : sequence.regions) {
+        const bool loop = sequence.settings.loop_region && *sequence.settings.loop_region == region.id;
+        if (loop && loop_gesture)
+            continue; // drawn from the gesture preview below
         const double left = mapping_.tick_to_x(region.start_tick);
         const double right = mapping_.tick_to_x(region.end_tick);
-        const bool loop = sequence.settings.loop_region && *sequence.settings.loop_region == region.id;
         QColor color = loop ? colors.loop : QColor(160, 120, 220, 90);
         if (loop)
             color.setAlpha(170);
-        painter.fillRect(QRectF(left, loop ? 0 : ruler_height - 6, right - left, loop ? 6 : 6), color);
+        painter.fillRect(QRectF(left, loop ? 0 : ruler_height - 6, right - left, 6), color);
         if (!loop && right - left > 40) {
             painter.setPen(colors.hint_text);
             painter.drawText(QRectF(left + 2, 0, right - left, ruler_height - 6), Qt::AlignLeft | Qt::AlignVCenter,
                              QString::fromStdString(region.name));
         }
+    }
+    if (loop_gesture && past_threshold_ && loop_preview_.end > loop_preview_.begin) {
+        QColor color = colors.loop;
+        color.setAlpha(220);
+        const double left = mapping_.tick_to_x(loop_preview_.begin);
+        painter.fillRect(QRectF(left, 0, mapping_.tick_to_x(loop_preview_.end) - left, 6), color);
     }
     const auto& meter = controller_.meter_map();
     const Tick last = mapping_.x_to_tick(ruler.width());
@@ -687,15 +974,33 @@ void PianoRollView::paint_ruler(QPainter& painter) {
 
 // --- Mouse contract (section 7.2) ----------------------------------------------------------------
 
+bool PianoRollView::event(QEvent* event) {
+    // Losing the mouse grab (a popup, a modal dialog) ends the gesture without committing it.
+    if (event->type() == QEvent::UngrabMouse && gesture_ != Gesture::none)
+        cancel_gesture();
+    return QWidget::event(event);
+}
+
 void PianoRollView::mousePressEvent(QMouseEvent* event) {
+    if (gesture_ != Gesture::none) {
+        // A second button never restarts or corrupts a running gesture.
+        event->accept();
+        return;
+    }
     setFocus(Qt::MouseFocusReason);
     press_point_ = event->position();
     current_point_ = press_point_;
     press_modifiers_ = event->modifiers();
+    gesture_modifiers_ = press_modifiers_;
+    gesture_button_ = event->button();
+    past_threshold_ = false;
     shift_axis_locked_ = false;
+    selection_at_press_ = controller_.selection();
+    edit_cursor_at_press_ = controller_.edit_cursor();
     if (event->button() == Qt::MiddleButton) {
         gesture_ = Gesture::pan;
         pan_origin_ = mapping_;
+        suspend_follow();
         setCursor(Qt::ClosedHandCursor);
         return;
     }
@@ -703,8 +1008,27 @@ void PianoRollView::mousePressEvent(QMouseEvent* event) {
         return;
     const QPointF point = event->position();
     if (point.y() < ruler_height && point.x() >= keyboard_width) {
-        const Tick tick = mapping_.x_to_tick(point.x() - keyboard_width);
-        controller_.set_edit_cursor(std::max<Tick>(0, effective_snap(event) == SnapMode::off ? tick : grid().nearest(tick)));
+        const Tick tick = std::max<Tick>(0, mapping_.x_to_tick(point.x() - keyboard_width));
+        if (point.y() < loop_strip_height && controller_.active_sequence().division.is_ppq()) {
+            // Loop strip: drag to create the loop, or drag its edges or body (applied on release).
+            gesture_ = Gesture::loop_create;
+            const auto loop = loop_range();
+            loop_at_press_ = loop.value_or(TimeRange{});
+            loop_preview_ = loop_at_press_;
+            if (loop) {
+                const double left = keyboard_width + mapping_.tick_to_x(loop->begin);
+                const double right = keyboard_width + mapping_.tick_to_x(loop->end);
+                if (std::abs(point.x() - left) <= 5)
+                    gesture_ = Gesture::loop_move_start;
+                else if (std::abs(point.x() - right) <= 5)
+                    gesture_ = Gesture::loop_move_end;
+                else if (point.x() > left && point.x() < right)
+                    gesture_ = Gesture::loop_move;
+            }
+            update();
+            return;
+        }
+        controller_.set_edit_cursor(snap_nearest(tick, event->modifiers()));
         gesture_ = Gesture::scrub;
         return;
     }
@@ -712,30 +1036,46 @@ void PianoRollView::mousePressEvent(QMouseEvent* event) {
         const int pitch = std::clamp(pitch_at_y(point.y() - ruler_height), 0, 127);
         audition_pitch_ = pitch;
         emit audition_note_on(pitch, default_velocity());
+        update();
         return;
     }
     const QPointF local = to_note_area(point);
     const Tick tick = std::max<Tick>(0, mapping_.x_to_tick(local.x()));
     const int pitch = std::clamp(pitch_at_y(local.y()), 0, 127);
-    const auto hit = hit_test(point);
+    auto hit = hit_test(point);
     const auto& index = controller_.note_index();
+    if (hit.note && !note_editable(index.notes()[*hit.note]) && tool_ != EditTool::erase && tool_ != EditTool::split)
+        hit = {}; // other tracks' notes are read-only: a press there acts on empty space
     EditTool tool = tool_;
-    if (tool == EditTool::draw && hit.note && note_editable(index.notes()[*hit.note]))
+    if (tool == EditTool::draw && hit.note)
         tool = EditTool::select; // clicking a note in Draw selects, moves or resizes it
     switch (tool) {
     case EditTool::select: {
-        selection_at_press_ = controller_.selection();
         if (hit.note) {
             const auto& note = index.notes()[*hit.note];
-            if (!note_editable(note))
-                return; // ghost tracks are read-only: no operation writes into them
             handle_note_ = note;
-            if (!(event->modifiers() & Qt::ControlModifier) && !controller_.selection().contains(note.on_id))
-                controller_.set_selection({note.on_id});
+            const bool control = (event->modifiers() & Qt::ControlModifier) != 0;
+            const bool alt = (event->modifiers() & Qt::AltModifier) != 0;
+            const bool shift = (event->modifiers() & Qt::ShiftModifier) != 0;
+            // Ctrl+Alt on a body is the explicit end-resize for notes too narrow for a handle.
+            HitZone zone = hit.zone;
+            if (control && alt && zone == HitZone::body)
+                zone = HitZone::right_edge;
+            const bool edge = zone == HitZone::left_edge || zone == HitZone::right_edge;
+            if (!controller_.selection().contains(note.on_id)) {
+                if (shift || (edge && control)) {
+                    // Shift extends; an edge press always resizes the grabbed note too.
+                    auto selection = controller_.selection();
+                    selection.insert(note.on_id);
+                    controller_.set_selection(std::move(selection));
+                } else if (!control) {
+                    controller_.set_selection({note.on_id});
+                }
+            }
             gesture_ = Gesture::pending_select;
-            if (hit.zone == HitZone::right_edge)
+            if (zone == HitZone::right_edge)
                 gesture_ = Gesture::resize_end;
-            else if (hit.zone == HitZone::left_edge)
+            else if (zone == HitZone::left_edge)
                 gesture_ = Gesture::resize_start;
             if (gesture_ != Gesture::pending_select)
                 begin_drag_from_selection();
@@ -749,7 +1089,7 @@ void PianoRollView::mousePressEvent(QMouseEvent* event) {
     case EditTool::draw: {
         if (!controller_.active_track_index())
             return;
-        const Tick start = effective_snap(event) == SnapMode::off ? tick : grid().floor(tick);
+        const Tick start = snap_floor(tick, event->modifiers());
         NoteSpan preview;
         preview.start = start;
         preview.end = start + default_note_length();
@@ -764,8 +1104,8 @@ void PianoRollView::mousePressEvent(QMouseEvent* event) {
     case EditTool::erase: {
         gesture_ = Gesture::erase;
         erase_hits_.clear();
-        if (hit.note && note_editable(index.notes()[*hit.note]))
-            erase_hits_.insert(index.notes()[*hit.note].on_id);
+        last_erase_point_ = point;
+        collect_erase_hits(point, point);
         break;
     }
     case EditTool::split: {
@@ -774,7 +1114,7 @@ void PianoRollView::mousePressEvent(QMouseEvent* event) {
         const auto& note = index.notes()[*hit.note];
         if (!note_editable(note))
             return;
-        const Tick at = effective_snap(event) == SnapMode::off ? tick : grid().nearest(tick);
+        const Tick at = snap_nearest(tick, event->modifiers());
         if (at <= note.start || at >= note.end) {
             emit status_message(tr("Split point must lie inside the note"));
             return;
@@ -800,6 +1140,29 @@ void PianoRollView::begin_drag_from_selection() {
     snapshot_ = DragSnapshot::capture(controller_.selected_notes());
     preview_move_ = {};
     preview_resize_delta_ = 0;
+    reported_move_ = {0, 0};
+}
+
+void PianoRollView::collect_erase_hits(QPointF from, QPointF to) {
+    // Every editable note the stroke segment crosses, not only those under sampled positions.
+    const QPointF a = to_note_area(from);
+    const QPointF b = to_note_area(to);
+    const Tick first = mapping_.x_to_tick(std::min(a.x(), b.x())) - 1;
+    const Tick last = mapping_.x_to_tick(std::max(a.x(), b.x())) + 1;
+    const int high = std::clamp(pitch_at_y(std::min(a.y(), b.y())), 0, 127);
+    const int low = std::clamp(pitch_at_y(std::max(a.y(), b.y())), 0, 127);
+    const auto& index = controller_.note_index();
+    for (const auto position : index.query(TimeRange{first, last + 1}, static_cast<std::uint8_t>(std::min(low, high)),
+                                           static_cast<std::uint8_t>(std::max(low, high)))) {
+        const auto& note = index.notes()[position];
+        if (!note_editable(note) || erase_hits_.contains(note.on_id))
+            continue;
+        const double left = mapping_.tick_to_x(note.start);
+        const double right = std::max(left + 2.0, mapping_.tick_to_x(note.end));
+        const QRectF body(left - 1, row_y(note.pitch), right - left + 2, mapping_.row_height);
+        if (segment_hits_rect(a, b, body))
+            erase_hits_.insert(note.on_id);
+    }
 }
 
 void PianoRollView::mouseMoveEvent(QMouseEvent* event) {
@@ -809,7 +1172,13 @@ void PianoRollView::mouseMoveEvent(QMouseEvent* event) {
         emit hover_changed(mapping_.x_to_tick(local.x()), pitch_at_y(local.y()));
     }
     if (gesture_ == Gesture::none) {
-        const auto hit = hit_test(point);
+        if (point.y() < loop_strip_height && point.x() >= keyboard_width) {
+            setCursor(Qt::SizeHorCursor); // the loop strip
+            return;
+        }
+        auto hit = hit_test(point);
+        if (hit.note && !note_editable(controller_.note_index().notes()[*hit.note]))
+            hit = {}; // read-only ghosts look like empty space
         const bool edge = hit.zone == HitZone::left_edge || hit.zone == HitZone::right_edge;
         switch (tool_) {
         case EditTool::select: setCursor(edge ? Qt::SizeHorCursor : hit.note ? Qt::SizeAllCursor : Qt::ArrowCursor); break;
@@ -822,23 +1191,18 @@ void PianoRollView::mouseMoveEvent(QMouseEvent* event) {
         }
         return;
     }
+    // The button that started the gesture is no longer down (its release went elsewhere): the
+    // gesture is abandoned, never left running on button-less moves.
+    if (event->spontaneous() && gesture_button_ != Qt::NoButton && !(event->buttons() & gesture_button_)) {
+        cancel_gesture();
+        return;
+    }
     current_point_ = point;
+    gesture_modifiers_ = event->modifiers();
     const QPointF delta = current_point_ - press_point_;
-    const bool past_threshold = delta.manhattanLength() >= QApplication::startDragDistance();
-    if (gesture_ == Gesture::pan) {
-        mapping_ = pan_origin_;
-        mapping_.origin_tick = std::max<Tick>(0, pan_origin_.origin_tick - static_cast<Tick>(delta.x() * mapping_.ticks_per_pixel));
-        mapping_.top_pitch = std::clamp(pan_origin_.top_pitch + static_cast<int>(delta.y() / mapping_.row_height), 0, 127);
-        emit mapping_changed();
-        update();
-        return;
-    }
-    if (gesture_ == Gesture::scrub) {
-        const Tick tick = mapping_.x_to_tick(point.x() - keyboard_width);
-        controller_.set_edit_cursor(std::max<Tick>(0, effective_snap(event) == SnapMode::off ? tick : grid().nearest(tick)));
-        return;
-    }
-    if (gesture_ == Gesture::pending_select && past_threshold) {
+    if (!past_threshold_ && delta.manhattanLength() >= QApplication::startDragDistance())
+        past_threshold_ = true; // stays true for the rest of the gesture
+    if (gesture_ == Gesture::pending_select && past_threshold_) {
         gesture_ = (press_modifiers_ & Qt::ControlModifier) ? Gesture::duplicate_move : Gesture::move;
         if (gesture_ == Gesture::duplicate_move && handle_note_ && !controller_.selection().contains(handle_note_->on_id)) {
             auto selection = controller_.selection();
@@ -847,77 +1211,131 @@ void PianoRollView::mouseMoveEvent(QMouseEvent* event) {
         }
         begin_drag_from_selection();
     }
+    if (gesture_ == Gesture::erase) {
+        collect_erase_hits(last_erase_point_, point);
+        last_erase_point_ = point;
+    }
+    update_gesture_preview();
+    // Auto-scroll near the viewport edges, only for drags that place something.
+    const bool scrolls = past_threshold_ &&
+                         (gesture_ == Gesture::move || gesture_ == Gesture::duplicate_move ||
+                          gesture_ == Gesture::resize_end || gesture_ == Gesture::resize_start ||
+                          gesture_ == Gesture::draw || gesture_ == Gesture::rubber_band);
+    const QRectF area = note_area();
+    const bool near_edge = point.x() < area.left() + 16 || point.x() > area.right() - 16 ||
+                           point.y() < area.top() + 12 || point.y() > area.bottom() - 12;
+    if (scrolls && near_edge)
+        auto_scroll_timer_.start();
+    else
+        auto_scroll_timer_.stop();
+    update();
+}
+
+void PianoRollView::update_gesture_preview() {
+    const QPointF delta = current_point_ - press_point_;
+    const Qt::KeyboardModifiers modifiers = gesture_modifiers_;
     const Tick raw_ticks = static_cast<Tick>(std::llround(delta.x() * mapping_.ticks_per_pixel));
-    // Pitch displacement from the rows under the pointer (folded rows skip hidden pitches).
-    const int raw_pitch = pitch_at_y(current_point_.y() - ruler_height) - pitch_at_y(press_point_.y() - ruler_height);
     switch (gesture_) {
+    case Gesture::pan: {
+        mapping_ = pan_origin_;
+        mapping_.origin_tick =
+            std::max<Tick>(0, pan_origin_.origin_tick - static_cast<Tick>(delta.x() * mapping_.ticks_per_pixel));
+        mapping_.top_pitch = clamp_top(step_rows(pan_origin_.top_pitch, static_cast<int>(delta.y() / mapping_.row_height)));
+        emit mapping_changed();
+        break;
+    }
+    case Gesture::scrub: {
+        const Tick tick = std::max<Tick>(0, mapping_.x_to_tick(current_point_.x() - keyboard_width));
+        controller_.set_edit_cursor(snap_nearest(tick, modifiers));
+        break;
+    }
+    case Gesture::loop_create:
+    case Gesture::loop_move:
+    case Gesture::loop_move_start:
+    case Gesture::loop_move_end: {
+        const Tick press_tick = std::max<Tick>(0, mapping_.x_to_tick(press_point_.x() - keyboard_width));
+        const Tick tick = std::max<Tick>(0, mapping_.x_to_tick(current_point_.x() - keyboard_width));
+        const Tick snapped = snap_nearest(tick, modifiers);
+        TimeRange range = loop_at_press_;
+        if (gesture_ == Gesture::loop_create) {
+            const Tick anchor = snap_nearest(press_tick, modifiers);
+            range = TimeRange{std::min(anchor, snapped), std::max(anchor, snapped)};
+        } else if (gesture_ == Gesture::loop_move_start) {
+            range.begin = std::min(snapped, loop_at_press_.end - 1);
+        } else if (gesture_ == Gesture::loop_move_end) {
+            range.end = std::max(snapped, loop_at_press_.begin + 1);
+        } else {
+            const Tick begin = snap_nearest(std::max<Tick>(0, loop_at_press_.begin + (tick - press_tick)), modifiers);
+            range = TimeRange{begin, begin + (loop_at_press_.end - loop_at_press_.begin)};
+        }
+        loop_preview_ = range;
+        break;
+    }
     case Gesture::move:
     case Gesture::duplicate_move: {
+        // Pitch displacement from the rows under the pointer (folded rows skip hidden pitches).
         Tick ticks = raw_ticks;
-        int pitch = raw_pitch;
-        if (event->modifiers() & Qt::ShiftModifier) {
+        int pitch = pitch_at_y(current_point_.y() - ruler_height) - pitch_at_y(press_point_.y() - ruler_height);
+        SnapMode snap = effective_snap(modifiers);
+        if (modifiers & Qt::ShiftModifier) {
             // Lock to the first dominant axis after the threshold (section 7.2).
-            if (!shift_axis_locked_ && past_threshold) {
+            if (!shift_axis_locked_ && past_threshold_) {
                 shift_axis_locked_ = true;
                 lock_to_time_axis_ = std::abs(delta.x()) >= std::abs(delta.y());
             }
             if (shift_axis_locked_) {
-                if (lock_to_time_axis_)
+                if (lock_to_time_axis_) {
                     pitch = 0;
-                else
+                } else {
                     ticks = 0;
+                    snap = SnapMode::off; // a pitch-only move never shifts off-grid notes in time
+                }
             }
         }
         const auto previous_pitch = preview_move_.delta_pitch;
-        preview_move_ = compute_move(snapshot_, ticks, pitch, grid(), effective_snap(event));
+        preview_move_ = compute_move(snapshot_, ticks, pitch, grid(), snap);
         if (handle_note_ && preview_move_.delta_pitch != previous_pitch) {
             release_audition();
             audition_pitch_ = handle_note_->pitch + preview_move_.delta_pitch;
             emit audition_note_on(*audition_pitch_, handle_note_->velocity);
         }
+        // Report only when the preview changes, not on every repaint.
+        const std::pair<Tick, int> move{preview_move_.delta_ticks, preview_move_.delta_pitch};
+        if (move != reported_move_) {
+            reported_move_ = move;
+            emit status_message(tr("%1 %2 note(s) by %3 ticks, %4 semitones%5")
+                                    .arg(gesture_ == Gesture::duplicate_move ? tr("Duplicate") : tr("Move"))
+                                    .arg(snapshot_.notes.size())
+                                    .arg(move.first)
+                                    .arg(move.second)
+                                    .arg(preview_move_.constrained ? tr(" (limited at the edge of the range)") : QString()));
+        }
         break;
     }
     case Gesture::resize_end:
         if (handle_note_)
-            preview_resize_delta_ = compute_end_delta(snapshot_, *handle_note_, raw_ticks, grid(), effective_snap(event));
+            preview_resize_delta_ = compute_end_delta(snapshot_, *handle_note_, raw_ticks, grid(), effective_snap(modifiers));
         break;
     case Gesture::resize_start:
         if (handle_note_)
-            preview_resize_delta_ = compute_start_delta(snapshot_, *handle_note_, raw_ticks, grid(), effective_snap(event));
+            preview_resize_delta_ = compute_start_delta(snapshot_, *handle_note_, raw_ticks, grid(), effective_snap(modifiers));
         break;
     case Gesture::draw:
-        if (handle_note_) {
-            // Dragging sets the duration; crossing pitches previews but never sprays notes.
-            const QPointF local = to_note_area(point);
-            const Tick tick = mapping_.x_to_tick(local.x());
-            Tick end = effective_snap(event) == SnapMode::off ? tick : grid().next(tick);
-            handle_note_->end = std::max(handle_note_->start + 1, end);
+        if (handle_note_ && past_threshold_) {
+            // Dragging sets the duration (never below one grid step while snapping); crossing
+            // pitches previews but never sprays notes. A click keeps the default length.
+            const Tick tick = mapping_.x_to_tick(to_note_area(current_point_).x());
+            if (effective_snap(modifiers) == SnapMode::off)
+                handle_note_->end = std::max(handle_note_->start + 1, tick);
+            else
+                handle_note_->end = std::max(grid().next(tick), grid().next(handle_note_->start));
         }
         break;
-    case Gesture::erase: {
-        const auto hit = hit_test(point);
-        if (hit.note) {
-            const auto& note = controller_.note_index().notes()[*hit.note];
-            if (note_editable(note))
-                erase_hits_.insert(note.on_id);
-        }
-        break;
-    }
+    case Gesture::erase:
     case Gesture::rubber_band:
     case Gesture::pending_select:
-    case Gesture::none:
-    case Gesture::pan:
-    case Gesture::scrub: break;
+    case Gesture::none: break;
     }
-    // Auto-scroll near the viewport edges.
-    const QRectF area = note_area();
-    const bool near_edge = point.x() < area.left() + 16 || point.x() > area.right() - 16 ||
-                           point.y() < area.top() + 12 || point.y() > area.bottom() - 12;
-    if (near_edge && gesture_ != Gesture::erase)
-        auto_scroll_timer_.start();
-    else
-        auto_scroll_timer_.stop();
-    update();
 }
 
 void PianoRollView::auto_scroll_step() {
@@ -942,36 +1360,47 @@ void PianoRollView::auto_scroll_step() {
     mapping_.origin_tick = std::max<Tick>(0, mapping_.origin_tick + shift);
     press_point_.rx() -= static_cast<double>(mapping_.origin_tick - old_origin) / mapping_.ticks_per_pixel;
     if (dy != 0) {
-        const int rows = dy < 0 ? 1 : -1;
         const int old_top = mapping_.top_pitch;
-        mapping_.top_pitch = std::clamp(mapping_.top_pitch + rows, 0, 127);
-        press_point_.ry() += (mapping_.top_pitch - old_top) * mapping_.row_height;
+        mapping_.top_pitch = clamp_top(step_rows(mapping_.top_pitch, dy < 0 ? 1 : -1));
+        if (mapping_.top_pitch != old_top) // exactly one row, chromatic or folded
+            press_point_.ry() += (dy < 0 ? 1 : -1) * mapping_.row_height;
     }
+    suspend_follow();
+    // The dragged notes follow the pointer while the view scrolls under it.
+    update_gesture_preview();
     emit mapping_changed();
     update();
 }
 
 void PianoRollView::mouseReleaseEvent(QMouseEvent* event) {
+    if (gesture_ == Gesture::none) {
+        release_audition(); // keyboard gutter and audition tool
+        update();
+        return;
+    }
+    if (event->button() != gesture_button_)
+        return; // another button's release never ends this gesture
     auto_scroll_timer_.stop();
-    if (event->button() == Qt::MiddleButton && gesture_ == Gesture::pan) {
+    gesture_modifiers_ = event->modifiers();
+    if (gesture_ == Gesture::pan) {
         gesture_ = Gesture::none;
+        gesture_button_ = Qt::NoButton;
         setCursor(Qt::ArrowCursor);
         return;
     }
-    if (event->button() != Qt::LeftButton)
-        return;
-    commit_gesture(event);
+    commit_gesture();
 }
 
-void PianoRollView::commit_gesture([[maybe_unused]] QMouseEvent* event) {
+void PianoRollView::commit_gesture() {
     const Gesture gesture = gesture_;
     gesture_ = Gesture::none;
+    gesture_button_ = Qt::NoButton;
     release_audition();
     const auto& sequence = controller_.active_sequence();
     const auto& index = controller_.note_index();
     switch (gesture) {
     case Gesture::pending_select:
-        // A click without drag: Ctrl toggles membership; a plain click keeps only that note.
+        // A click without drag: Ctrl toggles membership, Shift extends, a plain click keeps only that note.
         if (handle_note_) {
             auto selection = selection_at_press_;
             if (press_modifiers_ & Qt::ControlModifier) {
@@ -979,6 +1408,8 @@ void PianoRollView::commit_gesture([[maybe_unused]] QMouseEvent* event) {
                     selection.erase(handle_note_->on_id);
                 else
                     selection.insert(handle_note_->on_id);
+            } else if (press_modifiers_ & Qt::ShiftModifier) {
+                selection.insert(handle_note_->on_id);
             } else {
                 selection = {handle_note_->on_id};
             }
@@ -1023,6 +1454,12 @@ void PianoRollView::commit_gesture([[maybe_unused]] QMouseEvent* event) {
         break;
     }
     case Gesture::duplicate_move: {
+        if (preview_move_.delta_ticks == 0 && preview_move_.delta_pitch == 0) {
+            // Exact copies on top of the originals would be invisible and double the sound.
+            controller_.set_selection(selection_at_press_);
+            emit status_message(tr("Duplicate cancelled: the copy was not moved"));
+            break;
+        }
         std::vector<EventId> ids;
         for (const auto& note : snapshot_.notes)
             ids.push_back(note.on_id);
@@ -1061,25 +1498,51 @@ void PianoRollView::commit_gesture([[maybe_unused]] QMouseEvent* event) {
             break;
         const auto& note = *handle_note_;
         const NewNote created{controller_.active_track(), note.start, std::max(note.start + 1, note.end), note.pitch,
-                              note.velocity, default_channel(), 0};
+                              note.velocity, default_channel_for(controller_), 0};
         auto changes = insert_notes(controller_.document(), std::span(&created, 1), "Draw note");
-        if (changes)
-            controller_.apply(*changes);
+        if (!changes) {
+            emit status_message(QString::fromStdString(changes.error().message));
+            break;
+        }
+        // The drawn note becomes the selection, so Delete, arrows and the velocity lane act on it.
+        const auto ids = inserted_note_starts(*changes);
+        if (controller_.apply(*changes))
+            controller_.set_selection(std::set<EventId>(ids.begin(), ids.end()));
         break;
     }
     case Gesture::erase: {
         if (erase_hits_.empty())
             break;
         std::vector<EventId> ids(erase_hits_.begin(), erase_hits_.end());
+        erase_hits_.clear();
         auto changes = delete_notes(controller_.document(), sequence.id, ids, "Erase notes");
-        if (changes)
-            controller_.apply(*changes);
+        if (!changes) {
+            emit status_message(QString::fromStdString(changes.error().message));
+            break;
+        }
+        controller_.apply(*changes);
         auto selection = controller_.selection();
         for (const auto& id : ids)
             selection.erase(id);
         controller_.set_selection(std::move(selection));
         break;
     }
+    case Gesture::loop_create:
+    case Gesture::loop_move:
+    case Gesture::loop_move_start:
+    case Gesture::loop_move_end:
+        if (!past_threshold_) {
+            // A click in the loop strip moves the edit cursor like the rest of the ruler.
+            const Tick tick = std::max<Tick>(0, mapping_.x_to_tick(press_point_.x() - keyboard_width));
+            controller_.set_edit_cursor(snap_nearest(tick, press_modifiers_));
+        } else if (loop_preview_.end > loop_preview_.begin && (loop_preview_.begin != loop_at_press_.begin ||
+                                                                 loop_preview_.end != loop_at_press_.end)) {
+            if (set_loop_range(controller_, loop_preview_))
+                emit status_message(tr("Loop set to %1 - %2")
+                                        .arg(QString::fromStdString(controller_.meter_map().format(loop_preview_.begin)))
+                                        .arg(QString::fromStdString(controller_.meter_map().format(loop_preview_.end))));
+        }
+        break;
     case Gesture::none:
     case Gesture::pan:
     case Gesture::scrub: break;
@@ -1095,11 +1558,33 @@ void PianoRollView::cancel_gesture() {
     // Escape restores the exact state at gesture start; nothing reaches the undo history.
     if (gesture_ == Gesture::none)
         return;
-    if (gesture_ == Gesture::rubber_band || gesture_ == Gesture::pending_select)
-        controller_.set_selection(selection_at_press_);
-    if (gesture_ == Gesture::pan)
+    const Gesture gesture = gesture_;
+    gesture_ = Gesture::none; // first: the selection and cursor restores below repaint
+    gesture_button_ = Qt::NoButton;
+    switch (gesture) {
+    case Gesture::rubber_band:
+    case Gesture::pending_select:
+    case Gesture::move:
+    case Gesture::duplicate_move:
+    case Gesture::resize_end:
+    case Gesture::resize_start:
+        if (controller_.selection() != selection_at_press_)
+            controller_.set_selection(selection_at_press_);
+        break;
+    case Gesture::scrub: controller_.set_edit_cursor(edit_cursor_at_press_); break;
+    case Gesture::pan:
         mapping_ = pan_origin_;
-    gesture_ = Gesture::none;
+        emit mapping_changed();
+        setCursor(Qt::ArrowCursor);
+        break;
+    case Gesture::draw:
+    case Gesture::erase:
+    case Gesture::loop_create:
+    case Gesture::loop_move:
+    case Gesture::loop_move_start:
+    case Gesture::loop_move_end:
+    case Gesture::none: break;
+    }
     auto_scroll_timer_.stop();
     release_audition();
     handle_note_.reset();
@@ -1121,29 +1606,62 @@ void PianoRollView::mouseDoubleClickEvent(QMouseEvent* event) {
     if (tool_ != EditTool::select || event->button() != Qt::LeftButton)
         return;
     const QPointF point = event->position();
-    if (!note_area().contains(point) || hit_test(point).note || !controller_.active_track_index())
+    if (!note_area().contains(point) || !controller_.active_track_index())
         return;
+    if (const auto hit = hit_test(point); hit.note) {
+        const auto& note = controller_.note_index().notes()[*hit.note];
+        if (!note_editable(note)) {
+            // Double-click on another track's note switches editing to that track.
+            const auto& tracks = controller_.active_sequence().tracks;
+            if (note.on_track < tracks.size()) {
+                controller_.set_active_track(tracks[note.on_track].id);
+                controller_.set_selection({note.on_id});
+                emit status_message(tr("Now editing %1").arg(QString::fromStdString(tracks[note.on_track].name)));
+            }
+        }
+        return;
+    }
     gesture_ = Gesture::none;
     const QPointF local = to_note_area(point);
     const Tick tick = std::max<Tick>(0, mapping_.x_to_tick(local.x()));
-    const Tick start = effective_snap(event) == SnapMode::off ? tick : grid().floor(tick);
+    const Tick start = snap_floor(tick, event->modifiers());
     const int pitch = std::clamp(pitch_at_y(local.y()), 0, 127);
     const NewNote created{controller_.active_track(), start, start + default_note_length(),
-                          static_cast<std::uint8_t>(pitch), default_velocity(), default_channel(), 0};
+                          static_cast<std::uint8_t>(pitch), default_velocity(), default_channel_for(controller_), 0};
     auto changes = insert_notes(controller_.document(), std::span(&created, 1), "Insert note");
-    if (changes && controller_.apply(*changes)) {
-        const auto& notes = controller_.notes().notes;
-        for (const auto& note : notes)
-            if (note.start == start && note.pitch == pitch && note_editable(note))
-                controller_.set_selection({note.on_id});
+    if (!changes) {
+        emit status_message(QString::fromStdString(changes.error().message));
+        return;
     }
+    const auto ids = inserted_note_starts(*changes);
+    if (controller_.apply(*changes))
+        controller_.set_selection(std::set<EventId>(ids.begin(), ids.end()));
+}
+
+void PianoRollView::push_zoom_history(bool from_wheel) {
+    // A wheel or pinch burst is one history step: wheel zooms within 500 ms coalesce.
+    if (from_wheel && last_wheel_zoom_.isValid() && last_wheel_zoom_.elapsed() < 500) {
+        last_wheel_zoom_.restart();
+        return;
+    }
+    if (from_wheel)
+        last_wheel_zoom_.restart();
+    else
+        last_wheel_zoom_.invalidate();
+    zoom_history_.push_back(mapping_);
+    if (zoom_history_.size() > zoom_history_limit)
+        zoom_history_.erase(zoom_history_.begin());
 }
 
 void PianoRollView::wheelEvent(QWheelEvent* event) {
     const double steps = event->angleDelta().y() / 120.0;
     const QPointF local = to_note_area(event->position());
     if (event->modifiers() & Qt::ControlModifier) {
-        zoom_history_.push_back(mapping_);
+        if (steps == 0) {
+            event->accept();
+            return;
+        }
+        push_zoom_history(true);
         if (event->modifiers() & Qt::ShiftModifier)
             mapping_.zoom_pitch_around(local.y(), std::pow(1.15, steps)); // Ctrl-Shift-wheel: pitch zoom
         else
@@ -1165,7 +1683,9 @@ void PianoRollView::wheelEvent(QWheelEvent* event) {
         const auto rows = static_cast<int>(wheel_rows_);
         wheel_rows_ -= rows;
         if (rows != 0)
-            mapping_.top_pitch = std::clamp(mapping_.top_pitch + rows, std::min(127, visible_row_count() - 1), 127);
+            mapping_.top_pitch = clamp_top(step_rows(mapping_.top_pitch, rows));
+        if (columns != 0 || rows != 0)
+            suspend_follow();
     }
     emit mapping_changed();
     update();
@@ -1181,15 +1701,23 @@ void PianoRollView::keyPressEvent(QKeyEvent* event) {
         event->accept();
         return;
     }
+    const auto modifiers = event->modifiers() & ~Qt::KeypadModifier;
     // Keyboard note entry (spec 29.3): Left/Right move the red transport line (window command),
     // Up/Down choose the entry pitch when nothing is selected (Shift: an octave), and Return or
     // Insert adds a note there and advances.
-    if (controller_.selection().empty() && (event->modifiers() & ~Qt::ShiftModifier) == Qt::NoModifier &&
+    if (controller_.selection().empty() && (modifiers & ~Qt::ShiftModifier) == Qt::NoModifier &&
         (event->key() == Qt::Key_Up || event->key() == Qt::Key_Down)) {
-        const int step = (event->modifiers() & Qt::ShiftModifier) ? 12 : 1;
-        cursor_pitch_ = std::clamp(cursor_pitch_ + (event->key() == Qt::Key_Up ? step : -step), 0, 127);
-        if (cursor_pitch_ > mapping_.top_pitch || cursor_pitch_ <= mapping_.top_pitch - visible_row_count()) {
-            mapping_.top_pitch = std::clamp(cursor_pitch_ + visible_row_count() / 2, 0, 127);
+        const bool up = event->key() == Qt::Key_Up;
+        if (modifiers & Qt::ShiftModifier) {
+            // An octave; with folded rows the nearest visible row at or below it.
+            cursor_pitch_ = std::clamp(cursor_pitch_ + (up ? 12 : -12), 0, 127);
+            cursor_pitch_ = step_rows(cursor_pitch_, 0);
+        } else {
+            cursor_pitch_ = step_rows(cursor_pitch_, up ? 1 : -1); // never lands on a hidden row
+        }
+        const double y = row_y(cursor_pitch_);
+        if (y < 0 || y + mapping_.row_height > note_area().height()) {
+            mapping_.top_pitch = clamp_top(step_rows(cursor_pitch_, visible_row_count() / 2));
             emit mapping_changed();
         }
         emit hover_changed(controller_.edit_cursor(), cursor_pitch_);
@@ -1198,16 +1726,21 @@ void PianoRollView::keyPressEvent(QKeyEvent* event) {
         return;
     }
     if ((event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter || event->key() == Qt::Key_Insert) &&
-        controller_.active_track_index() && controller_.selection().empty()) { // step entry only without a selection
+        modifiers == Qt::NoModifier && controller_.active_track_index() &&
+        controller_.selection().empty()) { // step entry only without a selection
         const Tick start = controller_.edit_cursor();
         const NewNote created{controller_.active_track(), start, start + default_note_length(),
-                              static_cast<std::uint8_t>(cursor_pitch_), default_velocity(), default_channel(), 0};
-        if (auto changes = insert_notes(controller_.document(), std::span(&created, 1), "Insert note")) {
-            if (controller_.apply(*changes))
-                controller_.set_edit_cursor(start + default_note_length()); // step entry: advance the cursor
+                              static_cast<std::uint8_t>(cursor_pitch_), default_velocity(),
+                              default_channel_for(controller_), 0};
+        auto changes = insert_notes(controller_.document(), std::span(&created, 1), "Insert note");
+        if (!changes) {
+            emit status_message(QString::fromStdString(changes.error().message));
+        } else if (controller_.apply(*changes)) {
+            controller_.set_edit_cursor(start + default_note_length()); // step entry: advance the cursor
+            scroll_to_tick(controller_.edit_cursor());                  // and keep it on screen
+            emit audition_note_on(cursor_pitch_, default_velocity());
+            QTimer::singleShot(150, this, [this, pitch = cursor_pitch_] { emit audition_note_off(pitch); }); // audible
         }
-        emit audition_note_on(cursor_pitch_, default_velocity());
-        QTimer::singleShot(150, this, [this, pitch = cursor_pitch_] { emit audition_note_off(pitch); }); // audible
         event->accept();
         return;
     }
@@ -1215,8 +1748,16 @@ void PianoRollView::keyPressEvent(QKeyEvent* event) {
 }
 
 void PianoRollView::focusOutEvent(QFocusEvent* event) {
-    release_audition(); // scrub/audition notes end when focus is lost (section 7.3)
+    // Focus loss (Alt+Tab, a dialog) ends any gesture without committing it and releases
+    // scrub/audition notes (section 7.3).
+    cancel_gesture();
+    release_audition();
     QWidget::focusOutEvent(event);
+}
+
+void PianoRollView::leaveEvent(QEvent* event) {
+    emit hover_left();
+    QWidget::leaveEvent(event);
 }
 
 void PianoRollView::resizeEvent(QResizeEvent* event) {
@@ -1225,6 +1766,11 @@ void PianoRollView::resizeEvent(QResizeEvent* event) {
 }
 
 void PianoRollView::contextMenuEvent(QContextMenuEvent* event) {
+    // A right press during a drag (Windows sends the menu on release) never opens a menu mid-gesture.
+    if (gesture_ != Gesture::none) {
+        event->accept();
+        return;
+    }
     // Right-click does not change an existing multi-note selection unnecessarily (section 7.2).
     const auto hit = hit_test(event->pos());
     if (hit.note) {
@@ -1253,16 +1799,23 @@ void PianoRollView::contextMenuEvent(QContextMenuEvent* event) {
     menu.addAction(tr("Select Same Pitch"), this, &PianoRollView::select_same_pitch);
     menu.addAction(tr("Select Same Pitch Class"), this, &PianoRollView::select_same_pitch_class);
     menu.addAction(tr("Select Same Channel"), this, &PianoRollView::select_same_channel);
+    menu.addAction(tr("Select Same Duration"), this, &PianoRollView::select_same_duration);
     menu.addAction(tr("Select Out-of-Scale Notes"), this, &PianoRollView::select_out_of_scale);
     menu.addSeparator();
+    auto* loop = menu.addAction(tr("Loop Selection"), this, &PianoRollView::loop_selection);
+    loop->setEnabled(!controller_.selection().empty());
     menu.addAction(tr("Fit Selection"), this, &PianoRollView::fit_selection_or_all);
+    auto* ghosts = menu.addAction(tr("Show Other Tracks"));
+    ghosts->setCheckable(true);
+    ghosts->setChecked(controller_.show_ghost_tracks());
+    connect(ghosts, &QAction::toggled, this, [this](bool on) { controller_.set_show_ghost_tracks(on); });
     menu.exec(event->globalPos());
 }
 
 // --- View and selection commands -----------------------------------------------------------------
 
 void PianoRollView::fit_all() {
-    zoom_history_.push_back(mapping_);
+    push_zoom_history(false);
     const auto& notes = controller_.notes().notes;
     const Tick end = std::max<Tick>(controller_.active_sequence().effective_end(), 1);
     mapping_.origin_tick = 0;
@@ -1296,7 +1849,7 @@ void PianoRollView::fit_selection_or_all() {
         fit_all();
         return;
     }
-    zoom_history_.push_back(mapping_);
+    push_zoom_history(false);
     const auto snapshot = DragSnapshot::capture(selected);
     const Tick span = std::max<Tick>(1, snapshot.latest_end - snapshot.earliest_start);
     mapping_.ticks_per_pixel = std::max(0.05, static_cast<double>(span) / std::max(50.0, note_area().width() - 40));
@@ -1312,12 +1865,13 @@ void PianoRollView::return_to_previous_zoom() {
         return;
     mapping_ = zoom_history_.back();
     zoom_history_.pop_back();
+    last_wheel_zoom_.invalidate();
     emit mapping_changed();
     update();
 }
 
 void PianoRollView::zoom_time(double factor) {
-    zoom_history_.push_back(mapping_);
+    push_zoom_history(false);
     mapping_.zoom_time_around(note_area().width() / 2, factor);
     emit mapping_changed();
     update();
@@ -1337,6 +1891,7 @@ void PianoRollView::set_origin(Tick tick) {
     if (origin == mapping_.origin_tick)
         return;
     mapping_.origin_tick = origin;
+    suspend_follow(); // the scroll bar is a manual scroll
     emit mapping_changed(); // lanes convert x to ticks with this mapping
     update();
 }
@@ -1368,14 +1923,20 @@ void PianoRollView::invert_selection() {
 
 namespace {
 
-template <class Predicate>
-std::set<EventId> select_matching(const DocumentController& controller, Predicate predicate,
+/// One pass over the notes with a constant-time membership test built from the selection once
+/// (a select-all of 100k notes must not compare every note with every selected note).
+template <std::size_t Size, class Key>
+std::set<EventId> select_matching(const DocumentController& controller, Key key,
                                   const std::function<bool(const NoteSpan&)>& editable) {
+    std::bitset<Size> wanted;
+    for (const auto& note : controller.selected_notes())
+        wanted.set(static_cast<std::size_t>(key(note)));
     std::set<EventId> selection;
-    const auto selected = controller.selected_notes();
+    if (wanted.none())
+        return selection;
     for (const auto& note : controller.notes().notes)
-        if (editable(note) && predicate(note, selected))
-            selection.insert(note.on_id);
+        if (editable(note) && wanted.test(static_cast<std::size_t>(key(note))))
+            selection.insert(selection.end(), note.on_id);
     return selection;
 }
 
@@ -1383,34 +1944,31 @@ std::set<EventId> select_matching(const DocumentController& controller, Predicat
 
 void PianoRollView::select_same_pitch() {
     const auto editable = [this](const NoteSpan& note) { return note_editable(note); };
-    controller_.set_selection(select_matching(
-        controller_,
-        [](const NoteSpan& note, const std::vector<NoteSpan>& selected) {
-            return std::any_of(selected.begin(), selected.end(), [&](const NoteSpan& s) { return s.pitch == note.pitch; });
-        },
-        editable));
+    controller_.set_selection(select_matching<128>(controller_, [](const NoteSpan& note) { return note.pitch; }, editable));
 }
 
 void PianoRollView::select_same_pitch_class() {
     const auto editable = [this](const NoteSpan& note) { return note_editable(note); };
-    controller_.set_selection(select_matching(
-        controller_,
-        [](const NoteSpan& note, const std::vector<NoteSpan>& selected) {
-            return std::any_of(selected.begin(), selected.end(),
-                               [&](const NoteSpan& s) { return s.pitch % 12 == note.pitch % 12; });
-        },
-        editable));
+    controller_.set_selection(
+        select_matching<12>(controller_, [](const NoteSpan& note) { return note.pitch % 12; }, editable));
 }
 
 void PianoRollView::select_same_channel() {
     const auto editable = [this](const NoteSpan& note) { return note_editable(note); };
-    controller_.set_selection(select_matching(
-        controller_,
-        [](const NoteSpan& note, const std::vector<NoteSpan>& selected) {
-            return std::any_of(selected.begin(), selected.end(),
-                               [&](const NoteSpan& s) { return s.channel == note.channel; });
-        },
-        editable));
+    controller_.set_selection(
+        select_matching<16>(controller_, [](const NoteSpan& note) { return note.channel & 0x0F; }, editable));
+}
+
+void PianoRollView::select_same_duration() {
+    std::set<Tick> durations;
+    for (const auto& note : controller_.selected_notes())
+        durations.insert(note.duration());
+    std::set<EventId> selection;
+    if (!durations.empty())
+        for (const auto& note : controller_.notes().notes)
+            if (note_editable(note) && durations.contains(note.duration()))
+                selection.insert(selection.end(), note.on_id);
+    controller_.set_selection(std::move(selection));
 }
 
 void PianoRollView::select_out_of_scale() {
@@ -1419,6 +1977,23 @@ void PianoRollView::select_out_of_scale() {
         if (note_editable(note) && !in_scale(note.pitch))
             selection.insert(note.on_id);
     controller_.set_selection(std::move(selection));
+}
+
+void PianoRollView::loop_selection() {
+    const auto selected = controller_.selected_notes();
+    if (selected.empty()) {
+        emit status_message(tr("Select notes first: Loop Selection loops their grid-aligned extent"));
+        return;
+    }
+    if (!controller_.active_sequence().division.is_ppq()) {
+        emit status_message(tr("Loops in bars need a PPQ (musical) time base"));
+        return;
+    }
+    const auto range = grid_aligned_extent(selected, grid());
+    if (set_loop_range(controller_, range))
+        emit status_message(tr("Loop set to %1 - %2")
+                                .arg(QString::fromStdString(controller_.meter_map().format(range.begin)))
+                                .arg(QString::fromStdString(controller_.meter_map().format(range.end))));
 }
 
 // --- Panel with windowed scroll bars -------------------------------------------------------------
@@ -1443,6 +2018,7 @@ PianoRollPanel::PianoRollPanel(DocumentController& controller, QWidget* parent)
     grid->addWidget(horizontal_);
     connect(view_, &PianoRollView::mapping_changed, this, &PianoRollPanel::sync_scrollbars);
     connect(&controller_, &DocumentController::document_changed, this, &PianoRollPanel::sync_scrollbars);
+    connect(&controller_, &DocumentController::view_state_changed, this, &PianoRollPanel::sync_scrollbars);
     connect(horizontal_, &QScrollBar::valueChanged, this, [this](int value) {
         if (syncing_)
             return;
@@ -1453,7 +2029,7 @@ PianoRollPanel::PianoRollPanel(DocumentController& controller, QWidget* parent)
     connect(vertical_, &QScrollBar::valueChanged, this, [this](int value) {
         if (syncing_)
             return;
-        view_->set_top_pitch(127 - value);
+        view_->set_top_row(value); // rows, so Fold to Scale scrolls by visible rows
     });
     sync_scrollbars();
 }
@@ -1469,12 +2045,13 @@ void PianoRollPanel::sync_scrollbars() {
     horizontal_->setRange(0, std::max(0, scrollbar_resolution - page));
     horizontal_->setPageStep(page);
     horizontal_->setSingleStep(std::max(1, page / 8));
-    const int rows = std::clamp(view_->visible_row_count(), 1, 128);
-    vertical_->setRange(0, std::max(0, 128 - rows));
+    const int total_rows = view_->row_count();
+    const int rows = std::clamp(view_->visible_row_count(), 1, total_rows);
+    vertical_->setRange(0, std::max(0, total_rows - rows));
     vertical_->setPageStep(rows);
     vertical_->setSingleStep(1);
     horizontal_->setValue(static_cast<int>(static_cast<__int128>(mapping.origin_tick) * scrollbar_resolution / total));
-    vertical_->setValue(127 - mapping.top_pitch);
+    vertical_->setValue(view_->top_row());
     syncing_ = false;
 }
 

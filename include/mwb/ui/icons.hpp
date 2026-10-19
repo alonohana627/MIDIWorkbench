@@ -31,9 +31,13 @@ enum class IconId {
     down,
     close,
     pause,
+    more,
 };
 
-/// Paints the icon at 16, 20, 24 and 32 px for the current palette; rebuild after a theme change.
+/// A painted icon. Every pixmap is drawn on request with the palette in effect at that moment, at
+/// the requested size and device pixel ratio, so icons follow theme changes (including Windows
+/// light/dark switches) and monitor scale changes without being rebuilt. Disabled icons use the
+/// disabled text color in both check states; checked and selected icons use the highlighted text.
 [[nodiscard]] QIcon make_icon(IconId id);
 
 } // namespace mwb::ui

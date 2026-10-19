@@ -44,7 +44,7 @@ enum class MediaType : std::uint8_t { smf, rmid, native };
 
 /// Connection settings (section 22.5).
 struct LibraryOptions {
-    int busy_timeout_ms = 5000;
+    int busy_timeout_ms = 5000;          ///< Also bounds the wait for a free read connection.
     std::size_t read_connections = 4;
 };
 
@@ -55,7 +55,7 @@ enum class DuplicatePolicy : std::uint8_t { attach_source, separate_asset };
 struct ImportOptions {
     bool recursive = true;
     DuplicatePolicy duplicates = DuplicatePolicy::attach_source;
-    std::size_t max_capture_attempts = 3;
+    std::size_t max_capture_attempts = 3; ///< Retries wait 100, 250, then 500 ms (cancellable).
     midi::ParseLimits limits;
     /// Parser for imported SMF/RMID bytes; empty parses in this process. The application passes
     /// the isolated parser worker (section 28.2).
@@ -212,19 +212,26 @@ struct GarbageCollectionOptions {
     std::optional<std::int64_t> now_ms; ///< Override for tests; defaults to the wall clock.
 };
 struct GarbageCollectionReport {
-    std::size_t unreferenced = 0;  ///< Objects without catalog references.
-    std::size_t deleted = 0;       ///< Removed after their grace period.
-    std::size_t waiting = 0;       ///< Still inside the grace period.
+    std::size_t unreferenced = 0;    ///< Objects without catalog references.
+    std::size_t deleted = 0;         ///< Removed after their grace period.
+    std::size_t waiting = 0;         ///< Still inside the grace period.
     std::size_t staging_removed = 0;
-    bool suspended = false;        ///< A backup is active; nothing was removed.
+    bool suspended = false;          ///< A backup is active; nothing was removed.
 };
 
-/// Explicit analysis (CLI `library analyze`).
+/// Derived analysis of current heads (CLI `library analyze`, automatic after imports and saves).
 struct AnalyzeOptions {
     bool fingerprints = true;
     bool motif = true;
     bool features = true;
     std::size_t batch_size = 64;
+    /// Parser for SMF/RMID objects; empty parses in this process. The application passes the
+    /// isolated parser worker exactly as for import (section 28.2): analysis re-reads the same
+    /// untrusted bytes and must not crash or exhaust the GUI process.
+    midi::MidiParser parser;
+    midi::ParseLimits limits;
+    /// Called after each revision with the number processed so far (on the calling thread).
+    std::function<void(std::size_t done)> progress;
 };
 struct AnalyzeReport {
     std::size_t revisions_analyzed = 0;
@@ -261,6 +268,7 @@ public:
     [[nodiscard]] static Result<std::unique_ptr<Library>> create(const std::filesystem::path& root,
                                                                  const LibraryOptions& options = {});
     /// Opens an existing library for writing; fails with ErrorCode::busy when another writer holds it.
+    /// Older catalog schemas are migrated in place.
     [[nodiscard]] static Result<std::unique_ptr<Library>> open(const std::filesystem::path& root,
                                                                const LibraryOptions& options = {});
 
@@ -341,7 +349,7 @@ public:
     [[nodiscard]] Result<PurgeReport> purge_preview(const std::vector<std::int64_t>& asset_ids);
     /// Permanently removes trashed assets (active assets are refused).
     [[nodiscard]] Result<PurgeReport> purge(const std::vector<std::int64_t>& asset_ids);
-    /// Trashed assets ordered by (deleted_ms, sort_title, id), keyset paged.
+    /// Trashed assets ordered by (deleted_ms, sort_title, id), first page.
     [[nodiscard]] Result<std::vector<std::int64_t>> list_trash(std::size_t limit = 500);
     [[nodiscard]] Result<GarbageCollectionReport> collect_garbage(const GarbageCollectionOptions& options = {});
 
@@ -364,6 +372,9 @@ public:
                                                                        bool across_sequences);
 
     // --- Analysis and musical search ----------------------------------------------------------
+    /// Builds derived data (fingerprints, motif streams and grams, feature vectors) for current
+    /// heads that lack it. Idempotent and cheap when nothing is pending, so callers run it after
+    /// every import, save, restore or duplicate (section 26.6 automatic analysis).
     [[nodiscard]] Result<AnalyzeReport> analyze(const AnalyzeOptions& options = {}, std::stop_token stop = {});
     [[nodiscard]] Result<search::ExactSearchResult> motif_search(const search::ExactQuery& query,
                                                                  std::stop_token stop = {});

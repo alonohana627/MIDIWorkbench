@@ -2,6 +2,7 @@
 
 #include "mwb/library/catalog_connection.hpp"
 
+#include "mwb/core/model.hpp"
 #include "mwb/document/sqlite_support.hpp"
 #include "mwb/library/catalog_schema.hpp"
 
@@ -42,7 +43,30 @@ int interrupt_when_stopped(void* context) {
     return stop->stop_requested() ? 1 : 0;
 }
 
+std::string replace_all(std::string text, std::string_view from, std::string_view to) {
+    for (auto position = text.find(from); position != std::string::npos; position = text.find(from, position + to.size()))
+        text.replace(position, from.size(), to);
+    return text;
+}
+
+/// Schema and data of migration step 1 -> 2 (DDL, fact backfill, version).
+std::string migration_v2_sql() {
+    return std::string(catalog_migration_v2) + sequence_fact_sql(false) + "PRAGMA user_version = 2;\n";
+}
+
 } // namespace
+
+std::string sequence_fact_sql(bool one_revision) {
+    auto sql = replace_all(std::string(sequence_fact_inserts), "{s_filter}", one_revision ? "s.revision_id = ?1" : "1");
+    return replace_all(std::move(sql), "{t_filter}", one_revision ? "t.revision_id = ?1" : "1");
+}
+
+std::string catalog_reference_ddl(std::int32_t version) {
+    auto ddl = std::string(catalog_ddl_v1) + std::string(catalog_tuning_indexes_v1);
+    if (version >= 2)
+        ddl += migration_v2_sql();
+    return ddl;
+}
 
 Result<std::unique_ptr<SQLite::Database>> open_catalog_connection(const std::filesystem::path& database_path,
                                                                   ConnectionRole role, int busy_timeout_ms,
@@ -62,16 +86,40 @@ Result<std::unique_ptr<SQLite::Database>> open_catalog_connection(const std::fil
 Status create_catalog_schema(SQLite::Database& database, const Uuid& library_uuid, std::int64_t created_ms) {
     return sqlite_support::guarded("create catalog schema", [&]() -> Status {
         SQLite::Transaction transaction(database, SQLite::TransactionBehavior::IMMEDIATE);
-        database.exec(std::string(catalog_ddl_v1));
-        database.exec(std::string(catalog_tuning_indexes_v1));
+        // The same statements as a migrated catalog, so both schemas compare equal.
+        database.exec(catalog_reference_ddl(catalog_schema_version));
         SQLite::Statement insert(database, "INSERT INTO catalog(singleton, uuid, created_ms, generation) VALUES (1, ?1, ?2, 0)");
         sqlite_support::bind_uuid(insert, 1, library_uuid);
         insert.bind(2, created_ms);
         insert.exec();
         SQLite::Statement setting(database, "INSERT INTO catalog_setting(key, schema_version, value_json) VALUES "
                                             "('migration.history', 1, ?1)");
-        setting.bind(1, std::format("[{{\"version\":1,\"applied_ms\":{}}}]", created_ms));
+        setting.bind(1, std::format("[{{\"version\":{},\"applied_ms\":{}}}]", catalog_schema_version, created_ms));
         setting.exec();
+        transaction.commit();
+        return ok();
+    });
+}
+
+Status migrate_catalog(SQLite::Database& database) {
+    return sqlite_support::guarded("migrate catalog", [&]() -> Status {
+        if (sqlite_support::pragma_integer(database, "user_version") >= catalog_schema_version)
+            return ok();
+        SQLite::Transaction transaction(database, SQLite::TransactionBehavior::IMMEDIATE);
+        // Re-read inside the write lock: another process may have migrated meanwhile.
+        const auto version = sqlite_support::pragma_integer(database, "user_version");
+        if (version == 1) {
+            database.exec(migration_v2_sql());
+            SQLite::Statement history(database,
+                                      "UPDATE catalog_setting SET value_json = json_insert(value_json, '$[#]', "
+                                      "json_object('version', 2, 'applied_ms', ?1)) WHERE key = 'migration.history' AND "
+                                      "json_type(value_json) = 'array'");
+            history.bind(1, now_utc_ms());
+            history.exec();
+        }
+        if (sqlite_support::pragma_integer(database, "user_version") != catalog_schema_version)
+            return make_error(ErrorCode::unsupported, "the catalog schema has no migration path to this version",
+                              std::to_string(version));
         transaction.commit();
         return ok();
     });
@@ -86,7 +134,7 @@ Status check_catalog_header(SQLite::Database& database) {
         if (version > catalog_schema_version)
             return make_error(ErrorCode::unsupported,
                               std::format("the catalog uses schema version {}, newer than this application ({}); "
-                                          "write access is refused",
+                                          "update MIDI Workbench to open this library",
                                           version, catalog_schema_version));
         if (version < 1)
             return make_error(ErrorCode::invalid_data, "the catalog has no schema version");
@@ -143,8 +191,11 @@ Status backup_database(SQLite::Database& source, const std::filesystem::path& de
             step = sqlite3_backup_step(backup, -1);
         }
         const int finished = sqlite3_backup_finish(backup);
+        // The target's errmsg often reads "not an error" when the source step failed; report the
+        // failing step's own code instead.
         if (step != SQLITE_DONE || finished != SQLITE_OK)
-            return make_error(ErrorCode::database, std::string("backup failed: ") + sqlite3_errmsg(target.getHandle()));
+            return make_error(ErrorCode::database,
+                              std::string("backup failed: ") + sqlite3_errstr(step != SQLITE_DONE ? step : finished));
         target.exec("PRAGMA journal_mode = DELETE");
         return ok();
     });

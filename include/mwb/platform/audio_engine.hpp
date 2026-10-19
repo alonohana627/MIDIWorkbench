@@ -15,7 +15,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <memory>
+#include <optional>
 
 namespace mwb::platform {
 
@@ -26,6 +28,19 @@ enum class EngineCommandKind : std::uint8_t { play, stop, seek, panic, metronome
 struct EngineCommand {
     EngineCommandKind kind = EngineCommandKind::stop;
     Tick tick = 0;
+    std::uint32_t count_in_bars = 0; ///< play: bars of count-in clicks before `tick` starts.
+};
+
+/// The render thread's transport clock: which absolute frame was rendered when, and how absolute
+/// frames map onto the playing snapshot. Read by the owner thread to place input events on the
+/// transport timeline (recording, section 8.4 rule 2).
+struct EngineClock {
+    std::int64_t steady_ns = 0;          ///< steady_clock time at the start of the last callback.
+    std::int64_t absolute_frame = 0;     ///< Scheduler absolute frame at that callback start.
+    playback::SchedulerClock scheduler;  ///< Mapping of absolute frames to the snapshot timeline.
+    std::uint64_t snapshot_generation = 0;
+    std::uint64_t run = 0;               ///< Number of play commands applied so far.
+    bool counting_in = false;
 };
 
 /// An event for an external MIDI endpoint, with the steady-clock time it should be sent.
@@ -59,7 +74,9 @@ struct EngineTelemetry {
     std::int64_t song_frame = 0;
     Tick position = 0;
     std::uint64_t epoch = 0;
+    std::uint64_t run = 0;                 ///< Play commands applied (see EngineClock::run).
     bool playing = false;
+    bool counting_in = false;              ///< Count-in clicks are playing; the song has not started.
     bool reached_end = false;
 };
 
@@ -86,7 +103,9 @@ public:
                                          audio::MetronomeSynth* metronome, audio::BuiltinSynth* timbre_target = nullptr);
     /// Opens `output`, prepares instruments at the negotiated rate and starts the device.
     [[nodiscard]] Result<NegotiatedFormat> open(IAudioOutput& output, const AudioOutputConfig& config);
-    /// Stops and closes the output (owned notes are released by a final panic on the synths).
+    /// Stops and closes the output. Owned notes are released and a panic (all-notes-off,
+    /// all-sound-off, sustain and bend reset) is sent on every used route, external MIDI included,
+    /// so closing never leaves notes sounding on a hardware synth (section 13.6).
     void close();
     /// Sample rate snapshots must be compiled for (0 before open()).
     [[nodiscard]] std::uint32_t sample_rate() const noexcept { return sample_rate_; }
@@ -98,8 +117,13 @@ public:
     std::size_t collect_retired();
     /// Queues a transport command; ErrorCode::busy when the control queue is full.
     [[nodiscard]] Status post(EngineCommand command);
-    /// Queues a live-input event for the built-in synth (single producer); false when full.
+    /// Queues a live-input event for the built-in synth's private audition channel (single
+    /// producer: the owner thread); false when full. Live events never touch the document's
+    /// channel state.
     [[nodiscard]] bool post_live(const playback::RealtimeMidiEvent& event) noexcept;
+    /// Second live queue with its own single producer (the MIDI input monitor thread), so input
+    /// monitoring does not depend on the owner (GUI) thread. Same destination as post_live().
+    [[nodiscard]] bool post_monitor(const playback::RealtimeMidiEvent& event) noexcept;
     /// Target master volume (linear 0..2); smoothed on the render thread.
     void set_master_volume(float volume) noexcept;
     /// Takes the next external MIDI event, waiting up to `timeout` (MIDI output side).
@@ -108,6 +132,16 @@ public:
     void set_external_latency(std::chrono::nanoseconds latency) noexcept;
 
     [[nodiscard]] EngineTelemetry telemetry() const noexcept;
+    /// Consistent copy of the render thread's transport clock (any thread; never blocks the
+    /// render thread, retries while it is being written).
+    [[nodiscard]] EngineClock clock() const noexcept;
+    /// Linear transport tick heard at `steady_ns` (steady_clock nanoseconds) in play run `run`:
+    /// extrapolated from the last callback, minus the device output latency, mapped through the
+    /// playing snapshot (tempo map, tempo multiplier and loop, with later loop passes unfolded;
+    /// see playback::linear_tick_at). nullopt when run `run` is not the one playing. Owner thread.
+    [[nodiscard]] std::optional<Tick> transport_tick_at(std::int64_t steady_ns, std::uint64_t run) const;
+    /// Device output latency subtracted by transport_tick_at() (from the negotiated format).
+    [[nodiscard]] std::int64_t output_latency_ns() const noexcept { return output_latency_ns_; }
     /// Peak meter (read with take() at display rate).
     [[nodiscard]] audio::PeakMeter& meter() noexcept { return meter_; }
     /// True when the output reported device loss; the owner then calls handle_device_lost().
@@ -142,6 +176,24 @@ private:
     float volume_coefficient_ = 0.0f;
     bool stop_pending_ = false;
     bool end_reached_in_callback_ = false;
+    std::int64_t output_latency_ns_ = 0;
+    std::uint64_t runs_ = 0;   ///< Render thread only; published through the clock.
+    /// Recently published snapshots (owner thread) so transport_tick_at() can map through the
+    /// snapshot the render thread reports, also just after a newer one was published.
+    std::deque<std::shared_ptr<const playback::PlaybackSnapshot>> recent_;
+
+    // Clock seqlock: odd while the render thread writes the fields below.
+    std::atomic<std::uint64_t> clock_sequence_{0};
+    std::atomic<std::int64_t> clock_steady_ns_{0};
+    std::atomic<std::int64_t> clock_absolute_{0};
+    std::atomic<std::int64_t> clock_anchor_{0};
+    std::atomic<std::int64_t> clock_iteration_{0};
+    std::atomic<std::int64_t> clock_passes_{0};
+    std::atomic<std::uint64_t> clock_generation_{0};
+    std::atomic<std::uint64_t> clock_run_{0};
+    std::atomic<bool> clock_looping_{false};
+    std::atomic<bool> clock_playing_{false};
+    std::atomic<bool> clock_counting_in_{false};
 
     std::atomic<float> target_volume_{0.5f};
     std::atomic<std::int64_t> external_latency_ns_{0};
@@ -156,6 +208,7 @@ private:
     std::atomic<Tick> position_{0};
     std::atomic<std::uint64_t> epoch_{0};
     std::atomic<bool> playing_{false};
+    std::atomic<bool> counting_in_{false};
     std::atomic<bool> reached_end_{false};
 };
 

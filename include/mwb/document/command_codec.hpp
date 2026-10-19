@@ -37,6 +37,9 @@ struct CommandEnvelope {
     ChangeSet changes;                   ///< The change set that was applied.
 };
 
+/// Stable lowercase name of a command kind ("edit", "undo", "redo"), as stored in envelopes.
+[[nodiscard]] const char* command_kind_name(CommandKind kind);
+
 /// Sorted, de-duplicated identities of every sequence, track and event a change set touches.
 [[nodiscard]] std::vector<Uuid> affected_entities(const ChangeSet& changes);
 

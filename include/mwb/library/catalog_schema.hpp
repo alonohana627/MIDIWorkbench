@@ -8,8 +8,9 @@ namespace mwb::library {
 
 /// SQLite application_id of library catalogs.
 inline constexpr std::int32_t catalog_application_id = 1297564204;
-/// Catalog schema version (PRAGMA user_version).
-inline constexpr std::int32_t catalog_schema_version = 1;
+/// Catalog schema version (PRAGMA user_version). Version 2 adds the search fact table and the
+/// covering browse indexes (catalog_migration_v2); older catalogs are migrated in place on open.
+inline constexpr std::int32_t catalog_schema_version = 2;
 
 /// Executable baseline DDL, verbatim from section 23.2.
 inline constexpr std::string_view catalog_ddl_v1 = R"sql(-- schema: catalog
@@ -294,6 +295,63 @@ CREATE INDEX source_asset ON source_location(asset_id);
 CREATE INDEX source_object ON source_location(last_object_sha256);
 CREATE INDEX revision_parent ON revision(parent_id);
 CREATE INDEX asset_head ON asset(current_revision_id);
+)sql";
+
+/// Migration 1 -> 2 (also run on new catalogs, so created and migrated schemas are identical).
+///
+/// Selective structured searches must not walk the whole catalog (section 33.2, 150 ms at L100K):
+/// - sequence_fact holds the per-sequence list facts that version 1 kept only inside JSON
+///   (event classes, meter names, tempos, channels, programs), so `has:`, `meter:`,
+///   `tempo.any:`, `channel:` and `program:` are answered from one primary-key range;
+/// - the *_head browse indexes cover current_revision_id, so a keyset walk tests the musical
+///   candidate set without reading asset rows; they replace asset_modified/asset_created;
+/// - summary_notes and summary_duration serve `notes:` and `duration:` ranges.
+/// The backfill derives facts from the stored JSON exactly as the version 1 SQL compiler did.
+inline constexpr std::string_view catalog_migration_v2 = R"sql(
+CREATE TABLE sequence_fact (
+    kind TEXT NOT NULL CHECK (kind IN ('event','meter','tempo','channel','program')),
+    value ANY NOT NULL,
+    revision_id INTEGER NOT NULL,
+    sequence_no INTEGER NOT NULL,
+    PRIMARY KEY(kind,value,revision_id,sequence_no),
+    FOREIGN KEY(revision_id,sequence_no)
+      REFERENCES sequence_summary(revision_id,sequence_no) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE INDEX fact_owner ON sequence_fact(revision_id,sequence_no);
+DROP INDEX IF EXISTS asset_modified;
+DROP INDEX IF EXISTS asset_created;
+CREATE INDEX asset_browse_head ON asset(deleted_ms,sort_title,id,current_revision_id);
+CREATE INDEX asset_modified_head ON asset(deleted_ms,modified_ms,id,current_revision_id);
+CREATE INDEX asset_created_head ON asset(deleted_ms,created_ms,id,current_revision_id);
+CREATE INDEX summary_notes ON sequence_summary(note_count,revision_id);
+CREATE INDEX summary_duration ON sequence_summary(duration_seconds,revision_id);
+)sql";
+
+/// Fact rows of sequence_summary/track_summary rows matched by `{filter}` (a condition on
+/// `s.revision_id` / `t.revision_id`, or "1" for every row). One statement per fact kind; the
+/// writers run it after inserting a revision's summaries and the migration runs it once.
+inline constexpr std::string_view sequence_fact_inserts = R"sql(
+INSERT OR IGNORE INTO sequence_fact(kind,value,revision_id,sequence_no)
+  SELECT 'event', j.value, s.revision_id, s.sequence_no
+  FROM sequence_summary AS s, json_each(s.diagnostics_json,'$.event_classes') AS j
+  WHERE {s_filter} AND j.type = 'text';
+INSERT OR IGNORE INTO sequence_fact(kind,value,revision_id,sequence_no)
+  SELECT 'meter', j.value, s.revision_id, s.sequence_no
+  FROM sequence_summary AS s, json_each(s.diagnostics_json,'$.meter_names') AS j
+  WHERE {s_filter} AND j.type = 'text';
+INSERT OR IGNORE INTO sequence_fact(kind,value,revision_id,sequence_no)
+  SELECT 'tempo', j.value, s.revision_id, s.sequence_no
+  FROM sequence_summary AS s, json_each(s.diagnostics_json,'$.tempos') AS j
+  WHERE {s_filter} AND j.type IN ('integer','real');
+INSERT OR IGNORE INTO sequence_fact(kind,value,revision_id,sequence_no)
+  SELECT 'program', json_extract(j.value,'$.program'), t.revision_id, t.sequence_no
+  FROM track_summary AS t, json_each(t.program_json) AS j
+  WHERE {t_filter} AND json_type(j.value,'$.program') = 'integer';
+WITH RECURSIVE bit(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM bit WHERE n < 16)
+INSERT OR IGNORE INTO sequence_fact(kind,value,revision_id,sequence_no)
+  SELECT 'channel', bit.n, t.revision_id, t.sequence_no
+  FROM track_summary AS t JOIN bit ON (t.channel_mask >> (bit.n - 1)) & 1 = 1
+  WHERE {t_filter};
 )sql";
 
 } // namespace mwb::library

@@ -417,9 +417,9 @@ void InMemoryMotifIndex::add(StoredMotifStream stream) {
     streams_.insert_or_assign(id, std::move(stream));
 }
 
-Result<std::uint64_t> InMemoryMotifIndex::count_postings(const GramKey& key) {
+Result<std::uint64_t> InMemoryMotifIndex::count_postings(const GramKey& key, std::uint64_t cap) {
     const auto found = postings_.find(key);
-    return found == postings_.end() ? std::uint64_t{0} : std::uint64_t{found->second.size()};
+    return found == postings_.end() ? std::uint64_t{0} : std::min<std::uint64_t>(found->second.size(), cap);
 }
 
 Result<std::vector<GramPosting>> InMemoryMotifIndex::postings(const GramKey& key, std::size_t limit) {

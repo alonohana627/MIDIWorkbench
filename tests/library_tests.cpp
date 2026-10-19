@@ -13,6 +13,7 @@
 #include <SQLiteCpp/Statement.h>
 
 #include <algorithm>
+#include <format>
 #include <fstream>
 #include <set>
 
@@ -258,7 +259,7 @@ TEST_SUITE("catalog") {
                 CHECK(std::filesystem::exists(root / entry));
             SQLite::Database database((root / "library.sqlite").string(), SQLite::OPEN_READONLY);
             CHECK(document::sqlite_support::pragma_integer(database, "application_id") == catalog_application_id);
-            CHECK(document::sqlite_support::pragma_integer(database, "user_version") == 1);
+            CHECK(document::sqlite_support::pragma_integer(database, "user_version") == catalog_schema_version);
             SQLite::Statement mode(database, "PRAGMA journal_mode");
             REQUIRE(mode.executeStep());
             CHECK(mode.getColumn(0).getString() == "wal");
@@ -283,7 +284,7 @@ TEST_SUITE("catalog") {
         make_library(root).reset();
         {
             SQLite::Database database((root / "library.sqlite").string(), SQLite::OPEN_READWRITE);
-            database.exec("PRAGMA user_version = 2");
+            database.exec(std::format("PRAGMA user_version = {}", catalog_schema_version + 1));
         }
         auto opened = Library::open(root);
         REQUIRE_FALSE(opened.has_value());
@@ -634,6 +635,22 @@ TEST_SUITE("import") {
         CHECK(analyzed->grams > 0);
         CHECK(library->analyze()->revisions_analyzed == 0);
 
+        // Analysis parses through the caller's parser (the isolated worker in the application).
+        write_bytes(in / "late.mid", phrase_smf(Phrase{}.set_pitches({55, 57, 59, 60})));
+        REQUIRE(library->import_paths({in / "late.mid"}).has_value());
+        std::size_t parser_calls = 0;
+        AnalyzeOptions counted;
+        counted.parser = [&](std::span<const std::uint8_t> bytes, std::string_view name, const midi::ParseLimits& limits,
+                             std::stop_token token) {
+            ++parser_calls;
+            return midi::import_midi(bytes, name, limits, std::move(token));
+        };
+        std::size_t progress_calls = 0;
+        counted.progress = [&](std::size_t) { ++progress_calls; };
+        CHECK(library->analyze(counted)->revisions_analyzed == 1);
+        CHECK(parser_calls == 1);
+        CHECK(progress_calls == 1);
+
         search::ExactQuery query;
         query.mode = search::MatchMode::transposed;
         for (const int pitch : {64, 67, 72, 71, 67})
@@ -642,7 +659,7 @@ TEST_SUITE("import") {
             query.notes[index].onset = static_cast<Tick>(index) * 480;
         auto exact = library->motif_search(query);
         REQUIRE(exact.has_value());
-        REQUIRE(exact->occurrences.size() == 2);
+        REQUIRE(exact->occurrences.size() == 2); // "late.mid" does not contain the motif.
         CHECK(exact->occurrences[0].first_note == 1);
         std::set<std::int64_t> assets;
         for (const auto& occurrence : exact->occurrences)

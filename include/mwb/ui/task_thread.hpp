@@ -6,6 +6,7 @@
 #include <mutex>
 #include <stop_token>
 #include <thread>
+#include <utility>
 
 namespace mwb::ui {
 
@@ -19,21 +20,29 @@ public:
     explicit TaskThread(bool drain = false) : drain_(drain) {
         thread_ = std::jthread([this](std::stop_token stop) {
             while (true) {
-                std::function<void(std::stop_token)> task;
+                Entry entry;
                 {
                     std::unique_lock lock(mutex_);
                     wake_.wait(lock, stop, [this] { return !tasks_.empty(); });
                     if (stop.stop_requested() && (!drain_ || tasks_.empty()))
                         return;
-                    task = std::move(tasks_.front());
+                    entry = std::move(tasks_.front());
                     tasks_.pop_front();
                     running_ = true;
                 }
                 try {
-                    task(stop);
+                    entry.task(stop);
                 } catch (...) {
-                    // A failing task must not terminate the application; its result simply never
-                    // arrives (tasks report their own errors through Result values).
+                    // A failing task must not terminate the application. Its own completion never
+                    // runs, so the poster's failure handler clears "in flight" state instead
+                    // (SQLiteCpp throws on storage errors the library does not wrap).
+                    if (entry.on_failure) {
+                        try {
+                            entry.on_failure();
+                        } catch (...) {
+                            // nothing more can be reported from here
+                        }
+                    }
                 }
                 {
                     std::lock_guard lock(mutex_);
@@ -45,34 +54,57 @@ public:
     }
     ~TaskThread() { stop(); }
     void stop() {
+        {
+            std::lock_guard lock(mutex_);
+            stopped_ = true;
+        }
         thread_.request_stop();
         wake_.notify_all();
         if (thread_.joinable())
             thread_.join();
+        {
+            std::lock_guard lock(mutex_);
+            tasks_.clear(); // never run after stop: post() refuses new ones
+            running_ = false;
+        }
+        idle_.notify_all();
     }
     TaskThread(const TaskThread&) = delete;
     TaskThread& operator=(const TaskThread&) = delete;
 
-    /// Blocks until every queued task has run; the thread stays available afterwards.
+    /// Blocks until every queued task has run; the thread stays available afterwards. Returns at
+    /// once after stop(), when queued tasks will never run.
     void wait_idle() {
         std::unique_lock lock(mutex_);
-        idle_.wait(lock, [this] { return tasks_.empty() && !running_; });
+        idle_.wait(lock, [this] { return stopped_ || (tasks_.empty() && !running_); });
     }
 
-    void post(std::function<void(std::stop_token)> task) {
+    /// Queues a task. `on_failure` runs on this thread when the task throws, so a poster that set
+    /// an "in flight" flag can post its reset (and an error text) back to the GUI. Returns false,
+    /// and drops the task, after stop().
+    bool post(std::function<void(std::stop_token)> task, std::function<void()> on_failure = {}) {
         {
             std::lock_guard lock(mutex_);
-            tasks_.push_back(std::move(task));
+            if (stopped_)
+                return false;
+            tasks_.push_back(Entry{std::move(task), std::move(on_failure)});
         }
         wake_.notify_all();
+        return true;
     }
 
 private:
+    struct Entry {
+        std::function<void(std::stop_token)> task;
+        std::function<void()> on_failure;
+    };
+
     std::mutex mutex_;
     std::condition_variable_any wake_;
     std::condition_variable_any idle_;
     bool running_ = false;
-    std::deque<std::function<void(std::stop_token)>> tasks_;
+    bool stopped_ = false;
+    std::deque<Entry> tasks_;
     bool drain_ = false;
     std::jthread thread_; // declared last: joined before the queue is destroyed
 };

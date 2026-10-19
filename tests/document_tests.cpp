@@ -889,17 +889,19 @@ TEST_CASE("checkpoints are written by count, size and time and compaction follow
         add_note(session, index * 480, 60);
         REQUIRE(journal->flush());
     }
-    // Checkpoints after commands 4 and 8; only the newest survives with command 9 after it.
-    CHECK(count("SELECT count(*) FROM recovery_checkpoint") == 1);
+    // Checkpoints 0 (initial), 4 and 8; compaction keeps the previous checkpoint (4) as a
+    // fallback together with the commands after it (5..9).
+    CHECK(count("SELECT count(*) FROM recovery_checkpoint") == 2);
     CHECK(count("SELECT max(command_no) FROM recovery_checkpoint") == 8);
-    CHECK(count("SELECT count(*) FROM recovery_command") == 1);
+    CHECK(count("SELECT min(command_no) FROM recovery_checkpoint") == 4);
+    CHECK(count("SELECT count(*) FROM recovery_command") == 5);
 
     SUBCASE("time threshold") {
         clock_ms += 61'000;
         add_note(session, 6000, 61);
         REQUIRE(journal->flush());
         CHECK(count("SELECT max(command_no) FROM recovery_checkpoint") == 10);
-        CHECK(count("SELECT count(*) FROM recovery_command") == 0);
+        CHECK(count("SELECT count(*) FROM recovery_command") == 2); // 9 and 10 after checkpoint 8
     }
     SUBCASE("size threshold") {
         RecoveryPolicy big;

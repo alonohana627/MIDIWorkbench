@@ -14,8 +14,16 @@ constexpr std::array<SchemaChecksum, 1> native_checksums{
     SchemaChecksum{1, "ae2f58dc4172f4ca77627d61cab6bab4ab09648824ae49c0355c5f49763240a4"},
 };
 
-constexpr std::array<SchemaChecksum, 1> recovery_checksums{
+constexpr std::array<SchemaChecksum, 2> recovery_checksums{
     SchemaChecksum{1, "44f2c189621c86a54e3e2b69376653e171f9b8870245bce07fbfadbb4df4aa5d"},
+    SchemaChecksum{2, "03a670217b301952ba5c9c82d57b1fcdfd4b0c208902024def9e7b7c4aa7e482"},
+};
+
+/// Recovery 1 -> 2 adds the in-progress capture chunk table (section 21.2). The recovery
+/// database is a private per-user cache, so it is migrated in place.
+constexpr std::array<MigrationStep, 1> recovery_steps{
+    MigrationStep{1, "add recovery_capture_chunk", schemas::recovery_v1_to_v2,
+                  "48243644f40dda50b29b8a9d95e2b601da42311693fe8c48044ea4d214300bd5"},
 };
 
 /// SHA-256 of SQL text with carriage returns removed, so a checkout with CRLF line endings
@@ -42,7 +50,7 @@ const char* family_name(SchemaFamily family) {
 std::int32_t current_version(SchemaFamily family) {
     switch (family) {
     case SchemaFamily::native: return 1;
-    case SchemaFamily::recovery: return 1;
+    case SchemaFamily::recovery: return 2;
     }
     return 1;
 }
@@ -50,7 +58,7 @@ std::int32_t current_version(SchemaFamily family) {
 std::string_view current_ddl(SchemaFamily family) {
     switch (family) {
     case SchemaFamily::native: return schemas::native_v1;
-    case SchemaFamily::recovery: return schemas::recovery_v1;
+    case SchemaFamily::recovery: return schemas::recovery_v2;
     }
     return schemas::native_v1;
 }
@@ -65,8 +73,8 @@ std::span<const SchemaChecksum> recorded_checksums(SchemaFamily family) {
 
 std::span<const MigrationStep> migration_steps(SchemaFamily family) {
     switch (family) {
-    case SchemaFamily::native:
-    case SchemaFamily::recovery: return {};
+    case SchemaFamily::native: return {};
+    case SchemaFamily::recovery: return recovery_steps;
     }
     return {};
 }

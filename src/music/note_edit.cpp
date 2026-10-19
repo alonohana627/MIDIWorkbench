@@ -4,7 +4,10 @@
 #include "mwb/music/json_fields.hpp"
 
 #include <algorithm>
+#include <bitset>
+#include <functional>
 #include <map>
+#include <memory>
 #include <set>
 #include <tuple>
 #include <unordered_set>
@@ -39,18 +42,31 @@ Result<NoteEditor> NoteEditor::open(const DocumentData& document, SequenceId seq
     const auto index = document.sequence_index(sequence);
     if (!index)
         return make_error(ErrorCode::not_found, "the target sequence does not exist", sequence.to_string());
+    return open_with(document, sequence, std::make_shared<const NotePairing>(pair_notes(document.sequences[*index])),
+                     false);
+}
+
+Result<NoteEditor> NoteEditor::open(const DocumentData& document, SequenceId sequence, const NotePairing& pairing) {
+    // Borrowed: an aliasing pointer that owns nothing.
+    return open_with(document, sequence, std::shared_ptr<const NotePairing>(std::shared_ptr<void>(), &pairing), true);
+}
+
+Result<NoteEditor> NoteEditor::open_with(const DocumentData& document, SequenceId sequence,
+                                         std::shared_ptr<const NotePairing> pairing, bool borrowed) {
+    const auto index = document.sequence_index(sequence);
+    if (!index)
+        return make_error(ErrorCode::not_found, "the target sequence does not exist", sequence.to_string());
     NoteEditor editor;
     editor.document_ = &document;
     editor.sequence_index_ = *index;
-    const Sequence& data = document.sequences[*index];
-    editor.pairing_ = pair_notes(data);
-    for (std::size_t track = 0; track < data.tracks.size(); ++track)
-        for (std::size_t event = 0; event < data.tracks[track].events.size(); ++event)
-            editor.locations_.emplace(data.tracks[track].events[event].id, EventLocation{track, event});
-    for (std::size_t note = 0; note < editor.pairing_.notes.size(); ++note)
-        editor.note_index_.emplace(editor.pairing_.notes[note].on_id, note);
-    editor.note_touched_.assign(editor.pairing_.notes.size(), false);
-    editor.note_removed_.assign(editor.pairing_.notes.size(), false);
+    editor.pairing_ = std::move(pairing);
+    editor.borrowed_pairing_ = borrowed;
+    const auto& tracks = document.sequences[*index].tracks;
+    for (const auto& note : editor.pairing_->notes)
+        if (note.on_track >= tracks.size() || note.off_track >= tracks.size())
+            return make_error(ErrorCode::conflict, "the note pairing does not match the sequence");
+    editor.note_touched_.assign(editor.pairing_->notes.size(), false);
+    editor.note_removed_.assign(editor.pairing_->notes.size(), false);
     return editor;
 }
 
@@ -62,35 +78,59 @@ std::int32_t NoteEditor::ppq() const noexcept {
 Result<std::vector<std::size_t>> NoteEditor::select(const TargetSelection& selection) const {
     if (selection.sequence != sequence().id)
         return make_error(ErrorCode::invalid_argument, "selection names a different sequence");
-    std::set<std::size_t> tracks;
+    std::vector<bool> tracks(sequence().tracks.size(), false);
     for (const auto& track : selection.tracks) {
         const auto index = sequence().track_index(track);
         if (!index)
             return make_error(ErrorCode::not_found, "selected track is not in the sequence", track.to_string());
-        tracks.insert(*index);
-    }
-    std::unordered_set<EventId, UuidHash> chosen;
-    for (const auto& note : selection.notes) {
-        if (!note_index_.contains(note))
-            return make_error(ErrorCode::not_found, "selected note does not exist", note.to_string());
-        chosen.insert(note);
+        tracks[*index] = true;
     }
     if (selection.range && selection.range->end < selection.range->begin)
         return make_error(ErrorCode::invalid_argument, "selection range ends before it begins");
+    // One linear pass over the pairing; small explicit selections (an arrow-key nudge) compare
+    // identities directly instead of hashing every note of the sequence.
+    const std::unordered_set<EventId, UuidHash> chosen(selection.notes.begin(), selection.notes.end());
+    const bool few = chosen.size() <= 16;
+    const auto is_chosen = [&](EventId id) {
+        return few ? std::ranges::find(selection.notes, id) != selection.notes.end() : chosen.contains(id);
+    };
+    const auto& notes = pairing_->notes;
+    std::size_t matched = 0;
     std::vector<std::size_t> result;
-    for (std::size_t index = 0; index < pairing_.notes.size(); ++index) {
-        const auto& note = pairing_.notes[index];
-        if (!tracks.empty() && !tracks.contains(note.on_track))
-            continue;
-        if (!chosen.empty() && !chosen.contains(note.on_id))
+    for (std::size_t index = 0; index < notes.size(); ++index) {
+        const auto& note = notes[index];
+        if (!chosen.empty()) {
+            if (!is_chosen(note.on_id))
+                continue;
+            ++matched;
+        }
+        if (!selection.tracks.empty() && !tracks[note.on_track])
             continue;
         if (selection.range && !selection.range->contains(note.start))
             continue;
         result.push_back(index);
     }
-    std::ranges::stable_sort(result, [this](std::size_t a, std::size_t b) {
-        const auto& left = pairing_.notes[a];
-        const auto& right = pairing_.notes[b];
+    if (matched != chosen.size()) {
+        std::unordered_set<EventId, UuidHash> found;
+        for (const auto& note : notes)
+            if (chosen.contains(note.on_id))
+                found.insert(note.on_id);
+        for (const auto& id : selection.notes)
+            if (!found.contains(id))
+                return make_error(ErrorCode::not_found, "selected note does not exist", id.to_string());
+    }
+    if (borrowed_pairing_) {
+        // A borrowed pairing must describe this document state: check every selected note.
+        for (const auto index : result) {
+            const auto& note = notes[index];
+            if (!original_position(note.on_track, note.on_id, note.start) ||
+                (note.off_id && !original_position(note.off_track, *note.off_id, note.end)))
+                return make_error(ErrorCode::conflict, "the cached note pairing is out of date");
+        }
+    }
+    std::ranges::stable_sort(result, [&](std::size_t a, std::size_t b) {
+        const auto& left = notes[a];
+        const auto& right = notes[b];
         return std::tie(left.start, left.on_track, left.pitch) < std::tie(right.start, right.on_track, right.pitch);
     });
     return result;
@@ -102,45 +142,62 @@ std::vector<NoteEditor::WorkingEvent>& NoteEditor::working(std::size_t track_ind
         return found->second;
     std::vector<WorkingEvent> copy;
     const auto& events = sequence().tracks[track_index].events;
-    copy.reserve(events.size());
+    copy.reserve(events.size() + 16);
     for (const auto& event : events)
         copy.push_back(WorkingEvent{event, false, false, event.tick, event.order_key, 0});
     return working_.emplace(track_index, std::move(copy)).first->second;
 }
 
-NoteEditor::WorkingEvent* NoteEditor::working_event(EventId id) {
-    const auto found = locations_.find(id);
-    if (found == locations_.end())
-        return nullptr;
-    return &working(found->second.track)[found->second.index];
+std::optional<std::size_t> NoteEditor::original_position(std::size_t track_index, EventId id, Tick tick) const {
+    const auto& events = sequence().tracks[track_index].events;
+    auto it = std::ranges::lower_bound(events, tick, std::less<>{}, &Event::tick);
+    for (; it != events.end() && it->tick == tick; ++it)
+        if (it->id == id)
+            return static_cast<std::size_t>(it - events.begin());
+    return std::nullopt;
 }
 
-const Event* NoteEditor::current_event(EventId id) const {
-    const auto found = locations_.find(id);
-    if (found == locations_.end())
+NoteEditor::NotePositions NoteEditor::positions(std::size_t note) const {
+    if (const auto cached = note_positions_.find(note); cached != note_positions_.end())
+        return cached->second;
+    const auto& span = pairing_->notes[note];
+    NotePositions result;
+    result.on = original_position(span.on_track, span.on_id, span.start);
+    if (span.off_id)
+        result.off = original_position(span.off_track, *span.off_id, span.end);
+    return result;
+}
+
+const Event* NoteEditor::current_event(std::size_t track_index, std::optional<std::size_t> position) const {
+    if (!position)
         return nullptr;
-    const auto track = working_.find(found->second.track);
+    const auto track = working_.find(track_index);
     if (track != working_.end())
-        return &track->second[found->second.index].event;
-    return &sequence().tracks[found->second.track].events[found->second.index];
+        return &track->second[*position].event;
+    return &sequence().tracks[track_index].events[*position];
 }
 
 NoteValues NoteEditor::original_values(std::size_t note) const {
-    const auto& span = pairing_.notes[note];
+    const auto& span = pairing_->notes[note];
     return NoteValues{span.start, span.end, span.pitch, span.velocity, span.release_velocity, span.channel};
 }
 
 NoteValues NoteEditor::values(std::size_t note) const {
-    const auto& span = pairing_.notes[note];
+    // Only update/remove (touched notes) and retime_event change note events, so untouched notes
+    // are answered from the pairing without any event lookup.
+    if (!note_touched_[note] && !retimed_)
+        return original_values(note);
+    const auto& span = pairing_->notes[note];
     NoteValues result = original_values(note);
-    if (const Event* on = current_event(span.on_id)) {
+    const auto where = positions(note);
+    if (const Event* on = current_event(span.on_track, where.on)) {
         result.start = on->tick;
         result.pitch = on->data1();
         result.velocity = on->data2();
         result.channel = on->channel();
     }
     if (span.off_id) {
-        if (const Event* off = current_event(*span.off_id)) {
+        if (const Event* off = current_event(span.off_track, where.off)) {
             result.end = off->tick;
             result.release_velocity = off->message() == ChannelMessage::note_off ? off->data2() : 0;
         }
@@ -150,53 +207,62 @@ NoteValues NoteEditor::values(std::size_t note) const {
     return result;
 }
 
-bool NoteEditor::is_unterminated(std::size_t note) const { return !pairing_.notes[note].off_id.has_value(); }
+bool NoteEditor::is_unterminated(std::size_t note) const { return !pairing_->notes[note].off_id.has_value(); }
 
 bool NoteEditor::has_release_velocity(std::size_t note) const {
-    const auto& span = pairing_.notes[note];
+    const auto& span = pairing_->notes[note];
     if (!span.off_id)
         return false;
-    const Event* off = current_event(*span.off_id);
+    const Event* off = current_event(span.off_track, positions(note).off);
     return off && off->message() == ChannelMessage::note_off;
 }
 
-void NoteEditor::update(std::size_t note, const NoteValues& values) {
-    const auto& span = pairing_.notes[note];
+void NoteEditor::touch_note(std::size_t note) {
+    if (note_touched_[note])
+        return;
+    note_positions_.emplace(note, positions(note)); // positions never change: working copies keep indices
     note_touched_[note] = true;
-    if (WorkingEvent* on = working_event(span.on_id)) {
-        Event updated = on->event;
+    touched_notes_.push_back(note);
+}
+
+void NoteEditor::update(std::size_t note, const NoteValues& values) {
+    const auto& span = pairing_->notes[note];
+    touch_note(note);
+    const auto where = positions(note);
+    if (where.on) {
+        WorkingEvent& on = working(span.on_track)[*where.on];
+        Event updated = on.event;
         updated.tick = values.start;
         updated.code = static_cast<std::uint8_t>(0x90 | (values.channel & 0x0F));
         updated.payload = Payload{to_byte(values.pitch), static_cast<std::uint8_t>(std::clamp(values.velocity, 1, 127))};
-        if (!(updated == on->event)) {
-            on->event = std::move(updated);
-            on->changed = true;
+        if (!(updated == on.event)) {
+            on.event = std::move(updated);
+            on.changed = true;
         }
     }
-    if (span.off_id) {
-        if (WorkingEvent* off = working_event(*span.off_id)) {
-            Event updated = off->event;
-            const bool note_off = off->event.message() == ChannelMessage::note_off;
-            updated.tick = values.end;
-            updated.code = static_cast<std::uint8_t>((note_off ? 0x80 : 0x90) | (values.channel & 0x0F));
-            updated.payload = Payload{to_byte(values.pitch), note_off ? to_byte(values.release_velocity) : std::uint8_t{0}};
-            if (!(updated == off->event)) {
-                off->event = std::move(updated);
-                off->changed = true;
-            }
+    if (span.off_id && where.off) {
+        WorkingEvent& off = working(span.off_track)[*where.off];
+        Event updated = off.event;
+        const bool note_off = off.event.message() == ChannelMessage::note_off;
+        updated.tick = values.end;
+        updated.code = static_cast<std::uint8_t>((note_off ? 0x80 : 0x90) | (values.channel & 0x0F));
+        updated.payload = Payload{to_byte(values.pitch), note_off ? to_byte(values.release_velocity) : std::uint8_t{0}};
+        if (!(updated == off.event)) {
+            off.event = std::move(updated);
+            off.changed = true;
         }
     }
 }
 
 void NoteEditor::remove(std::size_t note) {
-    const auto& span = pairing_.notes[note];
-    note_touched_[note] = true;
+    const auto& span = pairing_->notes[note];
+    touch_note(note);
     note_removed_[note] = true;
-    if (WorkingEvent* on = working_event(span.on_id))
-        on->removed = true;
-    if (span.off_id)
-        if (WorkingEvent* off = working_event(*span.off_id))
-            off->removed = true;
+    const auto where = positions(note);
+    if (where.on)
+        working(span.on_track)[*where.on].removed = true;
+    if (span.off_id && where.off)
+        working(span.off_track)[*where.off].removed = true;
 }
 
 EventId NoteEditor::add(std::size_t track_index, const NoteValues& values) {
@@ -206,6 +272,8 @@ EventId NoteEditor::add(std::size_t track_index, const NoteValues& values) {
     Event off = events::note_off(std::max(values.end, values.start), values.channel, to_byte(values.pitch),
                                  to_byte(values.release_velocity));
     const EventId id = on.id;
+    if (values.end <= values.start)
+        zero_length_added_ends_.insert(off.id);
     events.push_back(WorkingEvent{std::move(on), true, false, values.start, 0, ++creation_counter_});
     events.push_back(WorkingEvent{std::move(off), true, false, values.end, 0, ++creation_counter_});
     added_notes_.emplace_back(track_index, values);
@@ -217,35 +285,51 @@ void NoteEditor::retime_event(std::size_t track_index, std::size_t event_index, 
     if (event.event.tick != tick) {
         event.event.tick = tick;
         event.changed = true;
+        retimed_ = true;
     }
 }
 
 std::size_t NoteEditor::new_collisions() const {
+    // Keys (track, channel, pitch) touched by this session; only notes of those keys can gain
+    // overlaps, and a per-track bit set keeps the scan over the pairing a cheap linear pass.
+    constexpr std::size_t key_count = 16 * 128;
+    const auto key_bit = [](std::uint8_t channel, int pitch) {
+        return static_cast<std::size_t>(channel & 0x0F) * 128 + static_cast<std::size_t>(std::clamp(pitch, 0, 127));
+    };
     std::set<CollisionKey> keys;
-    for (std::size_t note = 0; note < pairing_.notes.size(); ++note) {
-        if (!note_touched_[note])
-            continue;
+    const auto& notes = pairing_->notes;
+    for (const auto note : touched_notes_) {
         const auto before = original_values(note);
         const auto after = values(note);
-        keys.insert({pairing_.notes[note].on_track, before.channel, before.pitch});
-        keys.insert({pairing_.notes[note].on_track, after.channel, after.pitch});
+        keys.insert({notes[note].on_track, before.channel, before.pitch});
+        keys.insert({notes[note].on_track, after.channel, after.pitch});
     }
     for (const auto& [track, values] : added_notes_)
         keys.insert({track, values.channel, values.pitch});
+    if (keys.empty())
+        return 0;
+    std::vector<std::unique_ptr<std::bitset<key_count>>> bits(sequence().tracks.size());
+    for (const auto& key : keys) {
+        auto& slot = bits[key.track];
+        if (!slot)
+            slot = std::make_unique<std::bitset<key_count>>();
+        slot->set(key_bit(key.channel, key.pitch));
+    }
     std::map<CollisionKey, std::vector<std::pair<Tick, Tick>>> before_spans;
     std::map<CollisionKey, std::vector<std::pair<Tick, Tick>>> after_spans;
-    for (std::size_t note = 0; note < pairing_.notes.size(); ++note) {
-        const auto track = pairing_.notes[note].on_track;
+    for (std::size_t note = 0; note < notes.size(); ++note) {
+        const auto track = notes[note].on_track;
+        const auto* slot = bits[track].get();
+        if (!slot)
+            continue;
         const auto before = original_values(note);
-        const CollisionKey before_key{track, before.channel, before.pitch};
-        if (keys.contains(before_key))
-            before_spans[before_key].emplace_back(before.start, before.end);
+        if (slot->test(key_bit(before.channel, before.pitch)))
+            before_spans[{track, before.channel, before.pitch}].emplace_back(before.start, before.end);
         if (note_removed_[note])
             continue;
         const auto after = values(note);
-        const CollisionKey after_key{track, after.channel, after.pitch};
-        if (keys.contains(after_key))
-            after_spans[after_key].emplace_back(after.start, after.end);
+        if (slot->test(key_bit(after.channel, after.pitch)))
+            after_spans[{track, after.channel, after.pitch}].emplace_back(after.start, after.end);
     }
     for (const auto& [track, values] : added_notes_)
         after_spans[{track, values.channel, values.pitch}].emplace_back(values.start, values.end);
@@ -261,6 +345,18 @@ std::size_t NoteEditor::new_collisions() const {
 
 ChangeSet NoteEditor::finish(std::string label) {
     ChangeBuilder builder(*document_, std::move(label));
+    // Ends of edited notes that are zero-length afterwards: they must stay after their own start
+    // at the shared tick, otherwise FIFO pairing meets the end first (an orphan end, or one that
+    // closes another sounding note) and the moved note never ends (section 16.4).
+    std::unordered_set<EventId, UuidHash> zero_length_ends = zero_length_added_ends_;
+    for (const auto note : touched_notes_) {
+        const auto& span = pairing_->notes[note];
+        if (note_removed_[note] || !span.off_id)
+            continue;
+        const auto current = values(note);
+        if (current.end == current.start)
+            zero_length_ends.insert(*span.off_id);
+    }
     std::vector<std::size_t> tracks;
     for (const auto& [track, events] : working_)
         tracks.push_back(track);
@@ -279,8 +375,14 @@ ChangeSet NoteEditor::finish(std::string label) {
         }
         if (!any_change)
             continue;
-        const auto rank = [this](const WorkingEvent& event) {
-            if (!event.changed || chronological_)
+        // Rank inside a tick: changed note ends, unchanged events, changed note starts, then the
+        // ends of edited zero-length notes (after their own start whether or not either changed).
+        const auto rank = [&](const WorkingEvent& event) {
+            if (chronological_)
+                return 1;
+            if (!zero_length_ends.empty() && event.event.is_note_end() && zero_length_ends.contains(event.event.id))
+                return 3;
+            if (!event.changed)
                 return 1;
             if (event.event.is_note_end())
                 return 0;
@@ -288,9 +390,11 @@ ChangeSet NoteEditor::finish(std::string label) {
                 return 2;
             return 1;
         };
-        std::ranges::stable_sort(kept, [&](const WorkingEvent* a, const WorkingEvent* b) {
-            return std::make_tuple(a->event.tick, rank(*a), a->original_tick, a->original_order, a->creation) <
-                   std::make_tuple(b->event.tick, rank(*b), b->original_tick, b->original_order, b->creation);
+        for (auto* event : kept)
+            event->rank = rank(*event);
+        std::ranges::stable_sort(kept, [](const WorkingEvent* a, const WorkingEvent* b) {
+            return std::make_tuple(a->event.tick, a->rank, a->original_tick, a->original_order, a->creation) <
+                   std::make_tuple(b->event.tick, b->rank, b->original_tick, b->original_order, b->creation);
         });
         std::vector<Event> result;
         result.reserve(kept.size());
@@ -455,8 +559,9 @@ TransformPreview finish_preview(NoteEditor& editor, TransformReport report, std:
 namespace mwb::music {
 
 Result<PreparedTransform> prepare_transform(const DocumentData& document, const TargetSelection& selection,
-                                            std::string_view tool, bool require_ppq) {
-    auto editor = NoteEditor::open(document, selection.sequence);
+                                            std::string_view tool, bool require_ppq, const NotePairing* pairing) {
+    auto editor = pairing ? NoteEditor::open(document, selection.sequence, *pairing)
+                          : NoteEditor::open(document, selection.sequence);
     if (!editor)
         return std::unexpected(editor.error());
     if (require_ppq && editor->ppq() <= 0)

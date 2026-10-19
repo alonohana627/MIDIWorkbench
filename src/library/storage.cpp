@@ -352,7 +352,11 @@ ObjectStore::ObjectStore(std::filesystem::path library_root) : root_(std::move(l
 
 std::filesystem::path ObjectStore::object_path(const Sha256Digest& sha256, std::string_view extension) const {
     const auto hex = to_hex(sha256);
-    return root_ / "objects" / hex.substr(0, 2) / (hex + "." + std::string(extension));
+    // The extension comes from the catalog, which may be a restored or foreign file: only the
+    // three known extensions form a path (section 22.1), anything else names a file that never
+    // exists, so reads fail and removals do nothing instead of escaping the object directory.
+    const bool known = extension == "mid" || extension == "rmi" || extension == "mwb";
+    return root_ / "objects" / hex.substr(0, 2) / (hex + "." + std::string(known ? extension : "invalid-extension"));
 }
 
 Result<bool> ObjectStore::publish(const std::filesystem::path& staging_file, const Sha256Digest& sha256,
@@ -430,7 +434,7 @@ Result<WriterLock> WriterLock::acquire(const std::filesystem::path& library_root
         if (code == ERROR_SHARING_VIOLATION || code == ERROR_LOCK_VIOLATION)
             return make_error(ErrorCode::busy,
                               "the library is already open for writing by another MIDI Workbench process or window; "
-                              "close it there or open this library read-only",
+                              "close it there first",
                               describe_path(library_root));
         return std::unexpected(windows_error("lock the library", path, code));
     }
@@ -446,7 +450,7 @@ Result<WriterLock> WriterLock::acquire(const std::filesystem::path& library_root
         if (errno == EWOULDBLOCK)
             return make_error(ErrorCode::busy,
                               "the library is already open for writing by another MIDI Workbench process or window; "
-                              "close it there or open this library read-only",
+                              "close it there first",
                               describe_path(library_root));
         return std::unexpected(posix_error("lock the library", path, errno));
     }

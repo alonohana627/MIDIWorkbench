@@ -227,7 +227,7 @@ BuiltinSynth::BuiltinSynth(const BuiltinSynthSettings& settings)
     : settings_(settings),
       voices_(settings.voice_capacity),
       fade_voices_(fade_slot_count),
-      channels_(std::make_unique<std::array<Channel, 16>>()) {
+      channels_(std::make_unique<std::array<Channel, 17>>()) {
     for (auto& value : timbre_override_)
         value.store(no_override, std::memory_order_relaxed);
 }
@@ -254,7 +254,7 @@ Status BuiltinSynth::prepare(std::uint32_t sample_rate, std::uint32_t max_block_
         voice = Voice{};
     for (Voice& voice : fade_voices_)
         voice = Voice{};
-    *channels_ = std::array<Channel, 16>{};
+    *channels_ = std::array<Channel, 17>{};
     voice_serial_ = 0;
     steals_.store(0, std::memory_order_relaxed);
     dropped_.store(0, std::memory_order_relaxed);
@@ -273,10 +273,23 @@ void BuiltinSynth::set_channel_timbre(std::uint8_t channel, std::optional<Timbre
     timbre_override_[channel & 0x0Fu].store(timbre ? static_cast<int>(*timbre) : no_override, std::memory_order_relaxed);
 }
 
+void BuiltinSynth::set_audition_timbre(std::optional<Timbre> timbre) noexcept {
+    timbre_override_[audition_channel].store(timbre ? static_cast<int>(*timbre) : no_override, std::memory_order_relaxed);
+}
+
 void BuiltinSynth::dispatch(const playback::RealtimeMidiEvent& event) noexcept {
     if (event.kind != playback::RealtimeEventKind::midi || event.size == 0)
         return;
-    const std::uint8_t channel = event.channel();
+    dispatch_on(event.channel(), event);
+}
+
+void BuiltinSynth::dispatch_live(const playback::RealtimeMidiEvent& event) noexcept {
+    if (event.kind != playback::RealtimeEventKind::midi || event.size == 0)
+        return;
+    dispatch_on(audition_channel, event);
+}
+
+void BuiltinSynth::dispatch_on(std::uint8_t channel, const playback::RealtimeMidiEvent& event) noexcept {
     Channel& state = (*channels_)[channel];
     switch (event.message()) {
     case 0x90:
@@ -543,11 +556,12 @@ void BuiltinSynth::render(float* interleaved_stereo, std::uint32_t frame_count) 
     if (interleaved_stereo == nullptr || frame_count == 0)
         return;
     const float rate = static_cast<float>(sample_rate_);
-    std::array<float, 16> pitch_offset{};
-    std::array<float, 16> left_gain{};
-    std::array<float, 16> right_gain{};
+    constexpr std::size_t channel_count = 17;
+    std::array<float, channel_count> pitch_offset{};
+    std::array<float, channel_count> left_gain{};
+    std::array<float, channel_count> right_gain{};
     const float block_seconds = static_cast<float>(frame_count) / rate;
-    for (std::size_t index = 0; index < 16; ++index) {
+    for (std::size_t index = 0; index < channel_count; ++index) {
         Channel& channel = (*channels_)[index];
         const float vibrato_depth = std::min(1.0f, channel.modulation + 0.5f * channel.pressure) * 0.5f; // semitones
         const float vibrato = vibrato_depth * std::sin(two_pi * channel.vibrato_phase);

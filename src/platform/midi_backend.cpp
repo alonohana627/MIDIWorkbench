@@ -1,5 +1,13 @@
 #include "mwb/platform/midi_backend.hpp"
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <timeapi.h>
+#endif
+
 #include <blockingconcurrentqueue.h>
 #include <concurrentqueue.h>
 #include <libremidi/libremidi.hpp>
@@ -50,6 +58,61 @@ std::size_t short_message_length(std::uint8_t status) noexcept {
     }
 }
 
+/// Waits until a steady-clock time with sub-millisecond precision. std::this_thread::sleep_until
+/// maps to Sleep() in milliseconds on Windows and, at the default 15.6 ms timer resolution, wakes
+/// up to a full tick late (section 14.1 asks for high-resolution waits). One high-resolution
+/// waitable timer per thread; where the system lacks it, the thread raises the timer resolution
+/// to 1 ms for its lifetime instead.
+class PreciseWaiter {
+public:
+    PreciseWaiter() {
+#ifdef _WIN32
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+        timer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        high_resolution_ = timer_ != nullptr;
+        if (!high_resolution_)
+            raised_period_ = timeBeginPeriod(1) == TIMERR_NOERROR;
+#endif
+    }
+    ~PreciseWaiter() {
+#ifdef _WIN32
+        if (timer_ != nullptr)
+            CloseHandle(timer_);
+        if (raised_period_)
+            timeEndPeriod(1);
+#endif
+    }
+    PreciseWaiter(const PreciseWaiter&) = delete;
+    PreciseWaiter& operator=(const PreciseWaiter&) = delete;
+
+    [[nodiscard]] bool high_resolution() const noexcept { return high_resolution_ || raised_period_; }
+
+    void wait_until(std::int64_t due_ns) noexcept {
+        const std::int64_t remaining = due_ns - steady_now_ns();
+        if (remaining <= 0)
+            return;
+#ifdef _WIN32
+        if (timer_ != nullptr) {
+            LARGE_INTEGER relative;
+            relative.QuadPart = -std::max<std::int64_t>(remaining / 100, 1); // negative = relative, 100 ns units
+            if (SetWaitableTimer(timer_, &relative, 0, nullptr, nullptr, FALSE) != 0 &&
+                WaitForSingleObject(timer_, INFINITE) == WAIT_OBJECT_0)
+                return;
+        }
+#endif
+        std::this_thread::sleep_until(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(due_ns)));
+    }
+
+private:
+#ifdef _WIN32
+    HANDLE timer_ = nullptr;
+#endif
+    bool high_resolution_ = false;
+    bool raised_period_ = false;
+};
+
 // --- Input side -------------------------------------------------------------------------------
 
 /// Preallocated single-producer queue fed by a backend callback.
@@ -81,6 +144,12 @@ public:
         return count;
     }
 
+    std::size_t wait_drain(std::span<MidiInputMessage> output, std::chrono::milliseconds timeout) noexcept {
+        if (output.empty() || !queue_.wait_dequeue_timed(output[0], timeout))
+            return 0;
+        return 1 + drain(output.subspan(1));
+    }
+
     MidiInputStatistics statistics(std::uint64_t wraps) const noexcept {
         MidiInputStatistics statistics;
         statistics.received = received_.load(std::memory_order_relaxed);
@@ -92,7 +161,7 @@ public:
     }
 
 private:
-    moodycamel::ReaderWriterQueue<MidiInputMessage> queue_;
+    moodycamel::BlockingReaderWriterQueue<MidiInputMessage> queue_;
     std::size_t capacity_;
     std::atomic<std::uint64_t> received_{0};
     std::atomic<std::uint64_t> overflowed_{0};
@@ -163,6 +232,7 @@ public:
         statistics.send_errors = send_errors_.load(std::memory_order_relaxed);
         statistics.sysex_sent = sysex_sent_.load(std::memory_order_relaxed);
         statistics.max_lateness_ns = max_lateness_ns_.load(std::memory_order_relaxed);
+        statistics.high_resolution_timer = high_resolution_.load(std::memory_order_relaxed);
         return statistics;
     }
 
@@ -184,11 +254,9 @@ private:
         flushed_.notify_all();
     }
 
-    void deliver(const OutgoingMessage& message) {
-        if (message.due_ns > 0) {
-            const auto due = std::chrono::steady_clock::time_point(std::chrono::nanoseconds(message.due_ns));
-            if (due > std::chrono::steady_clock::now())
-                std::this_thread::sleep_until(due); // Scheduled delivery time, not a polling delay.
+    void deliver(const OutgoingMessage& message, PreciseWaiter* waiter) {
+        if (message.due_ns > 0 && waiter != nullptr) {
+            waiter->wait_until(message.due_ns); // Scheduled delivery time, not a polling delay.
             const std::int64_t lateness = steady_now_ns() - message.due_ns;
             std::int64_t worst = max_lateness_ns_.load(std::memory_order_relaxed);
             while (lateness > worst && !max_lateness_ns_.compare_exchange_weak(worst, lateness)) {
@@ -202,11 +270,13 @@ private:
     }
 
     void run(std::stop_token stop) {
+        PreciseWaiter waiter;
+        high_resolution_.store(waiter.high_resolution(), std::memory_order_relaxed);
         OutgoingMessage message;
         std::vector<std::uint8_t> sysex;
         while (!stop.stop_requested()) {
             if (queue_.try_dequeue(message)) {
-                deliver(message);
+                deliver(message, &waiter);
                 continue;
             }
             // Short messages always go first; SysEx only when no short message is waiting.
@@ -219,8 +289,12 @@ private:
                 continue;
             }
             if (queue_.wait_dequeue_timed(message, std::chrono::milliseconds(20)))
-                deliver(message);
+                deliver(message, &waiter);
         }
+        // Stopping (endpoint closing, application quitting): whatever is still queued is sent now,
+        // ignoring due times, so queued note-offs and panic messages are never dropped (13.6).
+        while (queue_.try_dequeue(message))
+            deliver(message, nullptr);
     }
 
     MidiPortInfo info_;
@@ -234,6 +308,7 @@ private:
     std::atomic<std::uint64_t> send_errors_{0};
     std::atomic<std::uint64_t> sysex_sent_{0};
     std::atomic<std::int64_t> max_lateness_ns_{0};
+    std::atomic<bool> high_resolution_{false};
     std::mutex flush_mutex_;
     std::condition_variable flushed_;
     std::jthread worker_;
@@ -295,6 +370,10 @@ public:
         : info_(std::move(info)), queue_(options.queue_capacity), extender_(winmm_timestamp_wrap_ns) {}
 
     ~LibremidiInput() override {
+        if (watcher_.joinable()) {
+            watcher_.request_stop();
+            watcher_.join();
+        }
         if (input_ && input_->is_port_open())
             std::ignore = input_->close_port(); // Closing errors cannot be acted upon here.
     }
@@ -316,22 +395,51 @@ public:
         input_ = std::make_unique<libremidi::midi_in>(configuration, libremidi::input_api_configuration(selected_api()));
         if (input_->open_port(port, "MIDI Workbench input") != stdx::error{})
             return make_error(ErrorCode::device, "the MIDI input is busy or unavailable", info_.display_name);
+        // WinMM never tells an open input that its device was unplugged (libremidi ignores
+        // MIM_CLOSE and keeps reporting the port connected), so a watcher re-enumerates the inputs
+        // twice a second and marks the endpoint removed when its stable identity disappears.
+        watcher_ = std::jthread([this](std::stop_token stop) {
+            std::mutex mutex;
+            std::condition_variable_any wake;
+            while (!stop.stop_requested()) {
+                {
+                    std::unique_lock lock(mutex); // nothing notifies: this is an interruptible sleep
+                    std::ignore = wake.wait_for(lock, stop, std::chrono::milliseconds(500), [] { return false; });
+                }
+                if (stop.stop_requested())
+                    return;
+                const auto observer = make_observer();
+                const auto present = describe_ports(observer.get_input_ports(), true);
+                if (std::ranges::none_of(present, [this](const MidiPortInfo& port) { return port.stable_id == info_.stable_id; })) {
+                    removed_.store(true, std::memory_order_release);
+                    return;
+                }
+            }
+        });
         return ok();
     }
 
     [[nodiscard]] const MidiPortInfo& info() const noexcept override { return info_; }
     [[nodiscard]] std::size_t drain(std::span<MidiInputMessage> output) noexcept override { return queue_.drain(output); }
+    [[nodiscard]] std::size_t wait_drain(std::span<MidiInputMessage> output,
+                                         std::chrono::milliseconds timeout) noexcept override {
+        return queue_.wait_drain(output, timeout);
+    }
     [[nodiscard]] MidiInputStatistics statistics() const noexcept override {
         return queue_.statistics(wraps_.load(std::memory_order_relaxed));
     }
-    [[nodiscard]] bool connected() const noexcept override { return input_ && input_->is_port_connected(); }
+    [[nodiscard]] bool connected() const noexcept override {
+        return input_ && input_->is_port_connected() && !removed_.load(std::memory_order_acquire);
+    }
 
 private:
     MidiPortInfo info_;
     InputQueue queue_;
     TimestampExtender extender_;  ///< Touched only by the callback thread.
     std::atomic<std::uint64_t> wraps_{0};
+    std::atomic<bool> removed_{false};
     std::unique_ptr<libremidi::midi_in> input_;
+    std::jthread watcher_; ///< Joined first in the destructor; reads only info_ and removed_.
 };
 
 /// libremidi output endpoint driven by its own thread.
@@ -440,6 +548,10 @@ public:
     }
     [[nodiscard]] const MidiPortInfo& info() const noexcept override { return info_; }
     [[nodiscard]] std::size_t drain(std::span<MidiInputMessage> output) noexcept override { return queue_.drain(output); }
+    [[nodiscard]] std::size_t wait_drain(std::span<MidiInputMessage> output,
+                                         std::chrono::milliseconds timeout) noexcept override {
+        return queue_.wait_drain(output, timeout);
+    }
     [[nodiscard]] MidiInputStatistics statistics() const noexcept override { return queue_.statistics(0); }
     [[nodiscard]] bool connected() const noexcept override { return true; }
 

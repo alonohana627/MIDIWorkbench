@@ -18,7 +18,22 @@ Grid Grid::make(Rational fraction, std::int32_t ppq) {
 }
 
 Tick Grid::point(std::int64_t index) const {
-    return mul_div_round(index * 4 * fraction.numerator, ppq, fraction.denominator).value_or(0);
+    // index * 4 * numerator can overflow for far-away indices: checked, saturating to 0 like the
+    // division below (callers bound ticks well inside 64 bits).
+    const auto scaled = checked_mul(index, 4 * fraction.numerator);
+    if (!scaled)
+        return 0;
+    return mul_div_round(*scaled, ppq, fraction.denominator).value_or(0);
+}
+
+std::span<const SnapChoice> snap_choices() {
+    static constexpr SnapChoice choices[] = {
+        {"1/1", "1/1 (bar in 4/4)"}, {"1/2", "1/2"}, {"1/4", "1/4"}, {"1/8", "1/8"}, {"1/16", "1/16"},
+        {"1/32", "1/32"}, {"1/64", "1/64"}, {"1/128", "1/128"}, {"1/6", "1/4 triplet"}, {"1/12", "1/8 triplet"},
+        {"1/24", "1/16 triplet"}, {"1/48", "1/32 triplet"}, {"3/8", "Dotted 1/4"}, {"3/16", "Dotted 1/8"},
+        {"3/32", "Dotted 1/16"}, {"1/20", "1/16 quintuplet"}, {"1/28", "1/16 septuplet"},
+    };
+    return choices;
 }
 
 double Grid::step() const {
@@ -143,6 +158,14 @@ TimeRange grid_aligned_extent(const std::vector<NoteSpan>& notes, const Grid& gr
     if (aligned_end <= aligned_start)
         aligned_end = grid.next(aligned_start);
     return TimeRange{aligned_start, aligned_end};
+}
+
+std::vector<EventId> inserted_note_starts(const ChangeSet& changes) {
+    std::vector<EventId> created;
+    for (const auto& operation : changes.operations)
+        if (const auto* insert = std::get_if<EventInsert>(&operation); insert && insert->event.is_note_start())
+            created.push_back(insert->event.id);
+    return created;
 }
 
 Tick ViewMapping::x_to_tick(double x) const {

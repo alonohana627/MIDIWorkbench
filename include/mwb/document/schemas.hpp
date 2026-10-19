@@ -216,4 +216,75 @@ CREATE TABLE recovery_command (
 ) STRICT, WITHOUT ROWID;
 )sql";
 
+/// Schema "recovery" version 2: version 1 plus recovery_capture_chunk, which keeps the raw
+/// capture of a recording take in bounded chunks while it is still in progress (section 21.2),
+/// so a crash during a long take does not discard the performance. The table text must stay
+/// identical to the one in recovery_v1_to_v2 (the schema whitelist compares stored SQL text).
+inline constexpr std::string_view recovery_v2 = R"sql(-- schema: recovery
+PRAGMA foreign_keys = ON;
+PRAGMA application_id = 1297564242;
+PRAGMA user_version = 2;
+
+CREATE TABLE recovery_session (
+    id BLOB PRIMARY KEY CHECK (length(id)=16),
+    document_uuid BLOB NOT NULL CHECK (length(document_uuid)=16),
+    source_reference_json TEXT NOT NULL CHECK (json_valid(source_reference_json)),
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    cleanly_closed INTEGER NOT NULL CHECK (cleanly_closed IN (0,1))
+) STRICT;
+
+CREATE TABLE recovery_checkpoint (
+    session_id BLOB NOT NULL REFERENCES recovery_session(id) ON DELETE CASCADE,
+    command_no INTEGER NOT NULL CHECK (command_no>=0),
+    generation INTEGER NOT NULL CHECK (generation>=0),
+    sha256 BLOB NOT NULL CHECK (length(sha256)=32),
+    native_snapshot BLOB NOT NULL,
+    created_ms INTEGER NOT NULL,
+    PRIMARY KEY(session_id,command_no)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE recovery_command (
+    session_id BLOB NOT NULL REFERENCES recovery_session(id) ON DELETE CASCADE,
+    command_no INTEGER NOT NULL CHECK (command_no>0),
+    codec_version INTEGER NOT NULL CHECK (codec_version>0),
+    base_generation INTEGER NOT NULL CHECK (base_generation>=0),
+    result_generation INTEGER NOT NULL CHECK (result_generation>base_generation),
+    sha256 BLOB NOT NULL CHECK (length(sha256)=32),
+    payload BLOB NOT NULL,
+    created_ms INTEGER NOT NULL,
+    PRIMARY KEY(session_id,command_no)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE recovery_capture_chunk (
+    session_id BLOB NOT NULL REFERENCES recovery_session(id) ON DELETE CASCADE,
+    take_id BLOB NOT NULL CHECK (length(take_id)=16),
+    track_id BLOB NOT NULL CHECK (length(track_id)=16),
+    ordinal INTEGER NOT NULL CHECK (ordinal>=0),
+    start_tick INTEGER NOT NULL CHECK (start_tick>=0),
+    first_time_ns INTEGER NOT NULL CHECK (first_time_ns>=0),
+    sha256 BLOB NOT NULL CHECK (length(sha256)=32),
+    payload BLOB NOT NULL CHECK (length(payload)<=1048576),
+    created_ms INTEGER NOT NULL,
+    PRIMARY KEY(session_id,take_id,ordinal)
+) STRICT, WITHOUT ROWID;
+)sql";
+
+/// Migration of the recovery database from version 1 to version 2 (run in one transaction).
+inline constexpr std::string_view recovery_v1_to_v2 = R"sql(-- migration: recovery 1 -> 2
+CREATE TABLE recovery_capture_chunk (
+    session_id BLOB NOT NULL REFERENCES recovery_session(id) ON DELETE CASCADE,
+    take_id BLOB NOT NULL CHECK (length(take_id)=16),
+    track_id BLOB NOT NULL CHECK (length(track_id)=16),
+    ordinal INTEGER NOT NULL CHECK (ordinal>=0),
+    start_tick INTEGER NOT NULL CHECK (start_tick>=0),
+    first_time_ns INTEGER NOT NULL CHECK (first_time_ns>=0),
+    sha256 BLOB NOT NULL CHECK (length(sha256)=32),
+    payload BLOB NOT NULL CHECK (length(payload)<=1048576),
+    created_ms INTEGER NOT NULL,
+    PRIMARY KEY(session_id,take_id,ordinal)
+) STRICT, WITHOUT ROWID;
+PRAGMA user_version = 2;
+)sql";
+
 } // namespace mwb::document::schemas

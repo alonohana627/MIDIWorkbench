@@ -39,7 +39,7 @@ public:
     void begin(float* interleaved_stereo, std::uint32_t frame_count) noexcept;
     /// Renders up to the event offset, then delivers the event.
     void on_event(const playback::RealtimeMidiEvent& event) noexcept override;
-    /// Delivers a live-input event directly to the built-in synth (or the SoundFont synth when
+    /// Delivers a live-input event to the built-in synth's private audition channel (or the SoundFont synth when
     /// `to_soundfont`), at its offset inside the current block.
     void dispatch_live(const playback::RealtimeMidiEvent& event, bool to_soundfont = false) noexcept;
     /// Renders the rest of the block.

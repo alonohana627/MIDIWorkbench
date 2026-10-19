@@ -99,6 +99,10 @@ struct ExportOptions {
     bool audible_tracks_only = false;       ///< Skip muted tracks / honor solo (section 11.1).
     std::optional<TimeRange> range;         ///< Export-selected-range (section 16.6).
     std::vector<TrackId> tracks;            ///< Optional track subset; empty means all.
+    /// Optional note subset (note-on identities) for a range export, e.g. "export the selection":
+    /// other notes are left out; controller state and non-note events follow the range rules.
+    /// Requires `range`; empty means every note.
+    std::vector<EventId> notes;
 };
 
 /// Export report: what was omitted, converted or repaired.

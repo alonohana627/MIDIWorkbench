@@ -1,5 +1,7 @@
 #include "mwb/core/note_edit.hpp"
 
+#include "mwb/core/checked.hpp"
+
 #include <algorithm>
 #include <unordered_map>
 
@@ -39,6 +41,9 @@ Result<ChangeSet> insert_notes(const DocumentData& document, std::span<const New
     std::unordered_map<TrackId, BulkTrackEdit, UuidHash> edits;
     for (const auto& note : notes) {
         MWB_TRY(validate_note_values(note.start, note.end, note.pitch, false));
+        // Same contract as update_notes: out-of-range values are rejected, never masked or clamped.
+        if (note.channel > 15 || note.velocity < 1 || note.velocity > 127 || note.release_velocity > 127)
+            return make_error(ErrorCode::invalid_argument, "channel or velocity is out of range");
         auto [entry, created] = edits.try_emplace(note.track);
         if (created && !find_track(document, note.track))
             return make_error(ErrorCode::not_found, "destination track does not exist");
@@ -104,6 +109,10 @@ Result<ChangeSet> update_notes(const DocumentData& document, SequenceId sequence
         Event on = *on_event;
         const bool on_changed = on.tick != update.start || on.data1() != update.pitch || on.data2() != update.velocity ||
                                 on.channel() != update.channel;
+        // A zero-length result keeps its end after its own start at the shared tick: a moved
+        // start and end are both placed after the existing events, start first (list order),
+        // otherwise FIFO pairing meets the end first and the note never ends (section 16.4).
+        const bool zero_length = update.end == update.start;
         if (on_changed) {
             on.tick = update.start;
             on.code = static_cast<std::uint8_t>(0x90 | update.channel);
@@ -125,7 +134,8 @@ Result<ChangeSet> update_notes(const DocumentData& document, SequenceId sequence
                 off.tick = update.end;
                 off.code = static_cast<std::uint8_t>((velocity_zero_encoding ? 0x90 : 0x80) | update.channel);
                 off.payload = Payload{update.pitch, release};
-                place(off_track, *off_event, std::move(off), OrderPlacement::before_note_starts);
+                place(off_track, *off_event, std::move(off),
+                      zero_length ? OrderPlacement::after_existing : OrderPlacement::before_note_starts);
             }
         } else if (update.end != span.end) {
             // An unterminated note gets an explicit end once the user sets one.
@@ -236,12 +246,23 @@ Result<DuplicatedNotes> duplicate_notes(const DocumentData& document, SequenceId
             spans.push_back(found->second);
     }
     // Constrain as a whole: if any copy would leave the valid range, reject (section 7.3).
+    if (transpose < -127 || transpose > 127)
+        return make_error(ErrorCode::invalid_argument, "pitch would leave the MIDI range 0..127");
     for (const auto* span : spans) {
-        MWB_TRY(validate_note_values(span->start + offset, span->end + offset, span->pitch + transpose,
-                                     (span->flags & note_flag::zero_length) != 0));
+        const auto start = checked_add(span->start, offset);
+        const auto end = checked_add(span->end, offset);
+        if (!start || !end)
+            return make_error(ErrorCode::invalid_argument, "the copy would leave the representable time range");
+        MWB_TRY(validate_note_values(*start, *end, span->pitch + transpose, (span->flags & note_flag::zero_length) != 0));
     }
-    if (destination && !find_track(document, *destination))
-        return make_error(ErrorCode::not_found, "destination track does not exist");
+    if (destination) {
+        // Ticks are only meaningful inside the source sequence's division and tempo map.
+        const auto location = find_track(document, *destination);
+        if (!location)
+            return make_error(ErrorCode::not_found, "destination track does not exist");
+        if (location->sequence != *sequence_index)
+            return make_error(ErrorCode::invalid_argument, "destination track belongs to another sequence");
+    }
     DuplicatedNotes result;
     std::unordered_map<TrackId, BulkTrackEdit, UuidHash> edits;
     for (const auto* span : spans) {
@@ -249,13 +270,17 @@ Result<DuplicatedNotes> duplicate_notes(const DocumentData& document, SequenceId
         Event on = events::note_on(span->start + offset, span->channel, static_cast<std::uint8_t>(span->pitch + transpose),
                                    std::max<std::uint8_t>(span->velocity, 1));
         on.id = EventId::generate();
+        on.flags = (span->flags & note_flag::muted) != 0 ? event_flag::muted : 0u; // a muted note copies as muted
         result.created.push_back(on.id);
         auto& bulk = edits[track];
         bulk.insert.emplace_back(std::move(on), OrderPlacement::after_existing);
+        // A zero-length copy keeps its end after its own start (list order inside the same
+        // placement); a positive-length copy ends before note starts at its end tick.
+        const bool zero_length = span->end == span->start;
         bulk.insert.emplace_back(events::note_off(span->end + offset, span->channel,
                                                   static_cast<std::uint8_t>(span->pitch + transpose),
                                                   span->release_velocity),
-                                 OrderPlacement::before_note_starts);
+                                 zero_length ? OrderPlacement::after_existing : OrderPlacement::before_note_starts);
     }
     ChangeBuilder builder(document, std::move(label));
     for (auto& [track, bulk] : edits)

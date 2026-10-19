@@ -163,6 +163,8 @@ Result<ExactSearchResult> exact_search(MotifIndexReader& index, const ExactQuery
         result.indexed = false;
         std::int64_t after_id = query.after ? query.after->stream_id - 1 : 0;
         std::size_t scanned = 0;
+        std::optional<std::int64_t> last_scanned;
+        bool scan_limited = false;
         while (true) {
             if (stop.stop_requested()) {
                 mark_partial("cancelled");
@@ -176,8 +178,10 @@ Result<ExactSearchResult> exact_search(MotifIndexReader& index, const ExactQuery
             for (const auto id : *ids) {
                 if (scanned++ >= query.scan_stream_limit) {
                     mark_partial(std::format("scan limited to {} streams", query.scan_stream_limit));
+                    scan_limited = true;
                     break;
                 }
+                last_scanned = id;
                 auto stream = cache.get(id);
                 if (!stream)
                     return std::unexpected(std::move(stream).error());
@@ -195,6 +199,10 @@ Result<ExactSearchResult> exact_search(MotifIndexReader& index, const ExactQuery
                 break;
             after_id = ids->back();
         }
+        // A scan cut short continues after everything of the last scanned stream; the result-limit
+        // truncation below replaces this with an earlier position when it applies.
+        if (scan_limited && last_scanned)
+            result.next = ExactContinuation{*last_scanned, std::numeric_limits<std::uint32_t>::max()};
     } else {
         // Rarest grams first; candidates are (stream, implied start) pairs present in every
         // selected gram's postings. Hash matches are verified against the original values.
@@ -203,30 +211,40 @@ Result<ExactSearchResult> exact_search(MotifIndexReader& index, const ExactQuery
             std::size_t position;
             std::uint64_t count;
         };
+        // Counts only rank the grams, so each is capped: selective queries no longer pay for
+        // counting the postings of their common grams.
+        const auto ranking_cap = std::min<std::uint64_t>(std::uint64_t{query.posting_limit} + 1, 65'536);
         std::vector<Selected> grams;
         for (std::size_t position = 0; position + gram_length <= tokens.size(); ++position) {
+            if (stop.stop_requested()) {
+                mark_partial("cancelled");
+                break;
+            }
             const GramKey key{family, static_cast<std::uint8_t>(gram_length),
                               gram_hash(family, std::span(tokens).subspan(position, gram_length))};
-            auto count = index.count_postings(key);
+            auto count = index.count_postings(key, ranking_cap);
             if (!count)
                 return std::unexpected(std::move(count).error());
             grams.push_back(Selected{key, position, *count});
         }
         std::ranges::stable_sort(grams, {}, &Selected::count);
-        const std::size_t selected_count = std::min<std::size_t>(3, grams.size());
+        const std::size_t selected_count = result.partial ? 0 : std::min<std::size_t>(3, grams.size());
         std::vector<std::set<std::pair<std::int64_t, std::int64_t>>> filters;
         std::vector<std::pair<std::int64_t, std::int64_t>> candidates;
         for (std::size_t index_in_selection = 0; index_in_selection < selected_count; ++index_in_selection) {
             const auto& gram = grams[index_in_selection];
-            // A truncated filter gram would reject true matches beyond the limit: filter only with
-            // complete posting lists (verify_exact checks every candidate anyway).
-            if (index_in_selection > 0 && gram.count > query.posting_limit)
-                continue;
-            if (gram.count > query.posting_limit)
-                mark_partial(std::format("a query gram has more than {} postings", query.posting_limit));
-            auto postings = index.postings(gram.key, query.posting_limit);
+            // One posting past the limit tells whether the list is complete.
+            auto postings = index.postings(gram.key, query.posting_limit + 1);
             if (!postings)
                 return std::unexpected(std::move(postings).error());
+            if (postings->size() > query.posting_limit) {
+                // A truncated filter gram would reject true matches beyond the limit: filter only
+                // with complete posting lists (verify_exact checks every candidate anyway).
+                if (index_in_selection > 0)
+                    continue;
+                mark_partial(std::format("a query gram has more than {} postings", query.posting_limit));
+                postings->resize(query.posting_limit);
+            }
             std::set<std::pair<std::int64_t, std::int64_t>> starts;
             for (const auto& posting : *postings) {
                 const auto start = static_cast<std::int64_t>(posting.start_ordinal) - static_cast<std::int64_t>(gram.position);
@@ -381,11 +399,14 @@ Alignment align(std::span<const QueryNote> query, std::span<const MotifNote> can
     const auto in_band = [&](std::int64_t row, std::int64_t column) {
         return std::abs((low + column) - (implied_start + row)) <= band;
     };
-    for (std::int64_t column = 0; column <= width; ++column)
-        if (in_band(0, column))
-            at(0, column) = Cell{0.0, 0, low + column, 0};
+    // Only the band's columns of each row are visited (about 2 * band + 1 instead of the full
+    // width), which is where every reachable cell lies.
+    const auto band_first = [&](std::int64_t row) { return std::max<std::int64_t>(0, implied_start + row - band - low); };
+    const auto band_last = [&](std::int64_t row) { return std::min<std::int64_t>(width, implied_start + row + band - low); };
+    for (std::int64_t column = band_first(0); column <= band_last(0); ++column)
+        at(0, column) = Cell{0.0, 0, low + column, 0};
     for (std::int64_t row = 0; row <= query_count; ++row) {
-        for (std::int64_t column = 0; column <= width; ++column) {
+        for (std::int64_t column = band_first(row); column <= band_last(row); ++column) {
             const auto& cell = at(row, column);
             if (!std::isfinite(cell.cost))
                 continue;
@@ -406,7 +427,7 @@ Alignment align(std::span<const QueryNote> query, std::span<const MotifNote> can
         }
     }
     std::int64_t best_column = -1;
-    for (std::int64_t column = 0; column <= width; ++column) {
+    for (std::int64_t column = band_first(query_count); column <= band_last(query_count); ++column) {
         const auto& cell = at(query_count, column);
         if (std::isfinite(cell.cost) && (best_column < 0 || cell.better_than(at(query_count, best_column))))
             best_column = column;
@@ -594,8 +615,14 @@ Result<ApproximateSearchResult> approximate_search(MotifIndexReader& index, cons
             existing->positions.push_back(static_cast<std::int64_t>(position));
         }
     }
+    // Capped one past the posting limit: enough to tell ubiquitous grams (skipped below) apart.
     for (auto& gram : query_grams) {
-        auto count = index.count_postings(gram.key);
+        if (stop.stop_requested()) {
+            result.partial = true;
+            result.partial_reason = "cancelled";
+            return result;
+        }
+        auto count = index.count_postings(gram.key, std::uint64_t{query.posting_limit} + 1);
         if (!count)
             return std::unexpected(std::move(count).error());
         gram.count = *count;
@@ -606,6 +633,7 @@ Result<ApproximateSearchResult> approximate_search(MotifIndexReader& index, cons
         const auto& gram = query_grams[gram_index];
         if (stop.stop_requested()) {
             result.partial = true;
+            result.partial_reason = "cancelled";
             break;
         }
         if (gram.count > query.posting_limit && gram_index > 0) {
@@ -700,6 +728,8 @@ Result<ApproximateSearchResult> approximate_search(MotifIndexReader& index, cons
     });
     if (result.matches.size() > query.result_limit)
         result.matches.resize(query.result_limit);
+    if (result.partial && result.partial_reason.empty())
+        result.partial_reason = stop.stop_requested() ? "cancelled" : "search budget reached";
     return result;
 }
 

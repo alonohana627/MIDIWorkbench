@@ -22,8 +22,8 @@ using StateId = std::uint64_t;
 inline constexpr std::size_t default_history_budget_bytes = 256u * 1024u * 1024u;
 
 /// Undo/redo over core ChangeSets. One entry per command; new edits discard the redo branch;
-/// whole oldest entries are evicted when the memory budget is exceeded and a visible history
-/// boundary is reported.
+/// whole oldest entries are evicted when the memory budget is exceeded (never the newest one)
+/// and a visible history boundary is reported (WorkingSession emits history_trimmed).
 class CommandHistory {
 public:
     explicit CommandHistory(std::size_t budget_bytes = default_history_budget_bytes);
@@ -62,9 +62,13 @@ public:
     /// Changes the budget; evicts immediately when the new budget is smaller.
     void set_budget_bytes(std::size_t budget_bytes);
 
-    /// Forgets every entry (for example after reloading from disk). The current state keeps its
-    /// identity.
+    /// Forgets every entry (for example after reloading from disk) and the history boundary. The
+    /// current state keeps its identity.
     void clear();
+
+    /// Forward change set of the entry undo() would revert, or null. Valid until the history
+    /// changes; the newest entry is never evicted.
+    [[nodiscard]] const ChangeSet* newest_undo_changes() const;
 
 private:
     /// One undoable command: the forward change set and the states it connects.

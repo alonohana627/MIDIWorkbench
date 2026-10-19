@@ -9,9 +9,12 @@
 #include "mwb/ui/drag_export.hpp"
 #include "mwb/ui/editor_math.hpp"
 #include "mwb/ui/keyboard_widget.hpp"
+#include "mwb/ui/controller_lane.hpp"
 #include "mwb/ui/piano_roll.hpp"
 
 #include <QApplication>
+
+#include <chrono>
 #include <QKeyEvent>
 #include <QMimeData>
 #include <QSignalSpy>
@@ -195,7 +198,8 @@ TEST_SUITE("piano_roll") {
         CHECK(inserted.start == 960);
         CHECK(controller->selection().contains(inserted.on_id));
         // Drag the body two rows up and right by roughly a beat.
-        const QPoint body = target + QPoint(4, 0);
+        // Grab the left part: the rightmost third of a short note is its end-resize zone.
+        const QPoint body = target + QPoint(-2, 0);
         QTest::mousePress(&view, Qt::LeftButton, Qt::NoModifier, body);
         QTest::mouseMove(&view, body + QPoint(20, -static_cast<int>(mapping.row_height * 2)));
         QTest::mouseMove(&view, body + QPoint(static_cast<int>(960 / mapping.ticks_per_pixel), -static_cast<int>(mapping.row_height * 2)));
@@ -227,6 +231,86 @@ TEST_SUITE("piano_roll") {
         QTest::mouseRelease(&view, Qt::LeftButton, Qt::NoModifier, body + QPoint(100, 0));
         CHECK(semantic_hash(controller->document()) == hash);
         CHECK(controller->undo_text() == QString("Insert notes"));
+    }
+}
+
+TEST_SUITE("piano_roll") {
+    TEST_CASE("Select Same Channel stays linear on a large selection") {
+        auto controller = make_controller();
+        std::vector<NewNote> notes;
+        for (int index = 0; index < 20000; ++index)
+            notes.push_back(NewNote{controller->active_track(), index * 10, index * 10 + 5,
+                                    static_cast<std::uint8_t>(40 + index % 40), 100, 0, 0});
+        REQUIRE(controller->apply(*insert_notes(controller->document(), notes)));
+        PianoRollView view(*controller);
+        view.select_all();
+        const auto started = std::chrono::steady_clock::now();
+        view.select_same_channel();
+        view.select_same_pitch();
+        CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(5));
+        CHECK(controller->selection().size() == 20000);
+    }
+
+    TEST_CASE("a Ctrl-drag that returns to its start creates no duplicates") {
+        auto controller = make_controller();
+        const NewNote note{controller->active_track(), 960, 1920, 64, 100, 0, 0};
+        REQUIRE(controller->apply(*insert_notes(controller->document(), std::span(&note, 1))));
+        PianoRollView view(*controller);
+        view.resize(800, 500);
+        view.show();
+        const auto& mapping = view.mapping();
+        const QPoint body(PianoRollView::keyboard_width + static_cast<int>(mapping.tick_to_x(1400)),
+                          PianoRollView::ruler_height + static_cast<int>(mapping.pitch_to_y(64)) + 4);
+        QTest::mousePress(&view, Qt::LeftButton, Qt::ControlModifier, body);
+        QTest::mouseMove(&view, body + QPoint(30, 0));
+        QTest::mouseMove(&view, body);
+        QTest::mouseRelease(&view, Qt::LeftButton, Qt::ControlModifier, body);
+        CHECK(controller->notes().notes.size() == 1);
+    }
+
+    TEST_CASE("a draw click keeps the default length and selects the new note") {
+        auto controller = make_controller();
+        PianoRollView view(*controller);
+        view.resize(800, 500);
+        view.show();
+        view.set_tool(EditTool::draw);
+        const auto& mapping = view.mapping();
+        const QPoint target(PianoRollView::keyboard_width + static_cast<int>(mapping.tick_to_x(1000)),
+                            PianoRollView::ruler_height + static_cast<int>(mapping.pitch_to_y(70)) + 4);
+        QTest::mousePress(&view, Qt::LeftButton, Qt::NoModifier, target);
+        QTest::mouseMove(&view, target + QPoint(1, 0)); // jitter under the drag distance
+        QTest::mouseRelease(&view, Qt::LeftButton, Qt::NoModifier, target + QPoint(1, 0));
+        REQUIRE(controller->notes().notes.size() == 1);
+        const auto note = controller->notes().notes.front();
+        CHECK(note.start == 960);
+        CHECK(note.end - note.start == 240); // default 1/16 at PPQ 960
+        CHECK(controller->selection().contains(note.on_id));
+    }
+
+    TEST_CASE("Loop Selection sets the loop to the grid-aligned extent") {
+        auto controller = make_controller();
+        const NewNote note{controller->active_track(), 1000, 1500, 60, 100, 0, 0};
+        REQUIRE(controller->apply(*insert_notes(controller->document(), std::span(&note, 1))));
+        PianoRollView view(*controller);
+        view.select_all();
+        view.loop_selection();
+        const auto& sequence = controller->active_sequence();
+        REQUIRE(sequence.settings.loop_region);
+        for (const auto& region : sequence.regions)
+            if (region.id == *sequence.settings.loop_region) {
+                CHECK(region.start_tick == 960);
+                CHECK(region.end_tick == 1680);
+            }
+        CHECK(controller->undo_text() == QString("Set loop"));
+    }
+}
+
+TEST_SUITE("controller") {
+    TEST_CASE("a pitch-bend curve on an empty lane ends with the reset value") {
+        CHECK(controller_default_value(LaneTarget{LaneTarget::Kind::pitch_bend, 0, 0}) == 8192);
+        CHECK(controller_default_value(LaneTarget{LaneTarget::Kind::controller, 7, 0}) == 100);
+        CHECK(controller_default_value(LaneTarget{LaneTarget::Kind::controller, 11, 0}) == 127);
+        CHECK(controller_default_value(LaneTarget{LaneTarget::Kind::controller, 1, 0}) == 0);
     }
 }
 

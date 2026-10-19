@@ -297,7 +297,7 @@ public:
     void audition_note_on(int pitch, int velocity, int, const std::string& synth_preset) override {
         if (!engine_ || !builtin_)
             return;
-        builtin_->set_channel_timbre(audition_channel, audio::parse_timbre(synth_preset));
+        builtin_->set_audition_timbre(audio::parse_timbre(synth_preset)); // private channel: never a document channel
         std::ignore = engine_->post_live(playback::RealtimeMidiEvent::short_message(
             static_cast<std::uint8_t>(0x90 | audition_channel), static_cast<std::uint8_t>(pitch),
             static_cast<std::uint8_t>(std::clamp(velocity, 1, 127)))); // a full queue only drops this audition note

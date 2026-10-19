@@ -731,6 +731,8 @@ Result<CommandEnvelope> decode_envelope(const json& root) {
 
 } // namespace
 
+const char* command_kind_name(CommandKind kind) { return kind_name(kind); }
+
 std::vector<Uuid> affected_entities(const ChangeSet& changes) {
     std::vector<Uuid> entities;
     for (const auto& operation : changes.operations) {

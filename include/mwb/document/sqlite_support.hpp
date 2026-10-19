@@ -49,6 +49,11 @@ void bind_uuid(SQLite::Statement& statement, int index, const Uuid& identity);
 /// Binds bytes as a BLOB. An empty range binds a zero-length BLOB, never NULL.
 void bind_bytes(SQLite::Statement& statement, int index, std::span<const std::uint8_t> bytes);
 
+/// Binds bytes as a BLOB without copying them (sqlite3 SQLITE_STATIC): `bytes` must stay alive
+/// and unchanged until the statement is reset, re-bound or destroyed. Used for multi-megabyte
+/// checkpoint snapshots, which would otherwise be duplicated in memory.
+void bind_bytes_no_copy(SQLite::Statement& statement, int index, std::span<const std::uint8_t> bytes);
+
 /// Reads a BLOB (or TEXT) column as bytes; NULL and zero-length values give an empty vector.
 [[nodiscard]] std::vector<std::uint8_t> column_bytes(const SQLite::Statement& statement, int index);
 
@@ -67,8 +72,8 @@ void bind_bytes(SQLite::Statement& statement, int index, std::span<const std::ui
 [[nodiscard]] Status check_database_integrity(SQLite::Database& database, bool quick);
 
 /// Hardens a connection that reads externally supplied bytes (section 22.5): bounded
-/// sqlite3_limit values, defensive mode, trusted_schema off, triggers and views disabled and the
-/// connection made query-only.
+/// sqlite3_limit values, defensive mode, trusted_schema off, triggers and views disabled, cell size
+/// checks on, memory mapping off and the connection made query-only.
 [[nodiscard]] Status harden_untrusted_connection(SQLite::Database& database, std::int64_t max_blob_bytes);
 
 /// One row of sqlite_schema used for whitelist comparisons.

@@ -13,7 +13,9 @@
 #include <QPainter>
 
 #include <algorithm>
+#include <cmath>
 #include <map>
+#include <utility>
 
 namespace mwb::ui {
 
@@ -48,6 +50,46 @@ QString controller_name(int controller) {
     }
 }
 
+int controller_default_value(const LaneTarget& target) {
+    switch (target.kind) {
+    case LaneTarget::Kind::pitch_bend: return 8192;
+    case LaneTarget::Kind::channel_pressure: return 0;
+    case LaneTarget::Kind::controller:
+        switch (target.controller) {
+        case 7: return 100;  // volume
+        case 8:              // balance
+        case 10: return 64;  // pan
+        case 11: return 127; // expression
+        default: return 0;
+        }
+    case LaneTarget::Kind::velocity:
+    case LaneTarget::Kind::release_velocity: break;
+    }
+    return 0;
+}
+
+QString LaneTarget::short_label() const {
+    switch (kind) {
+    case Kind::velocity: return QObject::tr("Velocity");
+    case Kind::release_velocity: return QObject::tr("Release");
+    case Kind::controller: return QObject::tr("CC %1").arg(controller);
+    case Kind::pitch_bend: return QObject::tr("Bend");
+    case Kind::channel_pressure: return QObject::tr("Pressure");
+    }
+    return {};
+}
+
+QString LaneTarget::detail_label() const {
+    switch (kind) {
+    case Kind::velocity: return {};
+    case Kind::release_velocity: return QObject::tr("velocity");
+    case Kind::controller: return controller_name(controller);
+    case Kind::pitch_bend:
+    case Kind::channel_pressure: return QObject::tr("ch %1").arg(channel + 1);
+    }
+    return {};
+}
+
 QString LaneTarget::label() const {
     switch (kind) {
     case Kind::velocity: return QObject::tr("Velocity");
@@ -73,7 +115,16 @@ QSize ControllerLane::sizeHint() const { return {400, 90}; }
 void ControllerLane::set_target(LaneTarget target) {
     target_ = target;
     setAccessibleName(target.label());
+    setToolTip(target.label()); // the margin shows a shortened label
     update();
+}
+
+void ControllerLane::follow_track_channel(std::uint8_t channel) {
+    if (!follow_channel_ || channel == target_.channel || stroke_)
+        return;
+    LaneTarget target = target_;
+    target.channel = channel;
+    set_target(target);
 }
 
 void ControllerLane::set_mapping(const ViewMapping& mapping, int left_margin, Grid grid) {
@@ -121,7 +172,8 @@ const std::vector<std::size_t>& ControllerLane::matching_positions() const {
     const auto active = controller_.active_track_index();
     const bool same_target = matching_target_.kind == target_.kind && matching_target_.channel == target_.channel &&
                              matching_target_.controller == target_.controller;
-    if (matching_generation_ != controller_.generation() || matching_track_ != active || !same_target) {
+    if (matching_generation_ != controller_.generation() || matching_track_ != active ||
+        matching_sequence_ != controller_.active_sequence_index() || !same_target) {
         matching_.clear();
         if (active) {
             const auto& events = controller_.active_sequence().tracks[*active].events;
@@ -131,6 +183,7 @@ const std::vector<std::size_t>& ControllerLane::matching_positions() const {
         }
         matching_generation_ = controller_.generation();
         matching_track_ = active;
+        matching_sequence_ = controller_.active_sequence_index();
         matching_target_ = target_;
     }
     return matching_;
@@ -140,9 +193,17 @@ void ControllerLane::paintEvent(QPaintEvent*) {
     QPainter painter(this);
     painter.fillRect(rect(), palette().color(QPalette::Base));
     painter.fillRect(QRect(0, 0, left_margin_, height()), palette().color(QPalette::Window));
-    painter.setPen(palette().color(QPalette::Text));
-    painter.drawText(QRect(4, 2, left_margin_ - 6, height() - 4), Qt::AlignVCenter | Qt::AlignLeft | Qt::TextWordWrap,
-                     target_.label());
+    {
+        // Short label in the middle of the margin (the scale sits in its top and bottom corners);
+        // long controller names are elided, the full label is the tooltip.
+        painter.setPen(palette().color(QPalette::Text));
+        const QFontMetrics metrics = fontMetrics();
+        const int text_width = std::max(8, left_margin_ - 8);
+        QString text = metrics.elidedText(target_.short_label(), Qt::ElideRight, text_width);
+        if (const QString detail = target_.detail_label(); !detail.isEmpty())
+            text += QLatin1Char('\n') + metrics.elidedText(detail, Qt::ElideRight, text_width);
+        painter.drawText(QRect(4, 14, left_margin_ - 6, std::max(14, height() - 28)), Qt::AlignVCenter | Qt::AlignLeft, text);
+    }
     painter.save();
     painter.setClipRect(QRect(left_margin_, 0, width() - left_margin_, height()));
     painter.translate(left_margin_, 0);
@@ -285,7 +346,7 @@ void ControllerLane::paintEvent(QPaintEvent*) {
     if (stroke_ && stroke_->points.size() > 1) {
         painter.setPen(QPen(stroke_->erase ? danger_color() : palette().color(QPalette::Highlight), 2));
         QPolygonF line;
-        for (const auto& [tick, value] : stroke_->points)
+        for (const auto& [tick, value] : stroke_by_tick())
             line << QPointF(mapping_.tick_to_x(tick), stroke_->erase ? height() / 2.0 : y_for_value(value));
         painter.drawPolyline(line);
     }
@@ -299,15 +360,15 @@ void ControllerLane::paintEvent(QPaintEvent*) {
         painter.drawText(anchor, text);
     }
     painter.restore();
-    // Scale at the plot's left edge, clear of the lane name in the margin.
+    // Scale inside the margin, right-aligned against the plot, so it never covers the first stems.
     QFont small = font();
-    small.setPointSizeF(std::max(6.0, small.pointSizeF() - 1));
+    small.setPointSizeF(std::max(7.0, small.pointSizeF() - 1));
     painter.setFont(small);
     painter.setPen(palette().color(QPalette::PlaceholderText));
     const int maximum = target_.maximum();
     if (height() >= 48) {
-        painter.drawText(QRectF(left_margin_ + 3, 1, 60, 14), Qt::AlignLeft | Qt::AlignTop, QString::number(maximum));
-        painter.drawText(QRectF(left_margin_ + 3, height() - 15, 60, 14), Qt::AlignLeft | Qt::AlignBottom, QString::number(0));
+        painter.drawText(QRectF(2, 1, left_margin_ - 5, 14), Qt::AlignRight | Qt::AlignTop, QString::number(maximum));
+        painter.drawText(QRectF(2, height() - 15, left_margin_ - 5, 14), Qt::AlignRight | Qt::AlignBottom, QString::number(0));
     }
     if (hasFocus()) {
         painter.setPen(QPen(palette().color(QPalette::Highlight), 2));
@@ -330,6 +391,12 @@ bool ControllerLane::event(QEvent* event) {
 }
 
 void ControllerLane::contextMenuEvent(QContextMenuEvent* event) {
+    // Windows delivers the menu after the right-button release: an erase drag never opens it, and
+    // neither does a right press during a draw stroke.
+    if (std::exchange(suppress_context_menu_, false) || stroke_) {
+        event->accept();
+        return;
+    }
     // Change what this lane shows, or remove it.
     QMenu menu(this);
     auto* show = menu.addMenu(tr("Show"));
@@ -337,7 +404,8 @@ void ControllerLane::contextMenuEvent(QContextMenuEvent* event) {
     const auto add_target = [&](const QString& text, LaneTarget target) {
         auto* action = show->addAction(text, this, [this, target] { set_target(target); });
         action->setCheckable(true);
-        action->setChecked(target.kind == target_.kind && target.controller == target_.controller);
+        action->setChecked(target.kind == target_.kind &&
+                           (target.kind != LaneTarget::Kind::controller || target.controller == target_.controller));
     };
     add_target(tr("Velocity"), LaneTarget{LaneTarget::Kind::velocity, 0, channel});
     add_target(tr("Release Velocity"), LaneTarget{LaneTarget::Kind::release_velocity, 0, channel});
@@ -360,6 +428,7 @@ void ControllerLane::contextMenuEvent(QContextMenuEvent* event) {
         auto* action = channels->addAction(tr("Channel %1").arg(index + 1), this, [this, index] {
             LaneTarget target = target_;
             target.channel = static_cast<std::uint8_t>(index);
+            follow_channel_ = false; // an explicit choice stays when the active track changes
             set_target(target);
         });
         action->setCheckable(true);
@@ -390,11 +459,19 @@ void ControllerLane::nudge_selected_velocity(int delta) {
 }
 
 void ControllerLane::mousePressEvent(QMouseEvent* event) {
-    if (event->position().x() < left_margin_)
+    // Left draws, right erases; other buttons (middle pans the roll) and a second button during a
+    // stroke never start or replace one.
+    if (stroke_ || event->position().x() < left_margin_ ||
+        (event->button() != Qt::LeftButton && event->button() != Qt::RightButton))
         return;
+    suppress_context_menu_ = false;
     stroke_ = Stroke{};
     stroke_->erase = event->button() == Qt::RightButton; // right-drag erases a range
-    mouseMoveEvent(event);
+    stroke_->button = event->button();
+    stroke_->press_x = event->position().x();
+    const double x = event->position().x() - left_margin_;
+    stroke_->points.emplace_back(std::max<Tick>(0, mapping_.x_to_tick(x)), value_at_y(event->position().y()));
+    update();
 }
 
 void ControllerLane::mouseMoveEvent(QMouseEvent* event) {
@@ -406,25 +483,37 @@ void ControllerLane::mouseMoveEvent(QMouseEvent* event) {
         }
         return;
     }
+    if (event->spontaneous() && !(event->buttons() & stroke_->button)) {
+        stroke_.reset(); // the release went elsewhere: abandon the stroke
+        update();
+        return;
+    }
     const double x = event->position().x() - left_margin_;
     const Tick tick = std::max<Tick>(0, mapping_.x_to_tick(x));
     stroke_->points.emplace_back(tick, value_at_y(event->position().y()));
+    stroke_->max_x_distance = std::max(stroke_->max_x_distance, std::abs(event->position().x() - stroke_->press_x));
     update();
 }
 
-void ControllerLane::mouseReleaseEvent(QMouseEvent*) {
-    if (!stroke_)
+void ControllerLane::focusOutEvent(QFocusEvent* event) {
+    if (stroke_) {
+        stroke_.reset(); // a stroke never survives focus loss (Alt+Tab, a dialog)
+        update();
+    }
+    QWidget::focusOutEvent(event);
+}
+
+void ControllerLane::mouseReleaseEvent(QMouseEvent* event) {
+    if (!stroke_ || event->button() != stroke_->button)
         return;
     if (stroke_->erase) {
         // A right-click (no drag) is for the context menu; erasing needs a right-drag.
-        const auto [first, last] = std::minmax_element(stroke_->points.begin(), stroke_->points.end());
-        const double span = stroke_->points.empty() ? 0.0
-                                                    : static_cast<double>(last->first - first->first) / mapping_.ticks_per_pixel;
-        if (span < QApplication::startDragDistance()) {
+        if (stroke_->max_x_distance < QApplication::startDragDistance()) {
             stroke_.reset();
             update();
             return;
         }
+        suppress_context_menu_ = true;
     }
     if (target_.kind == LaneTarget::Kind::velocity || target_.kind == LaneTarget::Kind::release_velocity)
         commit_velocity_stroke();
@@ -448,11 +537,22 @@ void ControllerLane::keyPressEvent(QKeyEvent* event) {
     QWidget::keyPressEvent(event);
 }
 
+std::vector<std::pair<Tick, int>> ControllerLane::stroke_by_tick() const {
+    std::map<Tick, int> latest;
+    if (stroke_)
+        for (const auto& [tick, value] : stroke_->points)
+            latest[tick] = value; // arrival order: a later point at the same tick wins
+    return {latest.begin(), latest.end()};
+}
+
 void ControllerLane::commit_velocity_stroke() {
     if (stroke_->points.empty() || stroke_->erase)
         return;
-    auto points = stroke_->points;
-    std::sort(points.begin(), points.end());
+    const auto points = stroke_by_tick();
+    // A drag that stays on one stem (horizontal travel under the drag distance) sets the value
+    // released, the same number the readout showed.
+    const bool vertical = stroke_->max_x_distance < QApplication::startDragDistance();
+    const int released = stroke_->points.back().second;
     const Tick first = points.front().first;
     const Tick last = points.back().first;
     const Tick slack = static_cast<Tick>(4 * mapping_.ticks_per_pixel);
@@ -460,6 +560,8 @@ void ControllerLane::commit_velocity_stroke() {
     if (!active)
         return;
     const auto value_at = [&](Tick tick) {
+        if (vertical)
+            return released;
         // Linear interpolation along the drag path.
         auto upper = std::lower_bound(points.begin(), points.end(), std::pair<Tick, int>{tick, INT32_MIN});
         if (upper == points.end())
@@ -503,8 +605,7 @@ void ControllerLane::commit_controller_stroke() {
     const auto active = controller_.active_track_index();
     if (!active)
         return;
-    auto points = stroke_->points;
-    std::sort(points.begin(), points.end());
+    const auto points = stroke_by_tick();
     const Tick first = grid_.floor(points.front().first);
     const Tick last = std::max(grid_.next(points.back().first), first + 1);
     const auto& track = controller_.active_sequence().tracks[*active];
@@ -541,22 +642,41 @@ void ControllerLane::commit_controller_stroke() {
     };
     int last_written = -1;
     if (!stroke_->erase) {
-        // Sample the stroke at grid points; skip repeated values (discrete MIDI 1.0 events).
-        // The sustain pedal is a switch: drawn values snap to off/on so a curve never becomes
-        // accidental pedal flutter (section 11.2).
+        // Sample the drawn line (linear between the stroke's points, as the preview shows it) at
+        // every grid point; skip repeated values (discrete MIDI 1.0 events). The sustain pedal is
+        // a switch: drawn values snap to off/on so a curve never becomes accidental pedal flutter
+        // (section 11.2).
         const bool sustain_lane = target_.kind == LaneTarget::Kind::controller && target_.controller == 64;
-        std::map<Tick, int> samples;
-        for (const auto& [tick, value] : points)
-            samples[grid_.nearest(tick)] = sustain_lane ? (value >= 64 ? 127 : 0) : value;
-        for (const auto& [tick, value] : samples) {
-            if (tick < first || tick >= last || value == last_written)
+        const auto value_at = [&](Tick tick) {
+            const auto upper = std::lower_bound(points.begin(), points.end(), tick,
+                                                [](const std::pair<Tick, int>& point, Tick value) { return point.first < value; });
+            if (upper == points.end())
+                return points.back().second;
+            if (upper == points.begin() || upper->first == tick)
+                return upper->second;
+            const auto lower = std::prev(upper);
+            const double fraction = static_cast<double>(tick - lower->first) / static_cast<double>(upper->first - lower->first);
+            return static_cast<int>(std::lround(lower->second + fraction * (upper->second - lower->second)));
+        };
+        const Tick stroke_last = points.back().first;
+        for (Tick tick = first; tick < last; tick = grid_.next(tick)) {
+            if (tick > stroke_last && tick != first)
+                break;
+            int value = std::clamp(value_at(tick), 0, target_.maximum());
+            if (sustain_lane)
+                value = value >= 64 ? 127 : 0;
+            if (value == last_written)
                 continue;
             bulk.insert.emplace_back(make_event(tick, value), OrderPlacement::before_note_starts);
             last_written = value;
         }
     }
-    if (value_after_range && !has_event_at_end && *value_after_range != last_written)
-        bulk.insert.emplace_back(make_event(last, *value_after_range), OrderPlacement::before_note_starts);
+    // Playback after the range stays as it was: the value in effect before the edit, or the
+    // channel's reset value when the lane had no earlier event (a fresh bend must not stay bent).
+    const int restore = value_after_range.value_or(controller_default_value(target_));
+    const bool wrote = last_written >= 0 || !bulk.remove.empty();
+    if (wrote && !has_event_at_end && restore != last_written)
+        bulk.insert.emplace_back(make_event(last, restore), OrderPlacement::before_note_starts);
     ChangeBuilder builder(controller_.document(), stroke_->erase ? "Erase controller range" : "Draw controller curve");
     std::ignore = builder.edit_track(track.id, std::move(bulk));
     controller_.apply(builder.finish());

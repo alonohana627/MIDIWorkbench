@@ -144,6 +144,24 @@ Tick TimeMapping::first_tick_at_or_after_frame(std::int64_t frame) const noexcep
     return high;
 }
 
+TimeMapping::ExactFrame TimeMapping::frames_for_ticks_at(Tick at, Tick ticks) const noexcept {
+    const Division& division = tempo_map_.division();
+    if (division.is_ppq()) {
+        const __int128 tempo = tempo_map_.tempo_at(std::max<Tick>(at, 0));
+        return ExactFrame{static_cast<__int128>(ticks) * tempo * sample_rate_ * multiplier_.denominator, denominator_};
+    }
+    const Rational seconds_per_tick = division.smpte_seconds_per_tick();
+    return ExactFrame{static_cast<__int128>(ticks) * seconds_per_tick.numerator * sample_rate_, denominator_};
+}
+
+Tick TimeMapping::ticks_for_frames_at(Tick at, std::int64_t frames) const noexcept {
+    const ExactFrame one_tick = frames_for_ticks_at(at, 1);
+    if (one_tick.numerator <= 0)
+        return 0;
+    // ticks = frames / (one_tick.numerator / one_tick.denominator), rounded toward zero.
+    return static_cast<Tick>(static_cast<__int128>(frames) * one_tick.denominator / one_tick.numerator);
+}
+
 // --- PlaybackSnapshot -------------------------------------------------------------------------
 
 std::size_t PlaybackSnapshot::first_event_at_or_after(Tick tick) const noexcept {
@@ -181,6 +199,14 @@ void PlaybackSnapshot::state_before(std::size_t event_index, std::span<ChannelSt
             continue;
         states[event.route].apply(event.bytes[0], event.bytes[1], event.bytes[2]);
     }
+}
+
+const ClickSegment* PlaybackSnapshot::click_segment_at(Tick tick) const noexcept {
+    if (click_segments.empty())
+        return nullptr;
+    const auto after = std::upper_bound(click_segments.begin(), click_segments.end(), tick,
+                                        [](Tick value, const ClickSegment& segment) { return value < segment.start; });
+    return after == click_segments.begin() ? &click_segments.front() : &*std::prev(after);
 }
 
 std::vector<bool> audible_tracks(const Sequence& sequence, bool master_mute) {
@@ -409,7 +435,9 @@ Result<std::unique_ptr<const PlaybackSnapshot>> compile_playback(const DocumentD
     for (const PendingEvent& event : pending)
         end_tick = std::max(end_tick, event.key.tick);
 
-    // Metronome clicks from the meter map (PPQ sequences only; synthesized separately).
+    // Metronome beat grid from the meter map (PPQ sequences only). Only one entry per meter
+    // segment is stored; the scheduler generates the clicks while playing, so the cost does not
+    // grow with the length of the timeline.
     if (options.metronome_clicks && sequence->division.is_ppq()) {
         const MeterMap meters = MeterMap::build(*sequence);
         const auto& segments = meters.segments();
@@ -417,21 +445,15 @@ Result<std::unique_ptr<const PlaybackSnapshot>> compile_playback(const DocumentD
             const MeterSegment& segment = segments[index];
             const Tick segment_end = index + 1 < segments.size() ? segments[index + 1].tick : end_tick;
             const Tick beat_length = meters.ticks_per_beat(segment);
-            if (beat_length <= 0 || segment.numerator <= 0)
+            if (beat_length <= 0 || segment.numerator <= 0 || segment_end <= segment.tick)
                 continue;
-            const bool compound = segment.denominator == 8 && segment.numerator % 3 == 0 && segment.numerator > 3;
-            std::int64_t beat = 0;
-            for (Tick tick = segment.tick; tick < segment_end; tick += beat_length, ++beat) {
-                if (check_stop())
-                    return make_error(ErrorCode::cancelled, "snapshot compilation was cancelled");
-                const std::int64_t in_bar = beat % segment.numerator;
-                PendingEvent click;
-                click.key = SortKey{tick, std::numeric_limits<std::uint32_t>::max(), 0, 1};
-                click.event.tick = tick;
-                click.event.kind = RealtimeEventKind::metronome_click;
-                click.event.value = in_bar == 0 ? 2u : (compound && in_bar % 3 == 0 ? 1u : 0u);
-                pending.push_back(click);
-            }
+            ClickSegment grid;
+            grid.start = segment.tick;
+            grid.end = segment_end;
+            grid.beat_length = beat_length;
+            grid.numerator = segment.numerator;
+            grid.compound = segment.denominator == 8 && segment.numerator % 3 == 0 && segment.numerator > 3;
+            snapshot->click_segments.push_back(grid);
         }
     }
 

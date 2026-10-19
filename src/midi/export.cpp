@@ -7,8 +7,11 @@
 
 #include <algorithm>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace mwb::midi {
 
@@ -98,25 +101,84 @@ libremidi::message to_message(const Event& event) {
     return message;
 }
 
+/// Registered (RPN) and non-registered (NRPN) parameter state of one channel before the range.
+/// Data entry (CC 6/38, increments 96/97) applies to the parameter selected last, so the state
+/// is replayed as complete select + data blocks instead of as independent controller values.
+struct ParameterState {
+    enum class Kind : std::uint8_t { none, registered, non_registered };
+    struct Value {
+        std::optional<std::uint8_t> msb;
+        std::optional<std::uint8_t> lsb;
+    };
+    Kind active = Kind::none;
+    std::optional<std::uint8_t> rpn_msb, rpn_lsb, nrpn_msb, nrpn_lsb;
+    std::map<std::tuple<Kind, std::uint8_t, std::uint8_t>, Value> values;
+
+    /// Returns true when the controller belongs to the parameter protocol.
+    bool apply(std::uint8_t controller, std::uint8_t value) {
+        switch (controller) {
+        case 101: rpn_msb = value; active = Kind::registered; return true;
+        case 100: rpn_lsb = value; active = Kind::registered; return true;
+        case 99: nrpn_msb = value; active = Kind::non_registered; return true;
+        case 98: nrpn_lsb = value; active = Kind::non_registered; return true;
+        case 6:
+        case 38:
+        case 96:
+        case 97: break;
+        default: return false;
+        }
+        const auto key = selected();
+        if (!key)
+            return true; // data entry with no (or the null) parameter selected does nothing
+        Value& stored = values[*key];
+        if (controller == 6) {
+            stored.msb = value;
+        } else if (controller == 38) {
+            stored.lsb = value;
+        } else if (stored.msb) {
+            // Increment/decrement step the 14-bit value by one.
+            int combined = (*stored.msb << 7) | stored.lsb.value_or(0);
+            combined = std::clamp(combined + (controller == 96 ? 1 : -1), 0, 16383);
+            stored.msb = static_cast<std::uint8_t>(combined >> 7);
+            stored.lsb = static_cast<std::uint8_t>(combined & 0x7F);
+        }
+        return true;
+    }
+
+    [[nodiscard]] std::optional<std::tuple<Kind, std::uint8_t, std::uint8_t>> selected() const {
+        if (active == Kind::registered && rpn_msb && rpn_lsb && !(*rpn_msb == 127 && *rpn_lsb == 127))
+            return std::tuple{active, *rpn_msb, *rpn_lsb};
+        if (active == Kind::non_registered && nrpn_msb && nrpn_lsb && !(*nrpn_msb == 127 && *nrpn_lsb == 127))
+            return std::tuple{active, *nrpn_msb, *nrpn_lsb};
+        return std::nullopt;
+    }
+};
+
 /// Export-selected-range for one track (section 16.6): notes crossing the boundaries are trimmed,
 /// controller state at the range start is initialized at tick 0 in a defined order (bank select,
-/// program, other controllers, pressure, bend), events are rebased to tick zero and the track
-/// ends at the range end.
+/// program, RPN/NRPN parameter blocks, other controllers, pressure, bend), events are rebased to
+/// tick zero and the track ends at the range end. `notes` maps note-on identities of the whole
+/// sequence to their spans, so a note whose end lives on another track keeps its real end.
 OutputTrack range_track(const Track& track, std::uint32_t track_index, TimeRange range, bool carry_globals,
-                        ExportReport& report) {
+                        const std::unordered_map<EventId, const NoteSpan*, UuidHash>& notes,
+                        const std::unordered_set<EventId, UuidHash>& note_subset, ExportReport& report) {
     OutputTrack output;
     output.end_tick = range.length();
     std::map<std::pair<int, int>, const Event*> controllers;
     std::map<int, const Event*> programs;
     std::map<int, const Event*> pressures;
     std::map<int, const Event*> bends;
+    std::map<int, ParameterState> parameters;
     std::map<std::uint8_t, const Event*> globals;
     for (const auto& event : track.events) {
         if (event.tick >= range.begin)
             break;
         if (event.is_channel()) {
             switch (event.message()) {
-            case ChannelMessage::control_change: controllers[{event.channel(), event.data1()}] = &event; break;
+            case ChannelMessage::control_change:
+                if (!parameters[event.channel()].apply(event.data1(), event.data2()))
+                    controllers[{event.channel(), event.data1()}] = &event;
+                break;
             case ChannelMessage::program_change: programs[event.channel()] = &event; break;
             case ChannelMessage::channel_pressure: pressures[event.channel()] = &event; break;
             case ChannelMessage::pitch_bend: bends[event.channel()] = &event; break;
@@ -133,6 +195,9 @@ OutputTrack range_track(const Track& track, std::uint32_t track_index, TimeRange
         copy.tick = tick;
         output.events.push_back(std::move(copy));
     };
+    const auto add_control = [&](int channel, std::uint8_t controller, std::uint8_t value) {
+        output.events.push_back(events::control_change(0, static_cast<std::uint8_t>(channel), controller, value));
+    };
     for (const auto& [type, event] : globals)
         add_copy(*event, 0);
     for (const auto& [key, event] : controllers)
@@ -140,6 +205,38 @@ OutputTrack range_track(const Track& track, std::uint32_t track_index, TimeRange
             add_copy(*event, 0);
     for (const auto& [channel, event] : programs)
         add_copy(*event, 0);
+    using Kind = ParameterState::Kind;
+    for (const auto& [channel, state] : parameters) {
+        // Each parameter: select MSB, select LSB, data entry MSB, data entry LSB, in that order.
+        for (const auto& [key, value] : state.values) {
+            const auto& [kind, msb, lsb] = key;
+            const bool registered = kind == Kind::registered;
+            add_control(channel, registered ? 101 : 99, msb);
+            add_control(channel, registered ? 100 : 98, lsb);
+            if (value.msb)
+                add_control(channel, 6, *value.msb);
+            if (value.lsb)
+                add_control(channel, 38, *value.lsb);
+        }
+        // Then restore the selection registers, the active kind last, so data entries inside
+        // the range address the same parameter as in the full song (including the null RPN).
+        const auto restore = [&](Kind kind) {
+            const bool registered = kind == Kind::registered;
+            const auto& msb = registered ? state.rpn_msb : state.nrpn_msb;
+            const auto& lsb = registered ? state.rpn_lsb : state.nrpn_lsb;
+            if (msb)
+                add_control(channel, registered ? 101 : 99, *msb);
+            if (lsb)
+                add_control(channel, registered ? 100 : 98, *lsb);
+        };
+        if (state.active == Kind::registered) {
+            restore(Kind::non_registered);
+            restore(Kind::registered);
+        } else if (state.active == Kind::non_registered) {
+            restore(Kind::registered);
+            restore(Kind::non_registered);
+        }
+    }
     for (const auto& [key, event] : controllers)
         if (key.second != 0 && key.second != 32)
             add_copy(*event, 0);
@@ -148,15 +245,13 @@ OutputTrack range_track(const Track& track, std::uint32_t track_index, TimeRange
     for (const auto& [channel, event] : bends)
         add_copy(*event, 0);
 
-    const auto pairing = pair_track_notes(track, track_index, track.end_tick);
-    std::map<EventId, const NoteSpan*> by_on;
-    for (const auto& note : pairing.notes)
-        by_on[note.on_id] = &note;
     std::vector<Event> body;
     for (const auto& event : track.events) {
         if (event.is_note_start()) {
-            const auto found = by_on.find(event.id);
-            if (found == by_on.end())
+            const auto found = notes.find(event.id);
+            if (found == notes.end() || found->second->on_track != track_index)
+                continue;
+            if (!note_subset.empty() && !note_subset.contains(event.id))
                 continue;
             const NoteSpan& note = *found->second;
             const Tick start = std::max(note.start, range.begin);
@@ -173,7 +268,8 @@ OutputTrack range_track(const Track& track, std::uint32_t track_index, TimeRange
             body.push_back(std::move(off));
         } else if (event.is_note_end()) {
             continue; // emitted with its paired note start; orphans are outside any exported note
-        } else if (range.contains(event.tick)) {
+        } else if (range.contains(event.tick) && (carry_globals || !is_global_meta(event))) {
+            // With a conductor track the tempo/meter/key events live only there.
             Event copy = event;
             copy.tick -= range.begin;
             body.push_back(std::move(copy));
@@ -238,6 +334,20 @@ Result<std::vector<OutputTrack>> sequence_tracks(const Sequence& sequence, const
     if (options.range && options.range->empty())
         return make_error(ErrorCode::invalid_argument, "export range is empty");
 
+    if (!options.notes.empty() && !options.range)
+        return make_error(ErrorCode::invalid_argument, "a note subset is exported with a range");
+
+    // Range export pairs the whole sequence once: links may cross tracks (section 16.4).
+    NotePairing pairing;
+    std::unordered_map<EventId, const NoteSpan*, UuidHash> notes;
+    const std::unordered_set<EventId, UuidHash> note_subset(options.notes.begin(), options.notes.end());
+    if (options.range) {
+        pairing = pair_notes(sequence);
+        notes.reserve(pairing.notes.size());
+        for (const auto& note : pairing.notes)
+            notes.emplace(note.on_id, &note);
+    }
+
     std::vector<OutputTrack> outputs;
     if (conductor) {
         // Canonical profile: global tempo/meter/key events on a conductor track (section 16.6).
@@ -276,7 +386,8 @@ Result<std::vector<OutputTrack>> sequence_tracks(const Sequence& sequence, const
     for (const auto index : chosen) {
         const auto& track = sequence.tracks[index];
         if (options.range)
-            outputs.push_back(range_track(track, static_cast<std::uint32_t>(index), *options.range, !conductor, report));
+            outputs.push_back(range_track(track, static_cast<std::uint32_t>(index), *options.range, !conductor, notes,
+                                          note_subset, report));
         else
             outputs.push_back(plain_track(track, conductor));
     }

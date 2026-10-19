@@ -151,7 +151,9 @@ std::vector<std::size_t> NoteIndex::query(TimeRange window, std::uint8_t low_pit
         std::lower_bound(prefix_max_end_.begin(), prefix_max_end_.end(), window.begin) - prefix_max_end_.begin());
     // prefix_max_end_ is non-decreasing; chunks before first_chunk all end before window.begin.
     for (std::size_t chunk = first_chunk; chunk * chunk_size < limit; ++chunk) {
-        if (chunk_max_end_[chunk] <= window.begin && notes_[chunk * chunk_size].start < window.begin)
+        // Strictly before: a chunk whose maximum end equals window.begin can still hold a
+        // zero-length note at window.begin, which intersects.
+        if (chunk_max_end_[chunk] < window.begin)
             continue;
         const std::size_t end = std::min(limit, (chunk + 1) * chunk_size);
         for (std::size_t index = chunk * chunk_size; index < end; ++index) {

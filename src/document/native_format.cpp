@@ -13,10 +13,12 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <fstream>
 #include <limits>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <tuple>
@@ -40,6 +42,21 @@ constexpr std::size_t max_take_chunk_bytes = 1024 * 1024;
 constexpr std::size_t max_source_bytes = 256u * 1024u * 1024u;
 /// Take chunk codec written by this version (section 23.1).
 constexpr std::int64_t take_chunk_codec_version = 1;
+
+/// Row caps for the secondary tables of an untrusted file, checked before the rows are read so
+/// a crafted file of millions of tiny rows cannot allocate gigabytes before validation.
+constexpr std::int64_t max_region_rows = 100'000; // per table: region, scale_region, recipe
+constexpr std::int64_t max_take_rows = 10'000;
+constexpr std::int64_t max_take_chunk_rows = 1'000'000;
+constexpr std::int64_t max_source_rows = 1'024;
+
+/// The secondary event index of native_v1. write_tables() creates it after the bulk insert
+/// (maintaining it row by row is slower); the stored schema text is the same either way.
+constexpr std::string_view event_index_ddl = "CREATE INDEX event_time ON midi_event(track_id, tick, order_key);";
+
+/// Temporary save files are named "<target>.~<8 hex digits>.mwb-tmp".
+constexpr std::string_view temporary_marker = ".~";
+constexpr std::string_view temporary_suffix = ".mwb-tmp";
 
 // --- Enumerations <-> text ----------------------------------------------------------------------
 
@@ -162,9 +179,18 @@ Status check_writable(const DocumentData& document) {
 // --- Writer -------------------------------------------------------------------------------------
 
 /// Creates the schema and writes every row inside one transaction. Throws SQLite::Exception.
+/// The DDL runs inside the transaction too (one commit and one set of fsyncs instead of one per
+/// statement); its "PRAGMA foreign_keys = ON" is a no-op there, so rows are inserted without
+/// per-row foreign key lookups and check_database_integrity() verifies the keys once afterwards.
 void write_tables(SQLite::Database& database, const DocumentData& document) {
-    database.exec(std::string(schemas::native_v1));
+    std::string ddl(schemas::native_v1);
+    const auto index_at = ddl.find(event_index_ddl);
+    if (index_at == std::string::npos)
+        throw std::logic_error("native schema has no event_time index statement");
+    ddl.erase(index_at, event_index_ddl.size());
+    database.exec("PRAGMA foreign_keys = OFF");
     SQLite::Transaction transaction(database);
+    database.exec(ddl);
 
     {
         SQLite::Statement insert(database,
@@ -357,6 +383,7 @@ void write_tables(SQLite::Database& database, const DocumentData& document) {
         }
     }
 
+    database.exec(std::string(event_index_ddl));
     transaction.commit();
 }
 
@@ -422,9 +449,11 @@ Result<NativeOpenResult> read_document(SQLite::Database& database, const NativeL
     NativeOpenResult result;
     DocumentData& document = result.document;
 
-    // Bounded counts before anything large is read.
+    // Bounded counts before anything large is read. NOT INDEXED forces a scan of the table
+    // itself: quick_check does not verify that index content matches table content, so a count
+    // answered from a damaged index would be no cross-check for rows read through an index.
     const auto count_rows = [&](const char* table) {
-        SQLite::Statement statement(database, std::string("SELECT count(*) FROM ") + table);
+        SQLite::Statement statement(database, std::string("SELECT count(*) FROM ") + table + " NOT INDEXED");
         statement.executeStep();
         return statement.getColumn(0).getInt64();
     };
@@ -433,6 +462,14 @@ Result<NativeOpenResult> read_document(SQLite::Database& database, const NativeL
         return make_error(ErrorCode::limit_exceeded, "native document has more events than the load limit");
     if (static_cast<std::uint64_t>(count_rows("sequence")) > limits.document.max_sequences)
         return make_error(ErrorCode::limit_exceeded, "native document has too many sequences");
+    if (count_rows("note_link") > event_count)
+        return make_error(ErrorCode::invalid_data, "native document has more note links than events");
+    for (const auto& [table, cap] : {std::pair{"region", max_region_rows}, std::pair{"scale_region", max_region_rows},
+                                     std::pair{"recipe", max_region_rows}, std::pair{"recording_take", max_take_rows},
+                                     std::pair{"take_chunk", max_take_chunk_rows},
+                                     std::pair{"source_blob", max_source_rows}})
+        if (count_rows(table) > cap)
+            return make_error(ErrorCode::limit_exceeded, std::string("native document has too many rows in ") + table);
 
     // Project row.
     {
@@ -506,6 +543,7 @@ Result<NativeOpenResult> read_document(SQLite::Database& database, const NativeL
         SQLite::Statement select_events(database, "SELECT id, tick, order_key, category, code, payload, flags FROM "
                                                   "midi_event WHERE track_id = ? ORDER BY tick, order_key");
         std::uint64_t tracks_seen = 0;
+        std::int64_t events_seen = 0;
         for (auto& sequence : document.sequences) {
             select_tracks.reset();
             bind_uuid(select_tracks, 1, sequence.id.uuid());
@@ -560,13 +598,20 @@ Result<NativeOpenResult> read_document(SQLite::Database& database, const NativeL
                     event.flags = static_cast<std::uint32_t>(flags);
                     event.payload = Payload(payload);
                     track.events.push_back(std::move(event));
+                    ++events_seen;
                 }
                 sequence.tracks.push_back(std::move(track));
                 ++tracks_seen;
             }
         }
         if (tracks_seen != static_cast<std::uint64_t>(count_rows("track")))
-            return make_error(ErrorCode::invalid_data, "a track belongs to no sequence");
+            return make_error(ErrorCode::invalid_data, "a track belongs to no sequence or the track index is damaged");
+        // Events are read through the (track, tick, order) index: a damaged index that lacks rows
+        // would otherwise open the document without them, and the next save would drop them.
+        if (events_seen != event_count)
+            return make_error(ErrorCode::invalid_data,
+                              "native document index does not match its events (an event belongs to no track or the "
+                              "event index is damaged)");
     }
 
     // Regions, scale regions and recipes, in stored (rowid) order.
@@ -694,6 +739,8 @@ Result<NativeOpenResult> read_document(SQLite::Database& database, const NativeL
         }
         if (matched != links.size())
             return make_error(ErrorCode::invalid_data, "note link projection contains links without notes");
+        if (static_cast<std::int64_t>(links.size()) != count_rows("note_link"))
+            return make_error(ErrorCode::invalid_data, "native document index does not match its note links");
     }
 
     // Recording takes and chunks.
@@ -863,6 +910,30 @@ void remove_quietly(const std::filesystem::path& path) {
     std::ignore = std::filesystem::remove(path, error);
 }
 
+/// Removes temporary files an interrupted save of `target` left behind ("<name>.~*.mwb-tmp"
+/// and their "-journal") once they are older than an hour: a younger one may belong to a save
+/// another instance is running right now.
+void remove_stale_temporaries(const std::filesystem::path& target) {
+    const std::u8string prefix =
+        target.filename().u8string() + std::u8string(temporary_marker.begin(), temporary_marker.end());
+    const std::u8string suffix(temporary_suffix.begin(), temporary_suffix.end());
+    const std::u8string journal_suffix = suffix + u8"-journal";
+    const auto cutoff = std::filesystem::file_time_type::clock::now() - std::chrono::hours(1);
+    std::error_code error;
+    std::filesystem::directory_iterator entries(target.parent_path(), error);
+    if (error)
+        return;
+    for (const auto& entry : entries) {
+        const std::u8string name = entry.path().filename().u8string();
+        if (!name.starts_with(prefix) || !(name.ends_with(suffix) || name.ends_with(journal_suffix)))
+            continue;
+        std::error_code time_error;
+        const auto written = std::filesystem::last_write_time(entry.path(), time_error);
+        if (!time_error && written < cutoff)
+            remove_quietly(entry.path());
+    }
+}
+
 } // namespace
 
 std::span<const std::string_view> document_setting_keys() { return allowed_setting_keys; }
@@ -885,9 +956,12 @@ Status save_native(const DocumentData& document, const std::filesystem::path& pa
     if (std::filesystem::is_directory(target, error))
         return make_error(ErrorCode::io, "the destination is a directory");
 
-    // Unique temporary file next to the target so the final rename stays on one volume.
+    remove_stale_temporaries(target);
+    // Unique temporary file next to the target so the final rename stays on one volume. The
+    // suffix is short (19 characters) so a target that fits MAX_PATH leaves room for it.
     std::filesystem::path temporary = target;
-    temporary += std::filesystem::path(".~" + Uuid::generate().to_string() + ".mwb-tmp");
+    temporary += std::filesystem::path(std::string(temporary_marker) + Uuid::generate().to_string().substr(0, 8) +
+                                       std::string(temporary_suffix));
     std::filesystem::path journal = temporary;
     journal += "-journal";
 
@@ -913,7 +987,9 @@ Result<std::vector<std::uint8_t>> native_to_bytes(const DocumentData& document) 
     return guarded("serializing the native document", [&]() -> Result<std::vector<std::uint8_t>> {
         SQLite::Database database(":memory:", SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);
         write_tables(database, document);
-        MWB_TRY(check_database_integrity(database, false));
+        // This code just wrote the image: the quick check (structure, NOT NULL and CHECK) and the
+        // foreign key check suffice; the full integrity check stays in save_native().
+        MWB_TRY(check_database_integrity(database, true));
         return serialize_database(database);
     });
 }

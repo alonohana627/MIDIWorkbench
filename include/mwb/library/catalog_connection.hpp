@@ -26,11 +26,24 @@ enum class ConnectionRole : std::uint8_t { writer, reader };
                                                                                 ConnectionRole role,
                                                                                 int busy_timeout_ms, bool create = false);
 
-/// Creates the section 23.2 schema plus the tuning indexes and the catalog identity row.
+/// Creates the section 23.2 schema plus the tuning indexes, every migration step up to
+/// catalog_schema_version and the catalog identity row.
 [[nodiscard]] Status create_catalog_schema(SQLite::Database& database, const Uuid& library_uuid, std::int64_t created_ms);
 
 /// Checks application_id and user_version; a newer schema is refused (section 23.4).
 [[nodiscard]] Status check_catalog_header(SQLite::Database& database);
+
+/// Migrates an older catalog to catalog_schema_version in one IMMEDIATE transaction on the writer
+/// connection (no-op when current). Each step records itself in catalog_setting migration.history.
+[[nodiscard]] Status migrate_catalog(SQLite::Database& database);
+
+/// Exact DDL whose execution yields the schema of `version` (whitelist reference for catalogs
+/// that come from outside, such as restored backups).
+[[nodiscard]] std::string catalog_reference_ddl(std::int32_t version);
+
+/// sequence_fact INSERT statements (section sequence_fact_inserts) for one revision bound as ?1
+/// when `one_revision`, otherwise for every summary row (migration backfill).
+[[nodiscard]] std::string sequence_fact_sql(bool one_revision);
 
 /// Library identity stored in the catalog row.
 [[nodiscard]] Result<Uuid> read_catalog_uuid(SQLite::Database& database);

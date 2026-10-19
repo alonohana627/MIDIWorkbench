@@ -15,6 +15,7 @@
 #include "mwb/ui/controller_lane.hpp"
 #include "mwb/ui/editor_tab.hpp"
 #include "mwb/ui/event_list.hpp"
+#include "mwb/ui/inspector.hpp"
 #include "mwb/ui/main_window.hpp"
 #include "mwb/ui/piano_roll.hpp"
 #include "mwb/ui/playback_service.hpp"
@@ -29,6 +30,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QKeyEvent>
+#include <QWheelEvent>
 #include <QLabel>
 #include <QPushButton>
 #include <QSettings>
@@ -1296,5 +1298,217 @@ TEST_SUITE("audio_device") {
         CHECK_FALSE(playback->has_device());
         CHECK_FALSE(playback->transport_tick_at(steady_ns()));
         playback->stop(0);
+    }
+}
+
+TEST_SUITE("keyboard") {
+    TEST_CASE("a held computer-keyboard note ends on release even with Ctrl held by then") {
+        application();
+        ComputerKeyboardPlayer player;
+        player.set_enabled(true);
+        QSignalSpy on(&player, &ComputerKeyboardPlayer::note_on);
+        QSignalSpy off(&player, &ComputerKeyboardPlayer::note_off);
+        QKeyEvent press(QEvent::KeyPress, Qt::Key_A, Qt::NoModifier);
+        CHECK(player.handle_key(&press, true));
+        QKeyEvent ctrl_press(QEvent::KeyPress, Qt::Key_S, Qt::ControlModifier); // Ctrl+S is a command
+        CHECK_FALSE(player.handle_key(&ctrl_press, true));
+        QKeyEvent release(QEvent::KeyRelease, Qt::Key_A, Qt::ControlModifier); // Ctrl still down
+        CHECK(player.handle_key(&release, false));
+        CHECK(on.count() == 1);
+        REQUIRE(off.count() == 1);
+        CHECK(off.at(0).at(0).toInt() == on.at(0).at(0).toInt());
+    }
+
+    TEST_CASE("the on-screen keyboard scrolls by accumulated wheel notches") {
+        application();
+        KeyboardWidget keyboard;
+        keyboard.resize(600, 80);
+        const int start = keyboard.view_start();
+        const auto wheel = [&](QPoint delta) {
+            QWheelEvent event(QPointF(10, 10), QPointF(10, 10), QPoint(), delta, Qt::NoButton, Qt::NoModifier,
+                              Qt::NoScrollPhase, false);
+            QApplication::sendEvent(&keyboard, &event);
+        };
+        wheel(QPoint(0, 0)); // no delta: nothing
+        CHECK(keyboard.view_start() == start);
+        wheel(QPoint(0, -40)); // touchpad steps add up to one notch
+        wheel(QPoint(0, -40));
+        CHECK(keyboard.view_start() == start);
+        wheel(QPoint(0, -40));
+        CHECK(keyboard.view_start() == start + 7);
+        wheel(QPoint(120, 0)); // a horizontal swipe scrolls too (left)
+        CHECK(keyboard.view_start() == start);
+    }
+}
+
+TEST_SUITE("clipboard") {
+    TEST_CASE("Drag MIDI of a selection exports exactly the selected notes") {
+        auto controller = make_controller();
+        std::vector<NewNote> notes = {{controller->active_track(), 0, 480, 60, 100, 0, 0},
+                                      {controller->active_track(), 240, 720, 64, 100, 0, 0},
+                                      {controller->active_track(), 480, 960, 67, 100, 0, 0}};
+        auto changes = insert_notes(controller->document(), notes);
+        REQUIRE(changes);
+        REQUIRE(controller->apply(*changes));
+        const auto& all = controller->notes().notes;
+        REQUIRE(all.size() == 3);
+        controller->set_selection({all[0].on_id, all[2].on_id}); // 64 lies inside their span but is not selected
+        std::string title;
+        const auto options = drag_export_options(*controller, &title);
+        CHECK(QString::fromStdString(title).endsWith("selection"));
+        auto bytes = midi::export_midi(controller->document(), options);
+        REQUIRE(bytes);
+        auto imported = midi::import_midi(*bytes, "drag.mid", {}, {});
+        REQUIRE(imported);
+        std::vector<int> pitches;
+        for (const auto& sequence : imported->document.sequences)
+            for (const auto& note : pair_notes(sequence).notes)
+                pitches.push_back(note.pitch);
+        std::ranges::sort(pitches);
+        CHECK(pitches == std::vector<int>{60, 67});
+    }
+}
+
+TEST_SUITE("event_list") {
+    TEST_CASE("between an edit and the rebuild a row never shows or edits another event") {
+        auto controller = make_controller();
+        const NewNote note{controller->active_track(), 960, 1440, 60, 100, 0, 0};
+        auto changes = insert_notes(controller->document(), std::span(&note, 1));
+        REQUIRE(changes);
+        REQUIRE(controller->apply(*changes));
+        EventTableModel model(*controller);
+        QTest::qWait(200);
+        int row = -1;
+        for (int index = 0; index < model.rowCount(); ++index)
+            if (const Event* event = model.event_at(index); event && event->is_note_start())
+                row = index;
+        REQUIRE(row >= 0);
+        const EventId shown = model.event_at(row)->id;
+        // An edit that shifts the track's events: a note before the shown one.
+        const NewNote earlier{controller->active_track(), 0, 120, 72, 100, 0, 0};
+        auto shift = insert_notes(controller->document(), std::span(&earlier, 1));
+        REQUIRE(shift);
+        REQUIRE(controller->apply(*shift));
+        const Event* now = model.event_at(row); // the rebuild has not run yet
+        CHECK((now == nullptr || now->id == shown));
+        if (now == nullptr) {
+            const bool edited = model.setData(model.index(row, EventTableModel::column_tick), 5, Qt::EditRole);
+            CHECK_FALSE(edited); // a stale row refuses edits
+        }
+        QTest::qWait(200);
+        CHECK(model.row_of(shown) >= 0);
+        CHECK(model.event_at(model.row_of(shown))->id == shown);
+    }
+}
+
+TEST_SUITE("inspector") {
+    TEST_CASE("a Song field writes only itself, keeps unusual meters and commits a step burst once") {
+        auto controller = make_controller();
+        // 3/64 with non-default clock bytes, and an exact tempo the 2-decimal display would round.
+        ChangeBuilder builder(controller->document(), "setup");
+        const TrackId track = controller->active_track();
+        for (const auto& event : controller->active_sequence().tracks.front().events)
+            if (event.tick == 0 && (event.is_meta(meta_type::time_signature) || event.is_meta(meta_type::tempo)))
+                builder.remove(track, event.id);
+        Event meter = events::time_signature(0, 3, 6);
+        meter.payload = Payload(std::vector<std::uint8_t>{3, 6, 12, 4});
+        std::ignore = builder.insert(track, meter, OrderPlacement::before_existing);
+        std::ignore = builder.insert(track, events::tempo(0, 523'457), OrderPlacement::before_existing);
+        REQUIRE(controller->apply(builder.finish()));
+        const auto before = controller->document().sequences.front().tracks.front().events;
+
+        InspectorPanel inspector;
+        inspector.set_controller(controller.get());
+        inspector.show();
+        QSpinBox* loop = nullptr;
+        for (auto* box : inspector.findChildren<QSpinBox*>())
+            if (box->suffix().contains("bars"))
+                loop = box;
+        REQUIRE(loop);
+        const auto loop_before = controller->active_sequence().settings.loop_region;
+        // Three arrow steps: one edit after the pause.
+        loop->stepBy(1);
+        loop->stepBy(1);
+        loop->stepBy(1);
+        QTest::qWait(600);
+        REQUIRE(controller->can_undo());
+        CHECK(controller->undo_text().contains("loop", Qt::CaseInsensitive));
+        // Tempo and the 3/64 meter (with its clock bytes) are untouched by a loop edit.
+        const auto& after = controller->document().sequences.front().tracks.front().events;
+        for (const auto& event : before)
+            if (event.is_meta(meta_type::time_signature) || event.is_meta(meta_type::tempo)) {
+                bool kept = false;
+                for (const auto& now : after)
+                    kept = kept || (now.id == event.id && now.payload == event.payload);
+                CHECK(kept);
+            }
+        REQUIRE(controller->undo()); // one undo removes the whole burst
+        CHECK(controller->active_sequence().settings.loop_region == loop_before);
+        CHECK(controller->undo_text() == "setup");
+    }
+
+    TEST_CASE("new-note length and velocity are set in the inspector and used for drawing") {
+        auto controller = make_controller();
+        InspectorPanel inspector;
+        inspector.set_controller(controller.get());
+        QComboBox* length = nullptr;
+        for (auto* combo : inspector.findChildren<QComboBox*>())
+            if (combo->toolTip().startsWith("Length of new notes"))
+                length = combo;
+        REQUIRE(length);
+        const int quarter = length->findData("1/4");
+        REQUIRE(quarter >= 0);
+        length->setCurrentIndex(quarter);
+        emit length->activated(quarter);
+        CHECK(controller->active_sequence().settings.default_note_length == Rational{1, 4});
+    }
+}
+
+TEST_SUITE("window") {
+    TEST_CASE("toolbar Snap shows custom grids, offers Off, and the view follows and lights the playhead") {
+        WindowFixture fixture;
+        auto* tab = fixture.window->current_tab();
+        auto& controller = tab->controller();
+        QComboBox* snap = nullptr;
+        for (auto* combo : fixture.window->findChildren<QComboBox*>())
+            if (combo->accessibleName() == "Snap")
+                snap = combo;
+        REQUIRE(snap);
+        // A grid the list does not offer is shown as itself, not a stale entry.
+        Sequence updated = sequence_header(controller.active_sequence());
+        updated.settings.snap = Rational{1, 96};
+        ChangeBuilder builder(controller.document(), "snap");
+        builder.set_sequence_properties(updated.id, updated);
+        REQUIRE(controller.apply(builder.finish()));
+        QTest::qWait(50);
+        CHECK(snap->currentText().contains("1/96"));
+        // Off is a view setting: the roll stops snapping.
+        const int off = snap->findData("off");
+        REQUIRE(off >= 0);
+        snap->setCurrentIndex(off);
+        emit snap->activated(off);
+        CHECK(tab->piano_roll().snap_mode() == SnapMode::off);
+        auto* off_action = fixture.window->findChild<QAction*>("view.snap_off");
+        REQUIRE(off_action);
+        CHECK(off_action->isChecked());
+        off_action->trigger(); // Ctrl+4 toggles it back
+        CHECK(tab->piano_roll().snap_mode() != SnapMode::off);
+
+        // Follow and sounding notes: a long note at the start sounds while playing.
+        const NewNote note{controller.active_track(), 0, 960 * 64, 62, 100, 0, 0};
+        auto changes = insert_notes(controller.document(), std::span(&note, 1));
+        REQUIRE(changes);
+        REQUIRE(controller.apply(*changes));
+        auto* follow = fixture.window->findChild<QAction*>("view.follow_playhead");
+        REQUIRE(follow);
+        CHECK(follow->isChecked());
+        tab->piano_roll().setFocus();
+        controller.set_edit_cursor(0);
+        fixture.key(Qt::Key_Space);
+        REQUIRE(wait_until([&] { return tab->piano_roll().sounding_pitches().contains(62); }, 3000));
+        CHECK(tab->keyboard().key_held(62, KeySource::playback));
+        fixture.key(Qt::Key_Space);
+        REQUIRE(wait_until([&] { return tab->piano_roll().sounding_pitches().empty(); }, 2000));
+        CHECK_FALSE(tab->keyboard().key_held(62, KeySource::playback));
     }
 }

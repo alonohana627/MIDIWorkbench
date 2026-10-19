@@ -66,6 +66,7 @@ public:
     [[nodiscard]] bool follow_playhead() const { return follow_playhead_; }
     /// Pitches currently sounding (highlighted keys and notes).
     void set_sounding_pitches(std::set<int> pitches);
+    [[nodiscard]] const std::set<int>& sounding_pitches() const { return sounding_; }
     /// Result of a transform preview drawn as outlined ghosts over the notes; shown only while the
     /// document is still at `generation` (an empty vector clears it).
     void set_preview_notes(std::vector<NoteSpan> notes, std::uint64_t generation);

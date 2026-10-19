@@ -12,6 +12,7 @@ class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
 class QSpinBox;
+class QTimer;
 
 class QFormLayout;
 class QDoubleSpinBox;
@@ -50,7 +51,12 @@ private:
     void apply_note_fields();
     void apply_track_fields();
     void apply_scale_fields();
+    /// Song fields commit one at a time and only when changed (uiB-16): each its own undo entry.
     void apply_song_fields();
+    void apply_tempo();
+    void apply_meter();
+    void apply_loop();
+    void apply_new_note_defaults();
     /// Chooses a transform tool without moving keyboard focus.
     void select_tool(const QString& tool_id);
     void load_tool_defaults();
@@ -71,6 +77,14 @@ private:
     QSpinBox* song_numerator_ = nullptr;
     QComboBox* song_denominator_ = nullptr;
     QSpinBox* song_loop_bars_ = nullptr;
+    QTimer* song_commit_ = nullptr;       ///< Arrow/wheel steps commit once they pause (one edit).
+    double shown_tempo_ = 0;              ///< Song values shown at the last refresh.
+    int shown_numerator_ = 0;
+    int shown_denominator_ = 0;
+    int shown_loop_bars_ = 0;
+    // New notes (draw, double-click, step entry)
+    QComboBox* new_length_ = nullptr;
+    QSpinBox* new_velocity_ = nullptr;
     // Selection
     QLabel* selection_label_ = nullptr;
     QFormLayout* selection_form_ = nullptr;

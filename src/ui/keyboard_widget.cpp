@@ -51,6 +51,12 @@ void KeyboardWidget::set_scale(int root_pitch_class, std::uint16_t absolute_mask
     update();
 }
 
+bool KeyboardWidget::key_held(int pitch, KeySource source) const {
+    if (pitch < 0 || pitch > 127)
+        return false;
+    return (owners_[static_cast<std::size_t>(pitch)] & (1u << static_cast<unsigned>(source))) != 0;
+}
+
 void KeyboardWidget::set_key_state(int pitch, KeySource source, bool down) {
     if (pitch < 0 || pitch > 127)
         return;
@@ -213,8 +219,20 @@ void KeyboardWidget::mouseReleaseEvent(QMouseEvent* event) {
 }
 
 void KeyboardWidget::wheelEvent(QWheelEvent* event) {
-    const int steps = event->angleDelta().y() > 0 ? -7 : 7;
-    set_view_start(view_start_ + steps);
+    // Accumulated like the piano roll: a touchpad's small deltas add up instead of each jumping
+    // an octave, a horizontal swipe scrolls too, and an empty delta does nothing (uiB-13).
+    const QPoint delta = event->angleDelta();
+    const int amount = delta.y() != 0 ? delta.y() : delta.x(); // tilt or swipe left moves left, like wheel up
+    if (amount == 0) {
+        event->ignore();
+        return;
+    }
+    wheel_accumulated_ += amount / 120.0;
+    const int notches = static_cast<int>(wheel_accumulated_);
+    if (notches != 0) {
+        wheel_accumulated_ -= notches;
+        set_view_start(view_start_ - 7 * notches); // one notch = one octave of white keys
+    }
     event->accept();
 }
 
@@ -256,9 +274,21 @@ void ComputerKeyboardPlayer::set_enabled(bool enabled) {
 }
 
 bool ComputerKeyboardPlayer::handle_key(QKeyEvent* event, bool pressed) {
-    if (!enabled_ || (event->modifiers() & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)))
+    if (!enabled_)
         return false;
     const int key = event->key();
+    // Modified keys are commands, so they never start a note; but the release of a key that is
+    // sounding always ends its note, even with Ctrl held by then (uiB-14).
+    if (event->modifiers() & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)) {
+        if (pressed || event->isAutoRepeat())
+            return false;
+        const auto held = held_.find(key);
+        if (held == held_.end())
+            return false;
+        emit note_off(held->second);
+        held_.erase(held);
+        return true;
+    }
     if (pressed && event->isAutoRepeat())
         return map_.semitone_by_key.contains(key); // auto-repeat never retriggers notes
     if (key == map_.octave_key_down || key == map_.octave_key_up) {

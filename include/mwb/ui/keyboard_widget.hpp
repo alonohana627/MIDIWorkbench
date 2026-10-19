@@ -28,6 +28,8 @@ public:
     void set_scale(int root_pitch_class, std::uint16_t absolute_mask, bool show);
     /// Marks a key active for a source (playback, MIDI input, computer keyboard).
     void set_key_state(int pitch, KeySource source, bool down);
+    /// True while `source` holds `pitch` down.
+    [[nodiscard]] bool key_held(int pitch, KeySource source) const;
     /// Marks keys held only by the sustain pedal (shown differently from held keys).
     void set_sustained(std::set<int> pitches);
     /// Releases every note owned by `source` (focus loss, mode change, device change).
@@ -66,6 +68,7 @@ private:
     void release_pointer_key();
 
     int view_start_ = 48; ///< C3
+    double wheel_accumulated_ = 0; ///< Wheel notches not yet turned into a scroll step.
     int visible_white_keys_ = 14;
     int octave_offset_ = -1;
     std::optional<int> fixed_velocity_ = 100;

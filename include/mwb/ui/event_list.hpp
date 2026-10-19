@@ -20,7 +20,9 @@ class DocumentController;
 
 /// Flattened, virtualized view of every event of the active sequence (section 11.3): absolute
 /// tick, delta, musical position, track, channel, type, decoded data, raw payload and warnings.
-/// Rows refer to events by (track index, event index) and are rebuilt per document generation.
+/// Rows refer to events by (track index, event index) plus the event identity, and are rebuilt
+/// shortly after each edit. Until then a row whose position no longer holds its event reads as
+/// empty and refuses edits, so a row can never show or change a different event (uiB-17).
 class EventTableModel : public QAbstractTableModel {
     Q_OBJECT
 
@@ -52,6 +54,7 @@ private:
     struct Row {
         std::uint32_t track = 0;
         std::uint32_t event = 0;
+        EventId id; ///< The event the row was built for (checked on every access).
     };
     DocumentController& controller_;
     std::vector<Row> rows_;

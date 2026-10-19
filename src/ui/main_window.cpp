@@ -79,10 +79,8 @@ namespace {
 
 constexpr int layout_schema_version = 2; // 2: toolbar and default dock sizes of the UI redesign
 
-/// Snap values offered on the toolbar (the inspector offers the full list).
-const std::pair<const char*, const char*> toolbar_snaps[] = {{"1/4", "1/4"}, {"1/8", "1/8"}, {"1/16", "1/16"},
-                                                             {"1/32", "1/32"}, {"1/12", "1/8 triplet"},
-                                                             {"1/24", "1/16 triplet"}};
+/// Item data of the toolbar Snap combo's "Off" entry (a view setting, not a grid).
+constexpr const char* snap_off_value = "off";
 
 std::filesystem::path to_path(const QString& text) { return std::filesystem::path(text.toStdWString()); }
 
@@ -570,6 +568,10 @@ void MainWindow::build_actions() {
     loop_action_ = add_command("transport.loop", tr("Loop"), QKeySequence(Qt::Key_L), [this] { publish_playback(); });
     loop_action_->setCheckable(true);
     loop_action_->setChecked(true);
+    add_command("transport.loop_selection", tr("Loop Selection"), QKeySequence(Qt::CTRL | Qt::Key_L), [this] {
+        if (auto* tab = current_tab())
+            tab->loop_selection(); // the grid-aligned extent of the selected notes (ux-editing-9)
+    });
     loop_action_->setProperty("mwb_keep_tooltip", true);
     metronome_action_ = add_command("transport.metronome", tr("Metronome"), QKeySequence(Qt::Key_K), [this] {
         playback_->set_metronome(metronome_action_->isChecked());
@@ -766,6 +768,30 @@ void MainWindow::build_menus() {
         colors_group->addAction(action);
         colors_menu->addAction(action);
     }
+    // Snap mode (section 7.3: absolute and relative are named and selectable) and Off.
+    snap_off_action_ = add_command("view.snap_off", tr("Snap Off"), QKeySequence(Qt::CTRL | Qt::Key_4),
+                                   [this] { set_snap_off(snap_off_action_->isChecked()); });
+    snap_off_action_->setCheckable(true);
+    snap_relative_action_ = add_command("view.snap_relative", tr("Relative Snap (keep offsets from the grid)"), {}, [this] {
+        snap_relative_ = snap_relative_action_->isChecked();
+        QSettings().setValue("editor/snap_relative", snap_relative_);
+        apply_snap_mode();
+    });
+    snap_relative_action_->setCheckable(true);
+    snap_relative_ = QSettings().value("editor/snap_relative", false).toBool();
+    snap_relative_action_->setChecked(snap_relative_);
+    view->addSeparator();
+    view->addAction(snap_off_action_);
+    view->addAction(snap_relative_action_);
+    follow_action_ = add_command("view.follow_playhead", tr("Follow Playhead"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_F), [this] {
+        QSettings().setValue("editor/follow_playhead", follow_action_->isChecked());
+        for (int index = 0; index < tabs_->count(); ++index)
+            if (auto* tab = qobject_cast<EditorTab*>(tabs_->widget(index)))
+                tab->set_follow_playhead(follow_action_->isChecked());
+    });
+    follow_action_->setCheckable(true);
+    follow_action_->setChecked(QSettings().value("editor/follow_playhead", true).toBool());
+    view->addAction(follow_action_);
     keyboard_action_ = add_command("view.onscreen_keyboard", tr("On-screen &Keyboard"), {}, [] {});
     keyboard_action_->setCheckable(true);
     view->addAction(keyboard_action_);
@@ -781,7 +807,7 @@ void MainWindow::build_menus() {
     add(menuBar()->addMenu(tr("T&ransport")), {"transport.play_stop", "transport.pause_resume", "transport.play_selection",
                                                 "transport.stop", "transport.go_to_start", "transport.go_to_end",
                                                 "transport.position_left", "transport.position_right",
-                                                nullptr, "transport.loop", "transport.metronome",
+                                                nullptr, "transport.loop", "transport.loop_selection", "transport.metronome",
                                                 nullptr, "transport.record", "transport.count_in_0", "transport.count_in_1",
                                                 "transport.count_in_2", "transport.input_latency", "transport.midi_input", nullptr,
                                                 "transport.audio_output", "transport.reconnect_audio", nullptr,
@@ -881,14 +907,24 @@ void MainWindow::build_toolbar() {
     snap_combo_ = new QComboBox(this);
     snap_combo_->setAccessibleName(tr("Snap"));
     snap_combo_->setToolTip(tr("Grid used for drawing, moving and resizing notes"));
-    for (const auto& [value, label] : toolbar_snaps)
-        snap_combo_->addItem(tr(label), QString::fromLatin1(value));
+    // The same grids as the Inspector (ux-editing-14), then Off; a custom snap from a file is
+    // added as its own item by update_command_state.
+    for (const auto& choice : snap_choices())
+        snap_combo_->addItem(tr(choice.label), QString::fromLatin1(choice.value));
+    snap_combo_->insertSeparator(snap_combo_->count());
+    snap_combo_->addItem(tr("Off"), QString::fromLatin1(snap_off_value));
     snap_combo_->setMinimumWidth(96);
     transport_bar_->addWidget(snap_combo_);
     connect(snap_combo_, &QComboBox::activated, this, [this] {
         auto* tab = current_tab();
         if (!tab || updating_toolbar_)
             return;
+        if (snap_combo_->currentData().toString() == QLatin1String(snap_off_value)) {
+            set_snap_off(true);
+            tab->piano_roll().setFocus();
+            return;
+        }
+        set_snap_off(false);
         const auto snap = Rational::parse(snap_combo_->currentData().toString().toStdString());
         if (!snap)
             return;
@@ -1173,6 +1209,10 @@ void MainWindow::connect_tab(EditorTab* tab) {
             [this](const QString& message) { statusBar()->showMessage(message, 8000); });
     connect(&view, &PianoRollView::status_message, this, [this](const QString& text) { statusBar()->showMessage(text, 4000); });
     connect(&view, &PianoRollView::tool_changed, this, &MainWindow::update_command_state);
+    // A new tab takes the window's view settings (follow, snap mode).
+    if (follow_action_)
+        tab->set_follow_playhead(follow_action_->isChecked());
+    view.set_snap_mode(snap_off_ ? SnapMode::off : snap_relative_ ? SnapMode::relative : SnapMode::absolute);
     connect(&view, &PianoRollView::seek_requested, this, [this, tab](Tick tick) {
         // A ruler click moves playback too, as in a DAW (ux-editing-8); never while recording.
         const auto display = playback_->display();
@@ -1245,9 +1285,20 @@ void MainWindow::update_command_state() {
         updating_toolbar_ = true;
         for (auto* action : tool_group_->actions())
             action->setChecked(action->property("mwb_tool").toInt() == static_cast<int>(tab->piano_roll().tool()));
-        const auto snap_index = snap_combo_->findData(QString::fromStdString(tab->controller().active_sequence().settings.snap.to_string()));
-        if (snap_index >= 0)
-            snap_combo_->setCurrentIndex(snap_index);
+        // The combo always shows the grid in use: Off, a listed grid, or the document's own value
+        // as a "(custom)" item (ux-editing-14).
+        const QString snap_value = QString::fromStdString(tab->controller().active_sequence().settings.snap.to_string());
+        for (int index = snap_combo_->count() - 1; index >= 0; --index)
+            if (snap_combo_->itemData(index, Qt::UserRole + 1).toBool() &&
+                snap_combo_->itemData(index).toString() != snap_value)
+                snap_combo_->removeItem(index);
+        int snap_index = snap_combo_->findData(snap_off_ ? QString::fromLatin1(snap_off_value) : snap_value);
+        if (snap_index < 0) {
+            snap_combo_->insertItem(0, tr("%1 (custom)").arg(snap_value), snap_value);
+            snap_combo_->setItemData(0, true, Qt::UserRole + 1);
+            snap_index = 0;
+        }
+        snap_combo_->setCurrentIndex(snap_index);
         updating_toolbar_ = false;
         const bool has_loop = tab->controller().active_sequence().settings.loop_region.has_value();
         loop_action_->setEnabled(has_loop);
@@ -1256,8 +1307,11 @@ void MainWindow::update_command_state() {
         const auto count = tab->controller().selection().size();
         selection_label_->setText(count == 0 ? tr("Nothing selected") : tr("%n note(s) selected", nullptr, static_cast<int>(count)));
         const auto grid = tab->piano_roll().grid();
-        snap_label_->setText(tr("Snap %1%2").arg(QString::fromStdString(grid.fraction.to_string()))
-                                 .arg(grid.exact ? QString() : tr(" (rounded to project ticks)")));
+        snap_label_->setText(snap_off_ ? tr("Snap off")
+                                       : tr("Snap %1%2%3")
+                                             .arg(QString::fromStdString(grid.fraction.to_string()))
+                                             .arg(snap_relative_ ? tr(" relative") : QString())
+                                             .arg(grid.exact ? QString() : tr(" (rounded to project ticks)")));
         const auto& sequence = tab->controller().active_sequence();
         if (auto scale = music::Scale::custom(sequence.root_pc, sequence.scale_mask))
             tab->keyboard().set_scale(sequence.root_pc, scale->absolute_pitch_class_mask(), sequence.settings.highlight_scale);
@@ -1601,7 +1655,9 @@ void MainWindow::transpose_selection(int semitones) {
     music::MoveParameters parameters;
     parameters.semitones = semitones;
     parameters.range_policy = music::RangePolicy::constrain; // constrain the whole displacement (section 7.3)
-    auto preview = music::move_notes(controller.document(), selection, parameters);
+    // The controller's cached pairing of the active sequence: a key press does not re-pair the
+    // whole sequence (code-core-2).
+    auto preview = music::move_notes(controller.document(), selection, parameters, &controller.notes());
     if (preview)
         controller.apply(preview->changes);
     else
@@ -1622,7 +1678,7 @@ void MainWindow::transpose_selection_by_degree(int degrees) {
     parameters.scale_root = sequence.root_pc;
     parameters.scale_mask = sequence.scale_mask;
     parameters.exclude_drums = false;
-    auto preview = music::transpose(controller.document(), selection, parameters);
+    auto preview = music::transpose(controller.document(), selection, parameters, &controller.notes());
     if (!preview) {
         statusBar()->showMessage(QString::fromStdString(preview.error().message), 5000);
         return;
@@ -1731,7 +1787,7 @@ void MainWindow::move_selection_by_grid(int direction) {
                                      std::vector<EventId>(controller.selection().begin(), controller.selection().end()), {}};
     music::MoveParameters parameters;
     parameters.ticks = direction * std::max<Tick>(1, tab->piano_roll().grid().point(1));
-    auto preview = music::move_notes(controller.document(), selection, parameters);
+    auto preview = music::move_notes(controller.document(), selection, parameters, &controller.notes());
     if (preview)
         controller.apply(preview->changes);
 }
@@ -1804,6 +1860,52 @@ void MainWindow::publish_playback() {
     playback_->set_loop(loop);
     playback_->publish_document(transport_owner_->document(), transport_owner_->active_sequence_index(),
                                 transport_owner_->generation());
+}
+
+void MainWindow::set_snap_off(bool off) {
+    snap_off_ = off;
+    snap_off_action_->setChecked(off);
+    apply_snap_mode();
+    update_command_state();
+}
+
+void MainWindow::apply_snap_mode() {
+    const SnapMode mode = snap_off_ ? SnapMode::off : snap_relative_ ? SnapMode::relative : SnapMode::absolute;
+    for (int index = 0; index < tabs_->count(); ++index)
+        if (auto* tab = qobject_cast<EditorTab*>(tabs_->widget(index)))
+            tab->piano_roll().set_snap_mode(mode);
+}
+
+void MainWindow::update_sounding_notes(EditorTab& tab, std::optional<Tick> position) {
+    // Notes under the playhead on audible tracks light up in the roll and on the keyboard
+    // (spec 7.1 "currently sounding", ux-editing-24).
+    std::set<int> sounding;
+    if (position) {
+        const auto& sequence = tab.controller().active_sequence();
+        bool any_solo = false;
+        for (const auto& track : sequence.tracks)
+            any_solo = any_solo || track.solo;
+        const auto& notes = tab.controller().notes().notes;
+        for (const std::size_t index : tab.controller().note_index().query(TimeRange{*position, *position + 1})) {
+            if (index >= notes.size() || sequence.tracks.empty())
+                continue;
+            const auto& note = notes[index];
+            const auto& track = sequence.tracks[std::min<std::size_t>(note.on_track, sequence.tracks.size() - 1)];
+            if (!track.muted && (!any_solo || track.solo))
+                sounding.insert(note.pitch);
+        }
+    }
+    auto& previous = sounding_by_tab_[&tab];
+    if (previous == sounding)
+        return;
+    for (const int pitch : previous)
+        if (!sounding.contains(pitch))
+            tab.keyboard().set_key_state(pitch, KeySource::playback, false);
+    for (const int pitch : sounding)
+        if (!previous.contains(pitch))
+            tab.keyboard().set_key_state(pitch, KeySource::playback, true);
+    tab.piano_roll().set_sounding_pitches(sounding);
+    previous = std::move(sounding);
 }
 
 Tick MainWindow::tempo_position(EditorTab& tab) const {
@@ -2000,11 +2102,18 @@ void MainWindow::update_status_from_transport() {
                                         ? tr("Playing the version before your latest edit; it updates in a moment")
                                         : tr("Transport position (bar.beat.tick), tempo, meter and state"));
         for (int index = 0; index < tabs_->count(); ++index)
-            if (auto* tab = qobject_cast<EditorTab*>(tabs_->widget(index)))
-                tab->piano_roll().set_playhead(&tab->controller() == transport_owner_ &&
-                                                       display.state != TransportDisplay::State::stopped
-                                                   ? std::optional<Tick>(display.position)
-                                                   : std::nullopt);
+            if (auto* tab = qobject_cast<EditorTab*>(tabs_->widget(index))) {
+                const bool owner = &tab->controller() == transport_owner_;
+                const bool shown = owner && display.state != TransportDisplay::State::stopped &&
+                                   display.state != TransportDisplay::State::device_lost;
+                // Piano roll and drum grid both draw (and follow) the playhead (C1).
+                tab->set_playhead(shown ? std::optional<Tick>(display.position) : std::nullopt);
+                update_sounding_notes(*tab, shown && display.state != TransportDisplay::State::paused
+                                                ? std::optional<Tick>(display.position)
+                                                : std::nullopt);
+            }
+        // Forget closed tabs (their address may be reused by a new tab).
+        std::erase_if(sounding_by_tab_, [this](const auto& entry) { return tabs_->indexOf(entry.first) < 0; });
     }
     if (auto* tab = current_tab(); tab && tempo_field_) {
         const bool ppq = tab->controller().active_sequence().division.is_ppq();

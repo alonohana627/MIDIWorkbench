@@ -481,8 +481,8 @@ QString PianoRollView::empty_hint() const {
         first << tr("Press %1 (Draw) and click to add notes").arg(draw);
     else
         first << tr("Double-click to add notes");
-    if (const QString play = shortcut("transport.play_pause"); !play.isEmpty())
-        first << tr("%1 plays").arg(play);
+    if (const QString play = shortcut("transport.play_stop"); !play.isEmpty())
+        first << tr("%1 plays and stops").arg(play);
     if (const QString open = shortcut("file.open"); !open.isEmpty())
         second << tr("%1 opens a MIDI file").arg(open);
     second << tr("drop .mid files here");

@@ -17,6 +17,7 @@
 #include <vector>
 #include <memory>
 #include <optional>
+#include <set>
 
 class QAction;
 class QDockWidget;
@@ -154,6 +155,10 @@ private:
     /// the rolling transport, otherwise the edit cursor.
     [[nodiscard]] Tick tempo_position(EditorTab& tab) const;
     void commit_tempo(double bpm);
+    void set_snap_off(bool off);
+    /// Off, relative or absolute snapping on every tab (a view setting, not part of the document).
+    void apply_snap_mode();
+    void update_sounding_notes(EditorTab& tab, std::optional<Tick> position);
     void write_screenshot_and_exit();
 
     StartupOptions options_;
@@ -206,6 +211,12 @@ private:
     /// activates it when it is a button or a check cell, a mouse-focused control leaves Space to Play.
     QPointer<QWidget> keyboard_focus_;
     QLabel* step_label_ = nullptr; ///< "STEP" while step recording is armed.
+    QAction* snap_off_action_ = nullptr;
+    QAction* snap_relative_action_ = nullptr;
+    QAction* follow_action_ = nullptr;
+    bool snap_off_ = false;
+    bool snap_relative_ = false;
+    std::map<EditorTab*, std::set<int>> sounding_by_tab_; ///< Pitches lit by playback per tab.
     std::chrono::steady_clock::time_point clip_until_{}; ///< "! CLIP" stays visible until then.
     bool audio_was_lost_ = false;
     std::chrono::steady_clock::time_point position_key_down_{};

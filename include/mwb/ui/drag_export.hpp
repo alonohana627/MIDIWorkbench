@@ -4,6 +4,7 @@
 #include "mwb/core/model.hpp"
 #include "mwb/midi/codec.hpp"
 
+#include <QPointer>
 #include <QWidget>
 
 #include <filesystem>
@@ -26,6 +27,11 @@ void clean_drag_cache(const std::filesystem::path& cache);
 /// Starts a Windows file drag (OLE file drop through Qt) of an existing file.
 void start_file_drag(QWidget* source, const std::filesystem::path& file);
 
+/// What "Drag MIDI" exports: the active sequence for a compatibility (canonical type 1) file, or,
+/// with notes selected, exactly those notes (and the active track's controller state) in their
+/// time span. `title` receives the file title.
+[[nodiscard]] midi::ExportOptions drag_export_options(const DocumentController& controller, std::string* title);
+
 /// Toolbar handle that drags the active document, or its selected notes, out as a .mid file to a
 /// DAW or Explorer.
 class DragHandle : public QWidget {
@@ -47,7 +53,7 @@ protected:
 
 private:
     std::filesystem::path cache_;
-    DocumentController* controller_ = nullptr;
+    QPointer<DocumentController> controller_; ///< Cleared if the document closes first (uiB-39).
     QPoint press_;
     bool pressed_ = false;
 };

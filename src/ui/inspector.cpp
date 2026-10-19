@@ -7,6 +7,7 @@
 #include "mwb/music/transform.hpp"
 #include "mwb/platform/midi_backend.hpp"
 #include "mwb/ui/document_controller.hpp"
+#include "mwb/ui/editor_math.hpp"
 
 #include <QAbstractButton>
 #include <QCheckBox>
@@ -22,6 +23,7 @@
 #include <QScrollArea>
 #include <QSettings>
 #include <QSpinBox>
+#include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -42,12 +44,6 @@ constexpr ToolEntry tool_entries[] = {
     {"euclidean", "Euclidean rhythm"},  {"remove_duplicates", "Remove duplicates"},
     {"resolve_overlaps", "Resolve overlaps"}, {"join", "Join notes"},    {"conform_to_scale", "Conform to scale"},
 };
-
-const char* const snap_values[] = {"1/1", "1/2", "1/4", "1/8", "1/16", "1/32", "1/64", "1/128",
-                                   "1/6", "1/12", "1/24", "1/48", "3/8", "3/16", "3/32", "1/20", "1/28"};
-const char* const snap_labels[] = {"1/1", "1/2", "1/4", "1/8", "1/16", "1/32", "1/64", "1/128",
-                                   "1/4 triplet", "1/8 triplet", "1/16 triplet", "1/32 triplet",
-                                   "Dotted 1/4", "Dotted 1/8", "Dotted 1/16", "1/16 quintuplet", "1/16 septuplet"};
 
 const char* const presets[] = {"classic", "saw-pad", "square-lead", "electric-piano", "bass"};
 
@@ -184,6 +180,20 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     selection_form->addRow(tr("Chord"), chord_label_);
     for (auto* box : {start_, length_, pitch_, velocity_, channel_})
         connect(box, &QSpinBox::editingFinished, this, &InspectorPanel::apply_note_fields);
+    // Length and velocity of notes drawn, double-clicked or step-entered (ux-editing-11).
+    auto* new_form = new QFormLayout;
+    new_length_ = new QComboBox(selection_box);
+    for (const auto& choice : snap_choices())
+        new_length_->addItem(tr(choice.label), QString::fromLatin1(choice.value));
+    new_length_->setToolTip(tr("Length of new notes (drawing, double-click, Return and step recording)"));
+    new_velocity_ = spin(1, 127, 100, selection_box);
+    new_velocity_->setKeyboardTracking(false);
+    new_velocity_->setToolTip(tr("Velocity of new notes"));
+    new_form->addRow(tr("New note length"), new_length_);
+    new_form->addRow(tr("New note velocity"), new_velocity_);
+    selection_column->addLayout(new_form);
+    connect(new_length_, &QComboBox::activated, this, &InspectorPanel::apply_new_note_defaults);
+    connect(new_velocity_, &QSpinBox::editingFinished, this, &InspectorPanel::apply_new_note_defaults);
     column->addWidget(selection_box);
 
     // --- Song -----------------------------------------------------------------------------------
@@ -195,7 +205,7 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     song_tempo_->setSuffix(tr(" BPM"));
     song_tempo_->setKeyboardTracking(false);
     song_tempo_->setToolTip(tr("Tempo at the start of the song (writes a tempo event at bar 1)"));
-    song_numerator_ = spin(1, 32, 4, song_box);
+    song_numerator_ = spin(1, 255, 4, song_box);
     song_numerator_->setKeyboardTracking(false);
     song_denominator_ = new QComboBox(song_box);
     for (const int denominator : {1, 2, 4, 8, 16, 32})
@@ -212,10 +222,24 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     song_form->addRow(tr("Tempo"), song_tempo_);
     song_form->addRow(tr("Meter"), meter_row);
     song_form->addRow(tr("Loop length"), song_loop_bars_);
-    connect(song_tempo_, &QDoubleSpinBox::valueChanged, this, &InspectorPanel::apply_song_fields);
-    connect(song_numerator_, &QSpinBox::valueChanged, this, &InspectorPanel::apply_song_fields);
-    connect(song_denominator_, &QComboBox::activated, this, &InspectorPanel::apply_song_fields);
-    connect(song_loop_bars_, &QSpinBox::valueChanged, this, &InspectorPanel::apply_song_fields);
+    // Typing commits on Enter or focus loss; arrow and wheel steps commit once they pause, so a
+    // burst of steps is one edit (uiB-15). Each field writes only itself (uiB-16).
+    song_commit_ = new QTimer(this);
+    song_commit_->setSingleShot(true);
+    song_commit_->setInterval(400);
+    connect(song_commit_, &QTimer::timeout, this, &InspectorPanel::apply_song_fields);
+    for (QAbstractSpinBox* box : std::initializer_list<QAbstractSpinBox*>{song_tempo_, song_numerator_, song_loop_bars_})
+        connect(box, &QAbstractSpinBox::editingFinished, this, &InspectorPanel::apply_song_fields);
+    connect(song_tempo_, &QDoubleSpinBox::valueChanged, this, [this] {
+        if (!updating_)
+            song_commit_->start();
+    });
+    for (QSpinBox* box : {song_numerator_, song_loop_bars_})
+        connect(box, &QSpinBox::valueChanged, this, [this] {
+            if (!updating_)
+                song_commit_->start();
+        });
+    connect(song_denominator_, &QComboBox::activated, this, &InspectorPanel::apply_meter);
     column->addWidget(song_box);
 
     // --- Track ----------------------------------------------------------------------------------
@@ -284,8 +308,8 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     input_policy_->addItems({tr("Allow all input"), tr("Reject out-of-scale input"), tr("Nearest scale member"),
                              tr("Diatonic keyboard map")});
     snap_ = new QComboBox(scale_box);
-    for (std::size_t index = 0; index < std::size(snap_values); ++index)
-        snap_->addItem(tr(snap_labels[index]), QString::fromLatin1(snap_values[index]));
+    for (const auto& choice : snap_choices()) // one list for the toolbar and the inspector
+        snap_->addItem(tr(choice.label), QString::fromLatin1(choice.value));
     scale_form->addRow(tr("Root"), scale_root_);
     scale_form->addRow(tr("Scale"), scale_type_);
     scale_form->addRow(highlight_);
@@ -338,8 +362,8 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     strength_->setSuffix(" %");
     seed_ = spin(0, INT32_MAX, 1, transform_box);
     grid_ = new QComboBox(transform_box);
-    for (std::size_t index = 0; index < std::size(snap_values); ++index)
-        grid_->addItem(tr(snap_labels[index]), QString::fromLatin1(snap_values[index]));
+    for (const auto& choice : snap_choices())
+        grid_->addItem(tr(choice.label), QString::fromLatin1(choice.value));
     grid_->setCurrentIndex(4);
     parameters_ = new QPlainTextEdit(transform_box);
     parameters_->setAccessibleName(tr("Tool parameters (JSON)"));
@@ -462,9 +486,19 @@ void InspectorPanel::refresh() {
     {
         const auto& meter = controller_->meter_map();
         const auto& segment = meter.segment_at(0);
+        song_commit_->stop(); // the document changed: nothing typed earlier is pending any more
         song_tempo_->setValue(60'000'000.0 / static_cast<double>(controller_->tempo_map().tempo_at(0)));
+        shown_tempo_ = song_tempo_->value();
         song_numerator_->setValue(segment.numerator);
-        song_denominator_->setCurrentIndex(std::max(0, song_denominator_->findData(segment.denominator)));
+        shown_numerator_ = song_numerator_->value();
+        // A denominator the list does not offer (x/64, ...) is shown and kept, not rewritten.
+        int denominator_index = song_denominator_->findData(segment.denominator);
+        if (denominator_index < 0) {
+            song_denominator_->addItem(QString::number(segment.denominator), segment.denominator);
+            denominator_index = song_denominator_->count() - 1;
+        }
+        song_denominator_->setCurrentIndex(denominator_index);
+        shown_denominator_ = segment.denominator;
         Tick loop_length = 0;
         if (sequence.settings.loop_region)
             for (const auto& region : sequence.regions)
@@ -472,6 +506,16 @@ void InspectorPanel::refresh() {
                     loop_length = region.end_tick - region.start_tick;
         const Tick bar = std::max<Tick>(1, meter.ticks_per_bar(segment));
         song_loop_bars_->setValue(static_cast<int>(std::clamp<Tick>((loop_length + bar - 1) / bar, 0, 999)));
+        shown_loop_bars_ = song_loop_bars_->value();
+        const int length_index = new_length_->findData(QString::fromStdString(sequence.settings.default_note_length.to_string()));
+        if (length_index >= 0) {
+            new_length_->setCurrentIndex(length_index);
+        } else {
+            new_length_->addItem(tr("%1 (custom)").arg(QString::fromStdString(sequence.settings.default_note_length.to_string())),
+                                 QString::fromStdString(sequence.settings.default_note_length.to_string()));
+            new_length_->setCurrentIndex(new_length_->count() - 1);
+        }
+        new_velocity_->setValue(sequence.settings.default_velocity);
         const bool ppq = sequence.division.is_ppq();
         for (QWidget* widget : std::initializer_list<QWidget*>{song_tempo_, song_numerator_, song_denominator_, song_loop_bars_})
             widget->setEnabled(ppq);
@@ -490,9 +534,15 @@ void InspectorPanel::refresh() {
     highlight_->setChecked(sequence.settings.highlight_scale);
     fold_->setChecked(sequence.settings.fold_to_scale);
     input_policy_->setCurrentIndex(static_cast<int>(sequence.settings.input_policy));
-    const auto snap_index = snap_->findData(QString::fromStdString(sequence.settings.snap.to_string()));
-    if (snap_index >= 0)
-        snap_->setCurrentIndex(snap_index);
+    // A snap the list does not offer (from a file or the toolbar) is shown as itself, so writing
+    // the scale never replaces it with a stale choice (uiB-34).
+    const QString snap_value = QString::fromStdString(sequence.settings.snap.to_string());
+    int snap_index = snap_->findData(snap_value);
+    if (snap_index < 0) {
+        snap_->addItem(tr("%1 (custom)").arg(snap_value), snap_value);
+        snap_index = snap_->count() - 1;
+    }
+    snap_->setCurrentIndex(snap_index);
     if (const auto active = controller_->active_track_index()) {
         const auto& track = sequence.tracks[*active];
         track_name_->setText(QString::fromStdString(track.name));
@@ -630,38 +680,80 @@ void InspectorPanel::apply_track_fields() {
 }
 
 void InspectorPanel::apply_song_fields() {
+    song_commit_->stop();
+    if (updating_ || !controller_ || !controller_->active_sequence().division.is_ppq())
+        return;
+    // Each field writes only itself and only when it differs from what was shown (uiB-16).
+    if (song_tempo_->value() != shown_tempo_)
+        apply_tempo();
+    if (song_numerator_->value() != shown_numerator_)
+        apply_meter();
+    if (song_loop_bars_->value() != shown_loop_bars_)
+        apply_loop();
+}
+
+void InspectorPanel::apply_tempo() {
+    if (updating_ || !controller_)
+        return;
+    shown_tempo_ = song_tempo_->value();
+    // The tempo at the start of the song: the same rule as the toolbar BPM field.
+    controller_->set_tempo_at(0, song_tempo_->value());
+}
+
+void InspectorPanel::apply_meter() {
     if (updating_ || !controller_ || !controller_->active_sequence().division.is_ppq())
         return;
     const auto& sequence = controller_->active_sequence();
-    const auto tempo = static_cast<std::uint32_t>(std::llround(60'000'000.0 / song_tempo_->value()));
-    const auto numerator = static_cast<std::uint8_t>(song_numerator_->value());
+    const int numerator = song_numerator_->value();
     const int denominator = song_denominator_->currentData().toInt();
+    if (numerator == shown_numerator_ && denominator == shown_denominator_)
+        return;
+    shown_numerator_ = numerator;
+    shown_denominator_ = denominator;
     std::uint8_t power = 0;
-    while ((1 << power) < denominator)
+    while ((1 << power) < denominator && power < 7)
         ++power;
-    ChangeBuilder builder(controller_->document(), "Edit tempo, meter or loop");
-    // Replace the tempo and time signature in effect at bar 1, or add them to the first track.
-    const auto replace_or_insert = [&](std::uint8_t type, const Event& replacement) {
-        for (const auto& track : sequence.tracks)
-            for (const auto& event : track.events) {
-                if (event.tick > 0)
-                    break;
-                if (event.is_meta(type)) {
-                    if (!(event.payload == replacement.payload)) {
-                        Event updated = event;
-                        updated.payload = replacement.payload;
-                        builder.replace(track.id, event.id, updated);
-                    }
-                    return;
-                }
-            }
-        if (!sequence.tracks.empty())
-            std::ignore = builder.insert(sequence.tracks.front().id, replacement, OrderPlacement::before_existing);
-    };
-    replace_or_insert(meta_type::tempo, events::tempo(0, tempo));
-    replace_or_insert(meta_type::time_signature, events::time_signature(0, numerator, power));
-    // Loop length in bars of the new meter, from the loop start (a loop region is created if none).
-    const Tick bar = std::max<Tick>(1, static_cast<Tick>(numerator) * 4 * sequence.division.ppq / denominator);
+    ChangeBuilder builder(controller_->document(), "Edit meter");
+    // Only the numerator and denominator bytes of the bar-1 time signature change; its clock and
+    // 32nd-note bytes are kept. Without one, it is added to the first track.
+    bool found = false;
+    for (const auto& track : sequence.tracks) {
+        for (const auto& event : track.events) {
+            if (event.tick > 0)
+                break;
+            if (!event.is_meta(meta_type::time_signature))
+                continue;
+            auto bytes = std::vector<std::uint8_t>(event.payload.bytes().begin(), event.payload.bytes().end());
+            if (bytes.size() < 2)
+                break;
+            bytes[0] = static_cast<std::uint8_t>(numerator);
+            bytes[1] = power;
+            Event updated = event;
+            updated.payload = Payload(bytes);
+            if (!(updated.payload == event.payload))
+                builder.replace(track.id, event.id, updated);
+            found = true;
+            break;
+        }
+        if (found)
+            break;
+    }
+    if (!found && !sequence.tracks.empty())
+        std::ignore = builder.insert(sequence.tracks.front().id,
+                                     events::time_signature(0, static_cast<std::uint8_t>(numerator), power),
+                                     OrderPlacement::before_existing);
+    auto changes = builder.finish();
+    if (!changes.empty())
+        controller_->apply(changes);
+}
+
+void InspectorPanel::apply_loop() {
+    if (updating_ || !controller_ || !controller_->active_sequence().division.is_ppq())
+        return;
+    const auto& sequence = controller_->active_sequence();
+    shown_loop_bars_ = song_loop_bars_->value();
+    // Loop length in bars of the meter at bar 1, from the loop start (a loop region is created if none).
+    const Tick bar = std::max<Tick>(1, controller_->meter_map().ticks_per_bar(controller_->meter_map().segment_at(0)));
     const Tick length = bar * song_loop_bars_->value();
     Sequence updated = sequence_header(sequence); // properties only, no events
     bool found = false;
@@ -692,10 +784,26 @@ void InspectorPanel::apply_song_fields() {
         updated.settings.loop_region = loop.id;
         updated.regions.push_back(std::move(loop));
     }
+    ChangeBuilder builder(controller_->document(), "Edit loop length");
     builder.set_sequence_properties(sequence.id, updated);
     auto changes = builder.finish();
     if (!changes.empty())
         controller_->apply(changes);
+}
+
+void InspectorPanel::apply_new_note_defaults() {
+    if (updating_ || !controller_)
+        return;
+    const auto& sequence = controller_->active_sequence();
+    Sequence updated = sequence_header(sequence); // properties only, no events
+    if (auto length = Rational::parse(new_length_->currentData().toString().toStdString()))
+        updated.settings.default_note_length = *length;
+    updated.settings.default_velocity = static_cast<std::uint8_t>(new_velocity_->value());
+    if (updated.settings == sequence.settings)
+        return;
+    ChangeBuilder builder(controller_->document(), "Change new-note length or velocity");
+    builder.set_sequence_properties(sequence.id, updated);
+    controller_->apply(builder.finish()); // a setting, no event changes
 }
 
 void InspectorPanel::apply_scale_fields() {

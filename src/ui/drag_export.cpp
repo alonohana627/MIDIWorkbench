@@ -105,6 +105,32 @@ void DragHandle::paintEvent(QPaintEvent*) {
     painter.drawText(rect(), Qt::AlignCenter, tr("⇲ Drag MIDI"));
 }
 
+midi::ExportOptions drag_export_options(const DocumentController& controller, std::string* title) {
+    midi::ExportOptions options;
+    options.mode = midi::ExportMode::compatibility; // canonical type 1 for DAWs
+    options.sequence = controller.active_sequence_index();
+    const auto selected = controller.selected_notes();
+    if (title)
+        *title = controller.document().title;
+    if (!selected.empty()) {
+        Tick begin = selected.front().start;
+        Tick end = selected.front().end;
+        for (const auto& note : selected) {
+            begin = std::min(begin, note.start);
+            end = std::max(end, note.end);
+        }
+        options.range = TimeRange{begin, std::max(end, begin + 1)};
+        options.tracks = {controller.active_track()};
+        // Exactly the selected notes, not every note of the track in that time span (uiB-18).
+        options.notes.reserve(selected.size());
+        for (const auto& note : selected)
+            options.notes.push_back(note.on_id);
+        if (title)
+            *title += " selection";
+    }
+    return options;
+}
+
 void DragHandle::mousePressEvent(QMouseEvent* event) {
     pressed_ = event->button() == Qt::LeftButton;
     press_ = event->position().toPoint();
@@ -114,22 +140,8 @@ void DragHandle::mouseMoveEvent(QMouseEvent* event) {
     if (!pressed_ || !controller_ || (event->position().toPoint() - press_).manhattanLength() < QApplication::startDragDistance())
         return;
     pressed_ = false;
-    midi::ExportOptions options;
-    options.mode = midi::ExportMode::compatibility; // canonical type 1 for DAWs
-    options.sequence = controller_->active_sequence_index();
-    const auto selected = controller_->selected_notes();
-    std::string title = controller_->document().title;
-    if (!selected.empty()) {
-        Tick begin = selected.front().start;
-        Tick end = selected.front().end;
-        for (const auto& note : selected) {
-            begin = std::min(begin, note.start);
-            end = std::max(end, note.end);
-        }
-        options.range = TimeRange{begin, std::max(end, begin + 1)};
-        options.tracks = {controller_->active_track()};
-        title += " selection";
-    }
+    std::string title;
+    const midi::ExportOptions options = drag_export_options(*controller_, &title);
     auto bytes = midi::export_midi(controller_->document(), options);
     if (!bytes) {
         emit status_message(QString::fromStdString(bytes.error().describe()));

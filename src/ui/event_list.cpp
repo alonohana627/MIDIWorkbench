@@ -125,7 +125,7 @@ void EventTableModel::rebuild() {
     rows_.reserve(total);
     for (std::uint32_t track = 0; track < sequence.tracks.size(); ++track)
         for (std::uint32_t event = 0; event < sequence.tracks[track].events.size(); ++event)
-            rows_.push_back(Row{track, event});
+            rows_.push_back(Row{track, event, sequence.tracks[track].events[event].id});
     // Merged stable order (tick, track, order key), the same order pairing and playback use.
     std::stable_sort(rows_.begin(), rows_.end(), [&](const Row& a, const Row& b) {
         const auto& left = sequence.tracks[a.track].events[a.event];
@@ -153,7 +153,10 @@ const Event* EventTableModel::event_at(int row) const {
     const auto& sequence = controller_.active_sequence();
     if (entry.track >= sequence.tracks.size() || entry.event >= sequence.tracks[entry.track].events.size())
         return nullptr;
-    return &sequence.tracks[entry.track].events[entry.event];
+    const Event& event = sequence.tracks[entry.track].events[entry.event];
+    // Between an edit and the (debounced) rebuild an index can point at another event: such a
+    // row is stale and reads as empty instead of showing or editing the wrong event.
+    return event.id == entry.id ? &event : nullptr;
 }
 
 TrackId EventTableModel::track_at(int row) const {

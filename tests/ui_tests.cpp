@@ -240,6 +240,40 @@ TEST_SUITE("controller") {
 }
 
 TEST_SUITE("piano_roll") {
+    TEST_CASE("Alt+wheel makes the piano rows taller or shorter around the row under the mouse") {
+        auto controller = make_controller();
+        PianoRollView view(*controller);
+        view.resize(800, 500);
+        view.show();
+        const auto alt_wheel = [&](QPoint delta, QPointF at) {
+            QWheelEvent event(at, view.mapToGlobal(at), QPoint(), delta, Qt::NoButton, Qt::AltModifier,
+                              Qt::NoScrollPhase, false);
+            QApplication::sendEvent(&view, &event);
+        };
+        const double start = view.mapping().row_height;
+        CHECK(start >= 16.0); // slightly larger default rows
+        const int anchor = 64;
+        const QPointF at(PianoRollView::keyboard_width + 200,
+                         PianoRollView::ruler_height + view.mapping().pitch_to_y(anchor) + start / 2);
+        const auto pitch_under = [&] {
+            return view.mapping().y_to_pitch(at.y() - PianoRollView::ruler_height);
+        };
+        REQUIRE(pitch_under() == anchor);
+        alt_wheel(QPoint(0, 120), at);
+        CHECK(view.mapping().row_height > start);
+        CHECK(std::abs(pitch_under() - anchor) <= 1);
+        // Windows reports Alt+wheel on the horizontal axis; it zooms the same way.
+        const double taller = view.mapping().row_height;
+        alt_wheel(QPoint(120, 0), at);
+        CHECK(view.mapping().row_height > taller);
+        alt_wheel(QPoint(0, -120), at);
+        alt_wheel(QPoint(0, -120), at);
+        alt_wheel(QPoint(0, -120), at);
+        CHECK(view.mapping().row_height < start);
+        CHECK(std::abs(pitch_under() - anchor) <= 1);
+        CHECK(controller->notes().notes.empty()); // zooming never edits
+    }
+
     TEST_CASE("double-click inserts one note and a body drag moves it as one undo entry") {
         auto controller = make_controller();
         PianoRollView view(*controller);

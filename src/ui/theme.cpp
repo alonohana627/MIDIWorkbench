@@ -380,7 +380,7 @@ RollColors roll_colors() {
     } else {
         colors = RollColors{QColor("#23252A"), QColor("#17181B"), QColor("#4A4E56"), QColor("#24262A"), QColor("#30333A"),
                             QColor("#50555E"), QColor("#6A707B"), accent, accent, QColor("#3FB37F"), QColor("#9AA0AA"),
-                            danger_color(), QColor("#C9CBD0"), QColor("#2B2D31"), QColor("#1B1C1F"), QColor("#1E1F22"),
+                            danger_color(), QColor("#E4E5E8"), QColor("#17181B"), QColor("#1B1C1F"), QColor("#1E1F22"),
                             QColor("#C9CBD0"), QColor("#8B8E96"), QColor("#FFFFFF"), QColor("#17181B"), true, false};
         colors.root_tint.setAlpha(56);
         colors.member_tint.setAlpha(22);

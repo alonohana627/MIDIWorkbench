@@ -134,7 +134,7 @@ PianoRollView::PianoRollView(DocumentController& controller, QWidget* parent)
     connect(&controller_, &DocumentController::edit_cursor_changed, this, qOverload<>(&QWidget::update));
     mapping_.ticks_per_pixel = 960.0 / 48.0; // one quarter note = 48 px
     mapping_.top_pitch = 72; // C4 sits mid-view in a fresh document
-    mapping_.row_height = 12.0;
+    mapping_.row_height = 16.0;
 }
 
 void PianoRollView::set_tool(EditTool tool) {
@@ -859,39 +859,54 @@ void PianoRollView::paint_drag_preview(QPainter& painter, const QRectF& area) {
 }
 
 void PianoRollView::paint_keyboard(QPainter& painter) {
+    // A label column with the octave names (C3, C4...) and a piano: every row is a white key, and
+    // black-key rows carry a solid black bar over the left part, as on a real keyboard.
     const QRectF gutter(0, ruler_height, keyboard_width, height() - ruler_height);
     painter.save();
     painter.setClipRect(gutter);
+    painter.fillRect(gutter, roll_colors().ruler_background);
     painter.translate(0, ruler_height);
     const auto& sequence = controller_.active_sequence();
     const RollColors colors = roll_colors();
+    const double key_left = keyboard_label_width;
+    const double key_width = keyboard_width - 1 - key_left;
+    const double black_width = std::round(key_width * 0.62);
+    const QColor sounding = palette().color(QPalette::Highlight);
+    QFont label_font = font();
+    label_font.setPointSizeF(std::clamp(mapping_.row_height * 0.55, 7.0, font().pointSizeF()));
+    painter.setFont(label_font);
     for (const int pitch : visible_rows(gutter.height())) {
-        const QRectF key(0, row_y(pitch), keyboard_width - 1, mapping_.row_height);
+        const double y = row_y(pitch);
+        const QRectF key(key_left, y, key_width, mapping_.row_height);
         const bool black = is_black_key(pitch);
-        QColor color = black ? colors.key_black : colors.key_white;
-        if (sounding_.contains(pitch) || (audition_pitch_ && *audition_pitch_ == pitch))
-            color = palette().color(QPalette::Highlight);
-        painter.fillRect(key, color);
-        // Divider in the opposite key color, so it reads on white keys in every theme.
-        painter.setPen(black ? colors.key_white : colors.key_black);
-        painter.drawLine(QPointF(key.left(), key.bottom() - 0.5), QPointF(key.right(), key.bottom() - 0.5)); // inside this key
+        const bool lit = sounding_.contains(pitch) || (audition_pitch_ && *audition_pitch_ == pitch);
+        painter.fillRect(key, lit && !black ? sounding : colors.key_white);
+        if (black)
+            painter.fillRect(QRectF(key_left, y, black_width, mapping_.row_height), lit ? sounding : colors.key_black);
+        // Key edges: a line under every row, drawn only on the white part so black bars stay solid.
+        painter.setPen(colors.high_contrast ? colors.key_black : colors.bar);
+        const double edge_left = black ? key_left + black_width : key_left;
+        painter.drawLine(QPointF(edge_left, y + mapping_.row_height - 0.5), QPointF(key.right(), y + mapping_.row_height - 0.5));
         if (sequence.settings.highlight_scale && in_scale(pitch)) {
             // Shape marker in addition to color: filled square for the root, dot for members.
             painter.setBrush(palette().color(QPalette::Highlight));
             painter.setPen(Qt::NoPen);
             const double size = std::min(6.0, mapping_.row_height - 2);
-            const QRectF marker(keyboard_width - size - 3, key.center().y() - size / 2, size, size);
+            const QRectF marker(key.right() - size - 3, key.center().y() - size / 2, size, size);
             if (is_root(pitch))
                 painter.drawRect(marker);
             else
                 painter.drawEllipse(marker);
         }
-        if (pitch % 12 == 0 && mapping_.row_height >= 8) {
-            painter.setPen(colors.key_label);
-            painter.drawText(key.adjusted(3, 0, -10, 0), Qt::AlignVCenter | Qt::AlignLeft,
+        if (pitch % 12 == 0 && mapping_.row_height >= 7) {
+            painter.setPen(colors.ruler_text);
+            painter.drawText(QRectF(0, y, key_left - 4, mapping_.row_height), Qt::AlignVCenter | Qt::AlignRight,
                              QString::fromStdString(pitch_name(static_cast<std::uint8_t>(pitch))));
         }
     }
+    // Right edge of the keyboard against the grid.
+    painter.setPen(colors.bar_strong);
+    painter.drawLine(QPointF(keyboard_width - 0.5, 0), QPointF(keyboard_width - 0.5, gutter.height()));
     painter.restore();
 }
 
@@ -1655,7 +1670,16 @@ void PianoRollView::push_zoom_history(bool from_wheel) {
 void PianoRollView::wheelEvent(QWheelEvent* event) {
     const double steps = event->angleDelta().y() / 120.0;
     const QPointF local = to_note_area(event->position());
-    if (event->modifiers() & Qt::ControlModifier) {
+    if ((event->modifiers() & Qt::AltModifier) && !(event->modifiers() & Qt::ControlModifier)) {
+        // Alt-wheel: taller or shorter piano rows around the row under the mouse. Qt reports
+        // Alt-wheel as horizontal motion on Windows, so read whichever axis moved.
+        const double alt_steps = steps != 0 ? steps : event->angleDelta().x() / 120.0;
+        if (alt_steps != 0) {
+            push_zoom_history(true);
+            mapping_.zoom_pitch_around(std::clamp(local.y(), 0.0, note_area().height()), std::pow(1.15, alt_steps));
+            mapping_.top_pitch = clamp_top(mapping_.top_pitch);
+        }
+    } else if (event->modifiers() & Qt::ControlModifier) {
         if (steps == 0) {
             event->accept();
             return;
@@ -1830,11 +1854,11 @@ void PianoRollView::fit_all() {
             low = std::min<int>(low, note.pitch);
             high = std::max<int>(high, note.pitch);
         }
-        // Rows between 8 and 16 px: as tall as fits, so a short phrase is easy to edit.
+        // Rows between 10 and 20 px: as tall as fits, so a short phrase is easy to edit.
         const int span = high - low + 7;
-        mapping_.row_height = std::clamp(std::floor(height / span), 8.0, 16.0);
+        mapping_.row_height = std::clamp(std::floor(height / span), 10.0, 20.0);
     } else {
-        mapping_.row_height = 14.0;
+        mapping_.row_height = 16.0;
     }
     const int rows = static_cast<int>(height / mapping_.row_height);
     mapping_.top_pitch = std::clamp((low + high) / 2 + rows / 2, std::min(127, rows - 1), 127);

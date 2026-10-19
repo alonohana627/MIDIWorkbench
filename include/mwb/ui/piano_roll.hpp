@@ -101,7 +101,9 @@ public:
     void loop_selection();
 
     /// Width of the pinned keyboard and height of the ruler in device-independent pixels.
-    static constexpr int keyboard_width = 56;
+    static constexpr int keyboard_width = 84;
+    /// Left part of the keyboard gutter that holds the octave labels (C3, C4...).
+    static constexpr int keyboard_label_width = 28;
     static constexpr int ruler_height = 26;
     /// Height of the loop strip at the top of the ruler (drag there to set the loop).
     static constexpr int loop_strip_height = 8;

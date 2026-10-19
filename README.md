@@ -97,7 +97,7 @@ multi-sequence file.
 | Esc | Cancel the drag or tool in progress |
 
 In the piano roll: mouse wheel scrolls pitch, Shift+wheel scrolls time, Ctrl+wheel zooms time,
-Ctrl+Shift+wheel zooms pitch, middle-drag pans, Alt while dragging turns snapping off, Shift
+Alt+wheel (or Ctrl+Shift+wheel) makes the piano rows taller or shorter, middle-drag pans, Alt while dragging turns snapping off, Shift
 while dragging locks to one direction, and Ctrl+drag copies the notes.
 
 **Computer keyboard playing mode** (Tools menu): the keys A W S E D F T G Y H U J K play an

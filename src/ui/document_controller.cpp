@@ -341,6 +341,14 @@ void DocumentController::set_selection(std::set<EventId> notes) {
     emit selection_changed();
 }
 
+std::shared_ptr<const DocumentData> DocumentController::shared_snapshot() const {
+    if (!snapshot_ || snapshot_generation_ != generation_) {
+        snapshot_ = std::make_shared<const DocumentData>(document());
+        snapshot_generation_ = generation_;
+    }
+    return snapshot_;
+}
+
 bool DocumentController::set_tempo_at(Tick position, double bpm) {
     const Sequence& sequence = active_sequence();
     if (!sequence.division.is_ppq() || sequence.tracks.empty() || !std::isfinite(bpm))

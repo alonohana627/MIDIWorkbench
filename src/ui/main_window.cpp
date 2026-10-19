@@ -501,7 +501,7 @@ void MainWindow::build_actions() {
             return;
         const auto source = library_sources_.find(tab);
         const bool known = source != library_sources_.end();
-        library_->save_document(std::make_shared<const DocumentData>(tab->controller().document()),
+        library_->save_document(tab->controller().shared_snapshot(),
                                 known ? std::optional<std::int64_t>(source->second.first) : std::nullopt,
                                 known ? std::optional<std::int64_t>(source->second.second) : std::nullopt,
                                 QString::fromStdString(tab->controller().document().title), false, tab);
@@ -824,10 +824,50 @@ void MainWindow::build_docks() {
     library_dock_->setObjectName("dock.library");
     library_dock_->setWidget(library_);
     addDockWidget(Qt::LeftDockWidgetArea, library_dock_);
-    connect(library_, &LibraryPanel::open_requested, this, [this](DocumentData document, qint64 asset, qint64 revision) {
-        open_prepared(std::move(document), false, [this, asset, revision](EditorTab* tab) {
-            library_sources_[tab] = {asset, revision};
-        });
+    connect(library_, &LibraryPanel::open_requested, this,
+            [this](DocumentData document, qint64 asset, qint64 revision, std::optional<TimeRange> reveal) {
+                open_prepared(std::move(document), false, [this, asset, revision, reveal](EditorTab* tab) {
+                    library_sources_[tab] = {asset, revision};
+                    if (!reveal)
+                        return;
+                    // A melody result opens at its match, with the matched notes selected.
+                    auto& controller = tab->controller();
+                    std::set<EventId> matched;
+                    for (const auto& note : controller.notes().notes)
+                        if (note.start >= reveal->begin && note.start < reveal->end)
+                            matched.insert(note.on_id);
+                    controller.set_selection(std::move(matched));
+                    controller.set_edit_cursor(reveal->begin);
+                    tab->piano_roll().scroll_to_tick(reveal->begin);
+                });
+            });
+    connect(library_, &LibraryPanel::preview_requested, this,
+            [this](DocumentData document, QString title, std::optional<TimeRange> range) {
+                preview_library_item(std::move(document), title, range);
+            });
+    connect(library_, &LibraryPanel::insert_requested, this, [this](DocumentData document, QString title) {
+        auto* tab = current_tab();
+        if (!tab) {
+            statusBar()->showMessage(tr("Open a document to insert into"), 5000);
+            return;
+        }
+        std::unique_ptr<QMimeData> mime(make_document_mime(document));
+        if (!mime) {
+            statusBar()->showMessage(tr("\"%1\" has no notes to insert").arg(title), 5000);
+            return;
+        }
+        QString error;
+        auto& controller = tab->controller();
+        const auto created = paste_clipboard(controller, mime.get(), controller.edit_cursor(), &error);
+        if (!error.isEmpty())
+            statusBar()->showMessage(error, 6000);
+        if (!created.empty()) {
+            controller.set_selection(std::set<EventId>(created.begin(), created.end()));
+            statusBar()->showMessage(tr("Inserted \"%1\" at the edit cursor (%n note(s))", nullptr,
+                                        static_cast<int>(created.size()))
+                                         .arg(title),
+                                     5000);
+        }
     });
     connect(library_, &LibraryPanel::saved, this, [this](qint64 asset, qint64 revision, bool phrase, QObject* origin) {
         // Only a whole-document save maps a tab to a library item, and only the tab that asked.
@@ -838,8 +878,10 @@ void MainWindow::build_docks() {
                 library_sources_[static_cast<EditorTab*>(origin)] = {asset, revision};
     });
     connect(library_, &LibraryPanel::status_message, this, [this](const QString& text) { statusBar()->showMessage(text, 6000); });
-    connect(library_, &LibraryPanel::opened, this, [this] {
-        if (!library_dock_->isVisible()) {
+    connect(library_, &LibraryPanel::opened, this, [this](bool interactive) {
+        // Only a library the user just chose opens the panel; the one reopened at startup keeps
+        // the saved layout (ux-panels-16).
+        if (interactive && !library_dock_->isVisible()) {
             library_dock_->show();
             resizeDocks({library_dock_}, {280}, Qt::Horizontal);
         }
@@ -1595,7 +1637,19 @@ void MainWindow::present_recovery(std::vector<document::RecoverableSession> sess
     layout->addWidget(buttons);
     bool discard_chosen = false;
     connect(recover, &QPushButton::clicked, &dialog, &QDialog::accept);
+    recover->setDefault(true);
     connect(discard, &QPushButton::clicked, &dialog, [&] {
+        int checked = 0;
+        for (int row = 0; row < list->count(); ++row)
+            checked += list->item(row)->checkState() == Qt::Checked ? 1 : 0;
+        if (checked == 0)
+            return;
+        // Recovery data is the only copy of that work: never deleted by one click (ux-panels-17).
+        if (QMessageBox::warning(&dialog, tr("Discard recovery data"),
+                                 tr("Permanently delete the unsaved changes of %n session(s)? This cannot be undone.",
+                                    nullptr, checked),
+                                 QMessageBox::Discard | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Discard)
+            return;
         discard_chosen = true;
         dialog.accept();
     });
@@ -1869,7 +1923,7 @@ void MainWindow::publish_playback() {
             if (region.id == *sequence.settings.loop_region)
                 loop = TimeRange{region.start_tick, region.end_tick};
     playback_->set_loop(loop);
-    playback_->publish_document(transport_owner_->document(), transport_owner_->active_sequence_index(),
+    playback_->publish_snapshot(transport_owner_->shared_snapshot(), transport_owner_->active_sequence_index(),
                                 transport_owner_->generation());
 }
 
@@ -1917,6 +1971,34 @@ void MainWindow::update_sounding_notes(EditorTab& tab, std::optional<Tick> posit
             tab.keyboard().set_key_state(pitch, KeySource::playback, true);
     tab.piano_roll().set_sounding_pitches(sounding);
     previous = std::move(sounding);
+}
+
+void MainWindow::preview_library_item(DocumentData document, const QString& title, std::optional<TimeRange> range) {
+    if (recording_->recording()) {
+        statusBar()->showMessage(tr("Stop recording to preview a library item"), 4000);
+        return;
+    }
+    if (!transport_display_is_stopped(playback_->display()))
+        stop_transport();
+    // The preview is not one of the open documents: no tab owns the transport while it plays,
+    // and the next Play of a tab publishes that tab again (start_playback).
+    transport_owner_ = nullptr;
+    Tick from = 0;
+    if (range && !document.sequences.empty()) {
+        // A melody match plays with a one-bar lead-in.
+        const auto& sequence = document.sequences.front();
+        const Tick bar = 4 * (sequence.division.is_ppq() ? sequence.division.ppq : default_ppq);
+        from = std::max<Tick>(0, range->begin - bar);
+    }
+    playback_->set_loop(std::nullopt);
+    const auto generation = document.generation;
+    playback_->publish_snapshot(std::make_shared<const DocumentData>(std::move(document)), 0, generation);
+    play_started_from_ = from;
+    paused_cursor_.reset();
+    playback_->play(from);
+    statusBar()->showMessage(tr("Previewing \"%1\"; %2 stops")
+                                 .arg(title, command("transport.play_stop")->shortcut().toString(QKeySequence::NativeText)),
+                             8000);
 }
 
 Tick MainWindow::tempo_position(EditorTab& tab) const {

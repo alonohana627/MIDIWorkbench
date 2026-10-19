@@ -48,6 +48,10 @@ struct ClipboardPayload {
 /// Plain-text note summary also placed on the clipboard.
 [[nodiscard]] std::string clipboard_summary(const ClipboardPayload& payload);
 
+/// Clipboard data for every note of a document's first sequence, relative to its tick 0 (inserting a
+/// library item keeps its timing from bar 1). Null when the document has no notes.
+[[nodiscard]] QMimeData* make_document_mime(const DocumentData& document);
+
 /// Builds clipboard data (internal JSON and a text summary) for the controller's selection.
 [[nodiscard]] QMimeData* make_clipboard_mime(const DocumentController& controller);
 

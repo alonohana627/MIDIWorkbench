@@ -54,8 +54,13 @@ public:
     using QObject::QObject;
     ~PlaybackService() override = default;
 
-    /// Compiles a playback snapshot of the document off the GUI thread and publishes it.
-    virtual void publish_document(const DocumentData& document, std::size_t sequence_index, std::uint64_t generation) = 0;
+    /// Compiles a playback snapshot of an immutable document off the GUI thread and publishes it.
+    virtual void publish_snapshot(std::shared_ptr<const DocumentData> document, std::size_t sequence_index,
+                                  std::uint64_t generation) = 0;
+    /// Convenience: publishes a copy of `document`.
+    void publish_document(const DocumentData& document, std::size_t sequence_index, std::uint64_t generation) {
+        publish_snapshot(std::make_shared<const DocumentData>(document), sequence_index, generation);
+    }
     virtual void play(Tick from) = 0;
     virtual void pause() = 0;
     /// Stops and returns to `return_to`.

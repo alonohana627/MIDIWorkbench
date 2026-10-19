@@ -123,6 +123,34 @@ std::string clipboard_summary(const ClipboardPayload& payload) {
     return text;
 }
 
+QMimeData* make_document_mime(const DocumentData& document) {
+    if (document.sequences.empty())
+        return nullptr;
+    const auto& sequence = document.sequences.front();
+    const auto pairing = pair_notes(sequence);
+    if (pairing.notes.empty())
+        return nullptr;
+    ClipboardPayload payload;
+    payload.ppq = sequence.division.is_ppq() ? sequence.division.ppq : default_ppq;
+    payload.source_root = sequence.root_pc;
+    payload.source_scale_mask = sequence.scale_mask;
+    std::map<std::uint32_t, int> track_slots;
+    Tick end = 0;
+    for (const auto& note : pairing.notes) {
+        auto [slot, inserted] = track_slots.emplace(note.on_track, static_cast<int>(payload.tracks.size()));
+        if (inserted)
+            payload.tracks.push_back(sequence.tracks[note.on_track].name);
+        payload.notes.push_back(ClipboardNote{note.start, note.end, note.pitch, note.velocity, note.release_velocity,
+                                              note.channel, slot->second});
+        end = std::max(end, note.end);
+    }
+    payload.selection_length = end;
+    auto* mime = new QMimeData;
+    mime->setData(clipboard_mime_type, QByteArray::fromStdString(clipboard_to_json(payload)));
+    mime->setText(QString::fromStdString(clipboard_summary(payload)));
+    return mime;
+}
+
 QMimeData* make_clipboard_mime(const DocumentController& controller) {
     const auto notes = controller.selected_notes();
     if (notes.empty())

@@ -121,6 +121,11 @@ bool TrackListWidget::eventFilter(QObject* watched, QEvent* event) {
     if (watched == table_ && event->type() == QEvent::KeyPress) {
         const auto* key = static_cast<QKeyEvent*>(event);
         if ((key->key() == Qt::Key_Delete || key->key() == Qt::Key_Backspace) && key->modifiers() == Qt::NoModifier) {
+            // The highlighted row is what Delete means (it may differ from the edited track after
+            // an M/S click): make it the active track first (review_4).
+            const auto& tracks = controller_.active_sequence().tracks;
+            if (const int row = table_->currentRow(); row >= 0 && static_cast<std::size_t>(row) < tracks.size())
+                controller_.set_active_track(tracks[static_cast<std::size_t>(row)].id);
             delete_active_track(); // undoable; the last track is kept (a rename editor has its own focus)
             return true;
         }

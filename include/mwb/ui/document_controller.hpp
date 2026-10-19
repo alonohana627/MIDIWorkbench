@@ -40,6 +40,10 @@ public:
     ~DocumentController() override;
 
     [[nodiscard]] const DocumentData& document() const;
+    /// An immutable copy of the current document, made once per generation and shared by the
+    /// background users (playback compile, transform preview, library save): repeated requests
+    /// within a generation do not copy the document again.
+    [[nodiscard]] std::shared_ptr<const DocumentData> shared_snapshot() const;
     [[nodiscard]] document::WorkingSession& session() { return *session_; }
     [[nodiscard]] std::uint64_t generation() const { return generation_; }
 
@@ -132,6 +136,8 @@ private:
     std::uint64_t generation_ = 0;
     std::size_t active_sequence_ = 0;
     TrackId active_track_;
+    mutable std::shared_ptr<const DocumentData> snapshot_;   ///< shared_snapshot() of...
+    mutable std::uint64_t snapshot_generation_ = 0;          ///< ...this generation.
     std::set<EventId> selection_;
     Tick edit_cursor_ = 0;
     bool show_ghost_tracks_ = true;

@@ -156,6 +156,8 @@ private:
     /// the rolling transport, otherwise the edit cursor.
     [[nodiscard]] Tick tempo_position(EditorTab& tab) const;
     void commit_tempo(double bpm);
+    /// Plays a library item that is not open (Preview), with a lead-in before a melody match.
+    void preview_library_item(DocumentData document, const QString& title, std::optional<TimeRange> range);
     void set_snap_off(bool off);
     /// Off, relative or absolute snapping on every tab (a view setting, not part of the document).
     void apply_snap_mode();

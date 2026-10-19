@@ -1015,7 +1015,7 @@ void InspectorPanel::request_preview(bool apply_when_ready) {
     const std::uint64_t generation = controller_->generation();
     // One immutable copy for the worker; the GUI keeps editing meanwhile and a result for an
     // older generation is reported as stale, never applied.
-    auto document = std::make_shared<const DocumentData>(controller_->document());
+    auto document = controller_->shared_snapshot(); // copied at most once per generation
     set_report(tr("Previewing…"));
     std::ignore = transform_thread_.post([guard = QPointer<InspectorPanel>(this), document, selection,
                                           parameters = std::move(*parameters), generation, serial](std::stop_token) {

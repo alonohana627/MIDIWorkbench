@@ -17,6 +17,7 @@
 #include "mwb/ui/editor_tab.hpp"
 #include "mwb/ui/event_list.hpp"
 #include "mwb/ui/inspector.hpp"
+#include "mwb/ui/library_panel.hpp"
 #include "mwb/ui/main_window.hpp"
 #include "mwb/ui/piano_roll.hpp"
 #include "mwb/ui/playback_service.hpp"
@@ -37,7 +38,10 @@
 #include <QWheelEvent>
 #include <QLabel>
 #include <QPushButton>
+#include <QMessageBox>
 #include <QSettings>
+#include <QTimer>
+#include <QHeaderView>
 #include <QSpinBox>
 #include <QStyleOption>
 #include <QTableView>
@@ -442,7 +446,7 @@ namespace {
 /// "engine clock" reports for the next captured message.
 class FakePlayback final : public PlaybackService {
 public:
-    void publish_document(const DocumentData&, std::size_t, std::uint64_t) override {}
+    void publish_snapshot(std::shared_ptr<const DocumentData>, std::size_t, std::uint64_t) override {}
     void play(Tick from) override {
         state = TransportDisplay::State::playing;
         position = from;
@@ -2095,5 +2099,279 @@ TEST_SUITE("window") {
         fixture.key(Qt::Key_Delete);
         CHECK(controller.active_sequence().tracks.size() == 1);
         CHECK(controller.notes().notes.size() == 1); // the selected note is still there
+    }
+}
+
+namespace {
+
+/// A library panel over a fresh library holding `count` small songs; settings stay in the temp dir.
+struct LibraryFixture {
+    test::TemporaryDirectory directory;
+    std::unique_ptr<LibraryPanel> panel;
+    QSignalSpy* opened = nullptr;
+
+    explicit LibraryFixture(int count) {
+        application();
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, QString::fromStdWString(directory.path().wstring()));
+        QSettings().remove("library");
+        panel = std::make_unique<LibraryPanel>();
+        panel->resize(420, 600);
+        panel->show();
+        opened = new QSignalSpy(panel.get(), &LibraryPanel::opened);
+        panel->open_library(directory.path() / "lib", true, true);
+        REQUIRE(wait_until([&] { return opened->count() > 0; }, 5000));
+        for (int index = 0; index < count; ++index) {
+            DocumentData document = make_blank_document("Song " + std::to_string(index));
+            ChangeBuilder builder(document, "note");
+            builder.add_note(document.sequences.front().tracks.front().id, 0, 480, 0,
+                             static_cast<std::uint8_t>(60 + index), 100);
+            REQUIRE(apply_change_set(document, builder.finish()));
+            panel->save_document(std::make_shared<const DocumentData>(document), std::nullopt, std::nullopt,
+                                 QString("Song %1").arg(index), false);
+        }
+        REQUIRE(wait_until([&] { return table()->model()->rowCount() == count; }, 5000));
+    }
+    ~LibraryFixture() {
+        panel.reset();
+        delete opened;
+    }
+    [[nodiscard]] QTableView* table() const { return panel->findChild<QTableView*>(); }
+    [[nodiscard]] QString status() const {
+        QString text;
+        for (auto* label : panel->findChildren<QLabel*>())
+            if (label->isVisible() && label->wordWrap())
+                text += label->text() + "\\n";
+        return text;
+    }
+};
+
+/// Answers the next modal message box with `button` (QMessageBox::question/warning block).
+void answer_next_message_box(QMessageBox::StandardButton button) {
+    QTimer::singleShot(100, [button] {
+        if (auto* box = qobject_cast<QMessageBox*>(QApplication::activeModalWidget()))
+            box->button(button)->click();
+    });
+}
+
+} // namespace
+
+TEST_SUITE("library_ui") {
+    TEST_CASE("the result table gives Title the room and hides secondary columns behind the header menu") {
+        LibraryFixture fixture(2);
+        auto* header = fixture.table()->horizontalHeader();
+        CHECK(header->sectionResizeMode(0) == QHeaderView::Stretch);
+        CHECK(header->isSectionHidden(1)); // Tags
+        CHECK(header->isSectionHidden(6)); // Status
+        CHECK_FALSE(header->isSectionHidden(3)); // BPM
+        CHECK(fixture.table()->model()->data(fixture.table()->model()->index(0, 0), Qt::ToolTipRole).toString().contains("Song"));
+        CHECK(fixture.opened->at(0).at(0).toBool()); // chosen now: interactive
+    }
+
+    TEST_CASE("trash works on every selected row at once, shows at once, and can be restored from the Trash view") {
+        LibraryFixture fixture(3);
+        auto* table = fixture.table();
+        table->selectAll();
+        table->selectionModel()->select(table->model()->index(2, 0), QItemSelectionModel::Deselect | QItemSelectionModel::Rows);
+        answer_next_message_box(QMessageBox::Yes);
+        fixture.panel->trash_selected();
+        CHECK(table->model()->rowCount() == 1); // removed at once, before the write commits
+        QTest::qWait(300);
+        CHECK(table->model()->rowCount() == 1); // and the library agreed
+        fixture.panel->show_trash(true);
+        REQUIRE(wait_until([&] { return table->model()->rowCount() == 2; }, 3000));
+        CHECK(fixture.status().contains("2 result"));
+        table->selectAll();
+        fixture.panel->restore_selected_from_trash();
+        CHECK(table->model()->rowCount() == 0);
+        fixture.panel->show_trash(false); // back to the search
+        REQUIRE(wait_until([&] { return table->model()->rowCount() == 3; }, 3000));
+    }
+
+    TEST_CASE("an empty melody search says so and is not replaced by later refreshes") {
+        LibraryFixture fixture(1);
+        fixture.panel->search_melody({{0, 90}, {240, 91}, {480, 92}, {720, 93}}, {200, 200, 200, 200}, false);
+        const bool said = wait_until([&] { return fixture.status().contains("No phrase matches"); }, 3000);
+        INFO("status: " << fixture.status().toStdString());
+        REQUIRE(said);
+        CHECK_FALSE(fixture.status().contains("library is empty"));
+        // A save would have re-run the text search before; melody results stay.
+        DocumentData document = make_blank_document("Later");
+        fixture.panel->save_document(std::make_shared<const DocumentData>(document), std::nullopt, std::nullopt, "Later",
+                                     false);
+        QTest::qWait(500);
+        CHECK(fixture.table()->model()->rowCount() == 0);
+        auto* back = find_by<QPushButton>(*fixture.panel, [](QPushButton* button) { return button->text() == "Back to Search"; });
+        REQUIRE(back);
+        CHECK(back->isVisible());
+        back->click();
+        REQUIRE(wait_until([&] { return fixture.table()->model()->rowCount() == 2; }, 3000));
+    }
+
+    TEST_CASE("a library reopened at startup does not count as chosen by the user") {
+        LibraryFixture fixture(0);
+        fixture.panel.reset(); // the app quits; the next start reopens the last library by itself
+        LibraryPanel restarted;
+        QSignalSpy reopened(&restarted, &LibraryPanel::opened);
+        REQUIRE(wait_until([&] { return reopened.count() > 0; }, 3000));
+        CHECK_FALSE(reopened.at(0).at(0).toBool());
+    }
+}
+
+TEST_SUITE("library_ui") {
+    TEST_CASE("a prepared drag file belongs to the revision it was made from") {
+        application();
+        LibraryResultModel model;
+        LibraryRow row;
+        row.asset_id = 7;
+        row.title = "Riff";
+        row.modified_ms = 100;
+        model.set_rows({row});
+        model.set_drag_file(7, 99, "C:/old.mid"); // prepared from an older revision: ignored
+        CHECK_FALSE(model.flags(model.index(0, 0)).testFlag(Qt::ItemIsDragEnabled));
+        model.set_drag_file(7, 100, "C:/riff.mid");
+        CHECK(model.flags(model.index(0, 0)).testFlag(Qt::ItemIsDragEnabled));
+        row.modified_ms = 200; // saved again: the file is stale
+        model.replace_row(7, row);
+        CHECK_FALSE(model.flags(model.index(0, 0)).testFlag(Qt::ItemIsDragEnabled));
+        model.set_drag_file(7, 200, "C:/riff2.mid");
+        model.clear_drag_files(); // another library opened
+        CHECK_FALSE(model.flags(model.index(0, 0)).testFlag(Qt::ItemIsDragEnabled));
+    }
+
+    TEST_CASE("Insert at Edit Cursor pastes a library item's notes at the cursor") {
+        auto controller = make_controller();
+        DocumentData item = make_blank_document("Phrase");
+        ChangeBuilder builder(item, "notes");
+        const TrackId track = item.sequences.front().tracks.front().id;
+        builder.add_note(track, 0, 240, 0, 60, 100);
+        builder.add_note(track, 480, 720, 0, 64, 100);
+        REQUIRE(apply_change_set(item, builder.finish()));
+        std::unique_ptr<QMimeData> mime(make_document_mime(item));
+        REQUIRE(mime);
+        QString error;
+        const auto created = paste_clipboard(*controller, mime.get(), 3840, &error);
+        REQUIRE(created.size() == 2);
+        const auto& notes = controller->notes().notes;
+        CHECK(notes[0].start == 3840);
+        CHECK(notes[1].start == 3840 + 480);
+    }
+}
+
+// Reviewer probes, batch 4 (probe_batch4); the screenshot folder is the test's temporary workspace.
+
+TEST_SUITE("reviewer_probe5") {
+    TEST_CASE("probe5: toolbar overflow and screenshots at 1400, 1366, 1280 px") {
+        WindowFixture fixture;
+        REQUIRE(fixture.window->open_path(std::filesystem::path(__FILE__).parent_path().parent_path() / "docs" / "images" / "demo.mid"));
+        QTest::qWait(300);
+        for (const int width : {1400, 1366, 1280, 1200}) {
+            fixture.window->resize(width, 860);
+            QTest::qWait(200);
+            bool overflow = false;
+            for (auto* bar : fixture.window->findChildren<QToolBar*>())
+                for (auto* button : bar->findChildren<QToolButton*>("qt_toolbar_ext_button"))
+                    if (button->isVisible()) {
+                        overflow = true;
+                        MESSAGE("width " << width << ": overflow button visible on " << bar->objectName().toStdString());
+                    }
+            if (!overflow)
+                MESSAGE("width " << width << ": no overflow");
+            fixture.window->grab().save(QString::fromStdWString((fixture.directory.path() / "dark_").wstring()) + QString("%1.png").arg(width));
+        }
+    }
+    TEST_CASE("probe5: destroying a focused standalone inspector does not abort") {
+        auto controller = make_controller();
+        {
+            InspectorPanel inspector;
+            inspector.set_controller(controller.get());
+            inspector.show();
+            QSpinBox* numerator = nullptr;
+            for (auto* box : inspector.findChildren<QSpinBox*>())
+                if (box->maximum() == 255)
+                    numerator = box;
+            REQUIRE(numerator);
+            inspector.activateWindow();
+            numerator->setFocus();
+            numerator->stepBy(1);
+            QTest::qWait(50);
+        }
+        CHECK(true);
+    }
+    TEST_CASE("probe5: Q applies the last quantize asynchronously from the roll") {
+        WindowFixture fixture;
+        auto* tab = fixture.window->current_tab();
+        auto& controller = tab->controller();
+        const NewNote note{controller.active_track(), 130, 400, 60, 100, 0, 0};
+        auto changes = insert_notes(controller.document(), std::span(&note, 1));
+        REQUIRE(changes);
+        REQUIRE(controller.apply(*changes));
+        controller.set_selection({controller.notes().notes.front().on_id});
+        tab->piano_roll().setFocus();
+        fixture.key(Qt::Key_Q);
+        REQUIRE(wait_until([&] { return controller.notes().notes.front().start != 130; }, 3000));
+        MESSAGE("quantized start " << controller.notes().notes.front().start << " undo " << controller.undo_text().toStdString());
+        CHECK(controller.notes().notes.front().start % 240 == 0);
+    }
+}
+
+TEST_SUITE("track_list") {
+    TEST_CASE("Delete removes the highlighted track even when another track is the edited one") {
+        auto controller = make_controller();
+        ChangeBuilder builder(controller->document(), "second track");
+        Track second;
+        second.id = TrackId::generate();
+        second.name = "Second";
+        builder.append(TrackInsert{controller->active_sequence().id, 1, second});
+        REQUIRE(controller->apply(builder.finish()));
+        const TrackId first = controller->active_sequence().tracks[0].id;
+        controller->set_active_track(first);
+        TrackListWidget list(*controller);
+        list.show();
+        auto* table = list.findChild<QTableWidget*>();
+        REQUIRE(table);
+        table->setCurrentCell(1, 1); // M of the second track: highlighted, not edited
+        CHECK(controller->active_track() == first);
+        table->setFocus();
+        QTest::keyClick(table, Qt::Key_Delete);
+        REQUIRE(controller->active_sequence().tracks.size() == 1);
+        CHECK(controller->active_sequence().tracks[0].id == first); // the highlighted one went
+    }
+}
+
+TEST_SUITE("controller") {
+    TEST_CASE("the shared snapshot is copied once per generation") {
+        auto controller = make_controller();
+        const auto first = controller->shared_snapshot();
+        CHECK(controller->shared_snapshot() == first); // same generation: the same copy
+        const NewNote note{controller->active_track(), 0, 480, 60, 100, 0, 0};
+        REQUIRE(controller->apply(*insert_notes(controller->document(), std::span(&note, 1))));
+        const auto second = controller->shared_snapshot();
+        CHECK(second != first);
+        CHECK(semantic_hash(*second) == semantic_hash(controller->document()));
+        CHECK(semantic_hash(*first) != semantic_hash(*second)); // the old copy stays as it was
+    }
+}
+
+TEST_SUITE("window") {
+    TEST_CASE("Preview plays a library item without opening it; Space stops it") {
+        WindowFixture fixture;
+        auto* library = fixture.window->findChild<LibraryPanel*>();
+        REQUIRE(library);
+        DocumentData item = make_blank_document("Riff");
+        ChangeBuilder builder(item, "note");
+        builder.add_note(item.sequences.front().tracks.front().id, 0, 3840 * 8, 0, 60, 100);
+        REQUIRE(apply_change_set(item, builder.finish()));
+        auto* tabs = fixture.window->findChild<QTabWidget*>();
+        REQUIRE(tabs);
+        const int open_tabs = tabs->count();
+        auto* play = fixture.window->findChild<QAction*>("transport.play_stop");
+        REQUIRE(play);
+        emit library->preview_requested(item, "Riff", std::nullopt);
+        REQUIRE(wait_until([&] { return play->iconText() == "Stop"; }, 3000)); // the transport runs
+        CHECK(tabs->count() == open_tabs);                                     // nothing was opened
+        fixture.window->current_tab()->piano_roll().setFocus();
+        fixture.key(Qt::Key_Space);
+        CHECK(wait_until([&] { return play->iconText() == "Play"; }, 2000));
     }
 }

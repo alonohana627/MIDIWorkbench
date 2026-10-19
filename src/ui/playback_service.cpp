@@ -324,14 +324,15 @@ public:
         close_device();
     }
 
-    void publish_document(const DocumentData& document, std::size_t sequence_index, std::uint64_t generation) override {
-        if (document.sequences.empty())
+    void publish_snapshot(std::shared_ptr<const DocumentData> document, std::size_t sequence_index,
+                          std::uint64_t generation) override {
+        if (!document || document->sequences.empty())
             return;
         // Serial numbers are unique per service, so two documents with equal generations never
         // satisfy each other's request.
         std::ignore = generation;
-        last_document_ = std::make_shared<const DocumentData>(document);
-        last_sequence_index_ = std::min(sequence_index, document.sequences.size() - 1);
+        last_sequence_index_ = std::min(sequence_index, document->sequences.size() - 1);
+        last_document_ = std::move(document); // shared, never copied here
         republish(); // without an engine yet, the document is compiled once the device is open
     }
 

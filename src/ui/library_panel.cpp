@@ -25,7 +25,9 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QAction>
 #include <QMenu>
+#include <QSignalBlocker>
 #include <QCoreApplication>
 #include <QMetaObject>
 #include <QPointer>
@@ -90,6 +92,7 @@ LibraryRow make_row(const search::BrowseRow& browse, const std::string& title) {
     row.tags = tags.join(", ");
     row.rating = browse.rating;
     row.favorite = browse.favorite;
+    row.modified_ms = browse.modified_ms;
     if (!browse.sequences.empty()) {
         const auto& facts = browse.sequences.front();
         if (facts.tempo_representative)
@@ -124,7 +127,18 @@ int LibraryResultModel::columnCount(const QModelIndex& parent) const { return pa
 
 QVariant LibraryResultModel::data(const QModelIndex& index, int role) const {
     const LibraryRow* row = row_at(index.row());
-    if (!row || role != Qt::DisplayRole)
+    if (!row)
+        return {};
+    if (role == Qt::ToolTipRole) {
+        // The title may be elided in a narrow dock; hidden columns are summarized here too.
+        QStringList lines{row->title};
+        if (!row->tags.isEmpty())
+            lines << tr("Tags: %1").arg(row->tags);
+        if (!row->status.isEmpty())
+            lines << row->status;
+        return lines.join('\n');
+    }
+    if (role != Qt::DisplayRole)
         return {};
     switch (index.column()) {
     case column_title: return (row->favorite ? QStringLiteral("★ ") : QString()) + row->title;
@@ -168,15 +182,50 @@ void LibraryResultModel::replace_row(std::int64_t asset_id, std::optional<Librar
             beginRemoveRows({}, position, position);
             rows_.erase(rows_.begin() + static_cast<std::ptrdiff_t>(index));
             endRemoveRows();
+            drag_files_.erase(asset_id);
             return;
         }
         const QString status = rows_[index].status; // keep a melody-search description
+        const auto match = rows_[index].match;
+        if (rows_[index].modified_ms != row->modified_ms)
+            drag_files_.erase(asset_id); // a new revision: the prepared file is stale
         rows_[index] = std::move(*row);
-        if (rows_[index].status.isEmpty())
+        if (match) { // a melody hit keeps its match and its description
+            rows_[index].match = match;
             rows_[index].status = status;
+        } else if (rows_[index].status.isEmpty()) {
+            rows_[index].status = status;
+        }
         emit dataChanged(this->index(position, 0), this->index(position, columnCount({}) - 1));
         return;
     }
+}
+
+void LibraryResultModel::insert_row(int position, LibraryRow row) {
+    position = std::clamp(position, 0, static_cast<int>(rows_.size()));
+    beginInsertRows({}, position, position);
+    rows_.insert(rows_.begin() + position, std::move(row));
+    endInsertRows();
+}
+
+int LibraryResultModel::position_of(std::int64_t asset_id) const {
+    for (std::size_t index = 0; index < rows_.size(); ++index)
+        if (rows_[index].asset_id == asset_id)
+            return static_cast<int>(index);
+    return -1;
+}
+
+void LibraryResultModel::set_drag_file(std::int64_t asset_id, std::int64_t modified_ms, QString path) {
+    const int position = position_of(asset_id);
+    if (position < 0 || rows_[static_cast<std::size_t>(position)].modified_ms != modified_ms)
+        return; // prepared from a revision the row no longer shows
+    drag_files_[asset_id] = {modified_ms, std::move(path)};
+    emit dataChanged(index(position, 0), index(position, columnCount({}) - 1)); // drag now enabled
+}
+
+const QString* LibraryResultModel::drag_file_for(const LibraryRow& row) const {
+    const auto found = drag_files_.find(row.asset_id);
+    return found != drag_files_.end() && found->second.first == row.modified_ms ? &found->second.second : nullptr;
 }
 
 bool LibraryResultModel::contains_asset(std::int64_t asset_id) const {
@@ -194,7 +243,7 @@ void LibraryResultModel::append_rows(std::vector<LibraryRow> rows) {
 
 Qt::ItemFlags LibraryResultModel::flags(const QModelIndex& index) const {
     auto result = QAbstractTableModel::flags(index);
-    if (const auto* row = row_at(index.row()); row && drag_files_.contains(row->asset_id))
+    if (const auto* row = row_at(index.row()); row && drag_file_for(*row))
         result |= Qt::ItemIsDragEnabled;
     return result;
 }
@@ -207,9 +256,8 @@ QMimeData* LibraryResultModel::mimeData(const QModelIndexList& indexes) const {
         const auto* row = row_at(index.row());
         if (!row)
             continue;
-        const auto found = drag_files_.find(row->asset_id);
-        if (found != drag_files_.end()) {
-            const auto url = QUrl::fromLocalFile(found->second);
+        if (const QString* file = drag_file_for(*row)) {
+            const auto url = QUrl::fromLocalFile(*file);
             if (!urls.contains(url))
                 urls << url;
         }
@@ -226,8 +274,20 @@ const LibraryRow* LibraryResultModel::row_at(int row) const {
 }
 
 LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
-    auto* open_button = new QPushButton(tr("Library…"), this);
-    open_button->setToolTip(tr("Open or create a managed library folder"));
+    // New and Open are separate (ux-panels-8): a library is its own folder; choosing a folder of
+    // MIDI files offers to create a library next to it and import them.
+    auto* open_button = new QPushButton(tr("Library"), this);
+    open_button->setToolTip(tr("Create a new library or open an existing one"));
+    auto* library_menu = new QMenu(open_button);
+    library_menu->addAction(tr("New Library…"), this, &LibraryPanel::new_library);
+    library_menu->addAction(tr("Open Library…"), this, &LibraryPanel::choose_library);
+    open_button->setMenu(library_menu);
+    trash_button_ = new QPushButton(tr("Trash"), this);
+    trash_button_->setCheckable(true);
+    trash_button_->setToolTip(tr("Show the items moved to the trash (restore or delete permanently)"));
+    trash_button_->setEnabled(false);
+    auto* refresh_button = new QPushButton(tr("Refresh"), this);
+    refresh_button->setToolTip(tr("Run the search again (new and changed items appear)"));
     import_button_ = new QPushButton(tr("Add Folder…"), this);
     import_button_->setToolTip(tr("Import a folder; browsing continues while it imports"));
     import_button_->setEnabled(false);
@@ -247,9 +307,11 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
             fetch_more();
     });
     table_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table_->setSelectionMode(QAbstractItemView::ExtendedSelection); // actions apply to every selected row
+    table_->setTextElideMode(Qt::ElideMiddle); // "Bass groove … take 3" keeps both ends
     table_->verticalHeader()->hide();
-    table_->verticalHeader()->setDefaultSectionSize(20);
-    table_->horizontalHeader()->setStretchLastSection(true);
+    table_->verticalHeader()->setDefaultSectionSize(24);
+    configure_columns();
     table_->setAccessibleName(tr("Library results"));
     table_->setContextMenuPolicy(Qt::CustomContextMenu);
     table_->setDragEnabled(true);
@@ -260,6 +322,27 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
     buttons->addWidget(open_button);
     buttons->addWidget(import_button_);
     buttons->addWidget(cancel_import_button_);
+    buttons->addWidget(trash_button_);
+    buttons->addWidget(refresh_button);
+    buttons->addStretch(1);
+    // Shown while the list holds melody hits or the trash, so the user knows (and can leave).
+    mode_bar_ = new QWidget(this);
+    auto* mode_layout = new QHBoxLayout(mode_bar_);
+    mode_layout->setContentsMargins(0, 0, 0, 0);
+    mode_label_ = new QLabel(mode_bar_);
+    QFont mode_font = mode_label_->font();
+    mode_font.setWeight(QFont::DemiBold);
+    mode_label_->setFont(mode_font);
+    auto* back = new QPushButton(tr("Back to Search"), mode_bar_);
+    mode_layout->addWidget(mode_label_, 1);
+    mode_layout->addWidget(back);
+    mode_bar_->hide();
+    connect(back, &QPushButton::clicked, this, [this] {
+        trash_button_->setChecked(false);
+        run_search();
+    });
+    connect(trash_button_, &QPushButton::toggled, this, &LibraryPanel::show_trash);
+    connect(refresh_button, &QPushButton::clicked, this, [this] { refresh_results(); });
     // Page 1: the open library. Page 0: what a library is and how to start one.
     auto* browse = new QWidget(this);
     auto* layout = new QVBoxLayout(browse);
@@ -267,6 +350,7 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
     layout->setSpacing(6);
     layout->addLayout(buttons);
     layout->addWidget(search_);
+    layout->addWidget(mode_bar_);
     layout->addWidget(table_, 1);
     layout->addWidget(status_);
 
@@ -280,18 +364,25 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
     heading_font.setWeight(QFont::DemiBold);
     heading->setFont(heading_font);
     auto* explanation = new QLabel(tr("A library indexes your MIDI files so you can search them by tag, key, tempo "
-                                      "and melody, and keeps every saved revision."),
+                                      "and melody, and keeps every saved revision. It is a new folder of its own: "
+                                      "importing copies your files into it and never changes the originals."),
                                    empty);
     explanation->setWordWrap(true);
     explanation->setForegroundRole(QPalette::PlaceholderText);
-    auto* start_button = new QPushButton(tr("Create or Open Library…"), empty);
+    auto* start_button = new QPushButton(tr("New Library…"), empty);
     start_button->setDefault(true);
-    connect(start_button, &QPushButton::clicked, this, &LibraryPanel::choose_library);
+    connect(start_button, &QPushButton::clicked, this, &LibraryPanel::new_library);
+    auto* open_existing = new QPushButton(tr("Open Library…"), empty);
+    connect(open_existing, &QPushButton::clicked, this, &LibraryPanel::choose_library);
     empty_status_ = new QLabel(empty);
     empty_status_->setWordWrap(true);
     empty_layout->addWidget(heading);
     empty_layout->addWidget(explanation);
-    empty_layout->addWidget(start_button, 0, Qt::AlignLeft);
+    auto* start_buttons = new QHBoxLayout;
+    start_buttons->addWidget(start_button);
+    start_buttons->addWidget(open_existing);
+    start_buttons->addStretch(1);
+    empty_layout->addLayout(start_buttons);
     empty_layout->addWidget(empty_status_);
     empty_layout->addStretch(1);
 
@@ -305,25 +396,52 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
     connect(&change_poll_, &QTimer::timeout, this, &LibraryPanel::poll_changes);
     debounce_.setSingleShot(true);
     debounce_.setInterval(120); // typing debounce (section 33.3)
-    connect(&debounce_, &QTimer::timeout, this, &LibraryPanel::run_search);
+    connect(&debounce_, &QTimer::timeout, this, [this] { run_search(); });
     connect(search_, &QLineEdit::textChanged, this, [this] { debounce_.start(); });
-    connect(open_button, &QPushButton::clicked, this, &LibraryPanel::choose_library);
     connect(import_button_, &QPushButton::clicked, this, &LibraryPanel::import_folder);
     connect(cancel_import_button_, &QPushButton::clicked, this, [this] {
         if (import_stop_)
             import_stop_->request_stop();
         status_->setText(tr("Cancelling the import…"));
     });
-    connect(table_->selectionModel(), &QItemSelectionModel::currentRowChanged, this, [this] { prepare_drag_file(); });
+    connect(table_->selectionModel(), &QItemSelectionModel::selectionChanged, this, [this] { prepare_drag_file(); });
+    // Listen before opening; insert into the open document (spec 5.2, 6.2).
+    auto* preview_action = new QAction(tr("Preview"), table_);
+    preview_action->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Return));
+    preview_action->setShortcutContext(Qt::WidgetShortcut);
+    connect(preview_action, &QAction::triggered, this, [this] {
+        load_current([](LibraryPanel& panel, DocumentData document, const LibraryRow& row, std::int64_t) {
+            emit panel.preview_requested(std::move(document), row.title, row.match);
+        });
+    });
+    table_->addAction(preview_action);
     // Single click selects silently; double-click or Enter opens (section 6.2).
     connect(table_, &QTableView::activated, this, [this] { open_selected(); });
     connect(table_, &QTableView::customContextMenuRequested, this, [this](const QPoint& point) {
         const QModelIndex clicked = table_->indexAt(point);
         if (!clicked.isValid())
             return; // no item under the pointer: nothing to act on
-        table_->setCurrentIndex(clicked);
+        if (!table_->selectionModel()->isRowSelected(clicked.row(), {}))
+            table_->setCurrentIndex(clicked); // a right-click outside the selection selects that row
         QMenu menu(this);
+        if (mode_ == ResultMode::trash) {
+            menu.addAction(tr("Restore"), this, &LibraryPanel::restore_selected_from_trash);
+            menu.addAction(tr("Delete Permanently…"), this, &LibraryPanel::purge_selected);
+            menu.exec(table_->viewport()->mapToGlobal(point));
+            return;
+        }
         menu.addAction(tr("Open"), this, &LibraryPanel::open_selected);
+        menu.addAction(tr("Preview\tCtrl+Enter"), this, [this] {
+            load_current([](LibraryPanel& panel, DocumentData document, const LibraryRow& row, std::int64_t) {
+                emit panel.preview_requested(std::move(document), row.title, row.match);
+            });
+        });
+        menu.addAction(tr("Insert at Edit Cursor"), this, [this] {
+            load_current([](LibraryPanel& panel, DocumentData document, const LibraryRow& row, std::int64_t) {
+                emit panel.insert_requested(std::move(document), row.title);
+            });
+        });
+        menu.addSeparator();
         menu.addAction(tr("Revisions…"), this, &LibraryPanel::show_revisions);
         menu.addAction(tr("Toggle Favorite"), this, [this] { set_metadata(0); });
         menu.addAction(tr("Add Tag…"), this, [this] {
@@ -332,6 +450,9 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
             if (accepted && !tag.trimmed().isEmpty())
                 run_metadata_task([tag = tag.trimmed().toStdString()](library::Library& library, std::int64_t asset) {
                     return library.add_tag(asset, tag);
+                }, [tag = tag.trimmed()](LibraryRow& row) {
+                    if (!row.tags.split(", ", Qt::SkipEmptyParts).contains(tag, Qt::CaseInsensitive))
+                        row.tags = row.tags.isEmpty() ? tag : row.tags + ", " + tag;
                 });
         });
         menu.addAction(tr("Remove Tag…"), this, [this] {
@@ -340,6 +461,10 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
             if (accepted && !tag.trimmed().isEmpty())
                 run_metadata_task([tag = tag.trimmed().toStdString()](library::Library& library, std::int64_t asset) {
                     return library.remove_tag(asset, tag);
+                }, [tag = tag.trimmed()](LibraryRow& row) {
+                    QStringList tags = row.tags.split(", ", Qt::SkipEmptyParts);
+                    tags.removeIf([&](const QString& existing) { return existing.compare(tag, Qt::CaseInsensitive) == 0; });
+                    row.tags = tags.join(", ");
                 });
         });
         menu.addAction(tr("Set Musical Role…"), this, [this] {
@@ -369,7 +494,7 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
         button->setFocusPolicy(Qt::TabFocus);
     const QString last = QSettings().value("library/last").toString();
     if (!last.isEmpty())
-        open_library(std::filesystem::path(last.toStdWString()), false);
+        open_library(std::filesystem::path(last.toStdWString()), false); // not interactive: the layout stays as saved
 }
 
 LibraryPanel::~LibraryPanel() {
@@ -386,14 +511,141 @@ LibraryPanel::~LibraryPanel() {
 }
 
 void LibraryPanel::trash_selected() {
-    const LibraryRow* row = model_->row_at(table_->currentIndex().row());
-    if (!row || QMessageBox::question(this, tr("Move to Trash"),
-                                      tr("Move \"%1\" to the trash? Re-importing the file brings it back.").arg(row->title)) !=
-                    QMessageBox::Yes)
+    if (mode_ == ResultMode::trash) {
+        purge_selected(); // Delete in the trash view deletes permanently (with its own question)
+        return;
+    }
+    const auto assets = selected_assets();
+    if (assets.empty())
+        return;
+    const LibraryRow* current = model_->row_at(table_->currentIndex().row());
+    const QString question = assets.size() == 1 && current
+                                 ? tr("Move \"%1\" to the trash? You can restore it from Trash.").arg(current->title)
+                                 : tr("Move %n items to the trash? You can restore them from Trash.", nullptr,
+                                      static_cast<int>(assets.size()));
+    if (QMessageBox::question(this, tr("Move to Trash"), question) != QMessageBox::Yes)
         return;
     run_metadata_task([](library::Library& library, std::int64_t asset) {
         return library.trash(std::vector<std::int64_t>{asset}); // a metadata state; restorable
-    }, true);
+    }, {}, true);
+}
+
+void LibraryPanel::show_trash(bool on) {
+    if (!library_)
+        return;
+    if (!on) {
+        if (mode_ == ResultMode::trash)
+            run_search();
+        return;
+    }
+    set_mode(ResultMode::trash);
+    const std::uint64_t generation = ++*generation_;
+    restart_search_cancellation();
+    next_page_.reset();
+    QPointer<LibraryPanel> guard(this);
+    auto library = library_;
+    read_thread_->post([guard, library, generation, latest = generation_](std::stop_token) {
+        if (generation != latest->load())
+            return;
+        std::vector<LibraryRow> rows;
+        QString error;
+        if (auto trashed = library->list_trash()) {
+            if (auto browse = library->browse_rows_for(*trashed))
+                for (const auto id : *trashed)
+                    for (const auto& row : *browse)
+                        if (row.id == id)
+                            rows.push_back(make_row(row, row.text[0].empty() ? row.sort_title : row.text[0]));
+        } else {
+            error = QString::fromStdString(trashed.error().describe());
+        }
+        QMetaObject::invokeMethod(
+            qApp,
+            [guard, generation, rows = std::move(rows), error]() mutable {
+                if (guard)
+                    guard->deliver_results(generation, std::move(rows), error);
+            },
+            Qt::QueuedConnection);
+    });
+}
+
+void LibraryPanel::restore_selected_from_trash() {
+    const auto assets = selected_assets();
+    if (assets.empty() || !library_)
+        return;
+    run_metadata_task([](library::Library& library, std::int64_t asset) {
+        return library.restore_from_trash(std::vector<std::int64_t>{asset}); // identity and tags come back
+    }, {}, true);
+    emit status_message(tr("Restored %n item(s) from the trash", nullptr, static_cast<int>(assets.size())));
+}
+
+void LibraryPanel::purge_selected() {
+    const auto assets = selected_assets();
+    if (assets.empty() || !library_)
+        return;
+    if (QMessageBox::warning(this, tr("Delete Permanently"),
+                             tr("Permanently delete %n item(s) and all their revisions? This cannot be undone.", nullptr,
+                                static_cast<int>(assets.size())),
+                             QMessageBox::Discard | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Discard)
+        return;
+    run_metadata_task([](library::Library& library, std::int64_t asset) -> Status {
+        auto purged = library.purge(std::vector<std::int64_t>{asset});
+        if (!purged)
+            return std::unexpected(std::move(purged).error());
+        return ok();
+    }, {}, true);
+}
+
+std::vector<std::int64_t> LibraryPanel::selected_assets() const {
+    std::vector<std::int64_t> assets;
+    for (const auto& index : table_->selectionModel()->selectedRows())
+        if (const auto* row = model_->row_at(index.row()))
+            assets.push_back(row->asset_id);
+    if (assets.empty())
+        if (const auto* row = model_->row_at(table_->currentIndex().row()))
+            assets.push_back(row->asset_id);
+    return assets;
+}
+
+void LibraryPanel::set_mode(ResultMode mode) {
+    mode_ = mode;
+    mode_label_->setText(mode == ResultMode::melody ? tr("Melody search results") : tr("Trash"));
+    mode_bar_->setVisible(mode != ResultMode::text);
+    if (mode != ResultMode::trash && trash_button_->isChecked()) {
+        const QSignalBlocker blocker(trash_button_);
+        trash_button_->setChecked(false);
+    }
+}
+
+void LibraryPanel::configure_columns() {
+    // Title takes the room; the other columns fit their content (ux-panels-9). Tags and Status
+    // start hidden in the narrow dock; the header menu shows or hides any column.
+    auto* header = table_->horizontalHeader();
+    header->setStretchLastSection(false);
+    header->setSectionResizeMode(QHeaderView::ResizeToContents);
+    header->setSectionResizeMode(column_title, QHeaderView::Stretch);
+    const QStringList hidden =
+        QSettings().value("library/hidden_columns", QStringList{QString::number(column_tags), QString::number(column_status)})
+            .toStringList();
+    for (int column = column_title + 1; column < library_column_count; ++column)
+        header->setSectionHidden(column, hidden.contains(QString::number(column)));
+    header->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(header, &QHeaderView::customContextMenuRequested, this, [this, header](const QPoint& point) {
+        QMenu menu(this);
+        for (int column = column_title + 1; column < library_column_count; ++column) {
+            auto* action = menu.addAction(model_->headerData(column, Qt::Horizontal, Qt::DisplayRole).toString());
+            action->setCheckable(true);
+            action->setChecked(!header->isSectionHidden(column));
+            connect(action, &QAction::toggled, this, [header, column](bool shown) {
+                header->setSectionHidden(column, !shown);
+                QStringList hidden_columns;
+                for (int index = column_title + 1; index < library_column_count; ++index)
+                    if (header->isSectionHidden(index))
+                        hidden_columns << QString::number(index);
+                QSettings().setValue("library/hidden_columns", hidden_columns);
+            });
+        }
+        menu.exec(header->mapToGlobal(point));
+    });
 }
 
 bool LibraryPanel::eventFilter(QObject* watched, QEvent* event) {
@@ -413,23 +665,58 @@ void LibraryPanel::focus_search() {
 }
 
 void LibraryPanel::choose_library() {
-    const QString directory = QFileDialog::getExistingDirectory(this, tr("Choose or create a library folder"));
+    const QString directory = QFileDialog::getExistingDirectory(this, tr("Open a library folder"));
     if (directory.isEmpty())
         return;
     const std::filesystem::path root(directory.toStdWString());
     std::error_code error;
-    const bool exists = std::filesystem::exists(root / "library.sqlite", error);
-    open_library(root, !exists);
+    if (std::filesystem::exists(root / "library.sqlite", error)) {
+        open_library(root, false, true);
+        return;
+    }
+    bool has_files = false;
+    for (std::filesystem::directory_iterator it(root, error), end; !error && it != end; it.increment(error)) {
+        has_files = true;
+        break;
+    }
+    if (!has_files) {
+        open_library(root, true, true); // an empty folder becomes a new library
+        return;
+    }
+    // A folder of MIDI files is not a library: offer one next to it and import the files (the
+    // originals are only read).
+    const std::filesystem::path suggested = root.parent_path() / (root.filename().wstring() + L" Library");
+    const auto answer = QMessageBox::question(
+        this, tr("Not a library"),
+        tr("\"%1\" is not a library. Create a library in \"%2\" and import the MIDI files from \"%1\"?")
+            .arg(QString::fromStdWString(root.wstring()), QString::fromStdWString(suggested.wstring())));
+    if (answer != QMessageBox::Yes)
+        return;
+    open_library(suggested, !std::filesystem::exists(suggested / "library.sqlite", error), true, root);
 }
 
-void LibraryPanel::open_library(const std::filesystem::path& root, bool create) {
+void LibraryPanel::new_library() {
+    const QString parent = QFileDialog::getExistingDirectory(this, tr("Where should the new library folder go?"));
+    if (parent.isEmpty())
+        return;
+    bool accepted = false;
+    const QString name = QInputDialog::getText(this, tr("New Library"), tr("Library folder name"), QLineEdit::Normal,
+                                               tr("MIDI Workbench Library"), &accepted)
+                             .trimmed();
+    if (!accepted || name.isEmpty())
+        return;
+    open_library(std::filesystem::path(parent.toStdWString()) / name.toStdWString(), true, true);
+}
+
+void LibraryPanel::open_library(const std::filesystem::path& root, bool create, bool interactive,
+                                std::optional<std::filesystem::path> import_after) {
     status_->setText(tr("Opening library…"));
     QPointer<LibraryPanel> guard(this);
-    write_thread_->post([guard, root, create](std::stop_token) {
+    write_thread_->post([guard, root, create, interactive, import_after](std::stop_token) {
         auto opened = create ? library::Library::create(root) : library::Library::open(root);
         QMetaObject::invokeMethod(
             qApp, // context outlives the task; the lambda checks the guard
-            [guard, root, opened = std::make_shared<decltype(opened)>(std::move(opened))]() mutable {
+            [guard, root, interactive, import_after, opened = std::make_shared<decltype(opened)>(std::move(opened))]() mutable {
                 if (!guard)
                     return;
                 if (!*opened) {
@@ -437,16 +724,22 @@ void LibraryPanel::open_library(const std::filesystem::path& root, bool create) 
                         tr("Library unavailable: %1").arg(QString::fromStdString((*opened).error().describe()));
                     guard->status_->setText(message);
                     guard->empty_status_->setText(message);
+                    if (interactive)
+                        emit guard->status_message(message);
                     return;
                 }
                 guard->library_ = std::shared_ptr<library::Library>(std::move(**opened));
+                guard->model_->clear_drag_files(); // asset ids repeat across libraries
                 guard->change_revision_.reset();
                 guard->change_poll_.start();
                 guard->pages_->setCurrentIndex(1);
-                emit guard->opened(); // after library_ is set, so listeners see the new library
+                emit guard->opened(interactive); // after library_ is set, so listeners see the new library
                 QSettings().setValue("library/last", QString::fromStdWString(root.wstring()));
                 guard->import_button_->setEnabled(true);
+                guard->trash_button_->setEnabled(true);
                 guard->run_search();
+                if (import_after)
+                    guard->import_path(*import_after);
             },
             Qt::QueuedConnection);
     });
@@ -456,12 +749,16 @@ void LibraryPanel::import_folder() {
     if (!library_)
         return;
     const QString directory = QFileDialog::getExistingDirectory(this, tr("Add a folder of MIDI files"));
-    if (directory.isEmpty())
+    if (!directory.isEmpty())
+        import_path(std::filesystem::path(directory.toStdWString()));
+}
+
+void LibraryPanel::import_path(const std::filesystem::path& source) {
+    if (!library_)
         return;
-    status_->setText(tr("Importing %1… (browsing stays available)").arg(directory));
+    status_->setText(tr("Importing %1… (browsing stays available)").arg(QString::fromStdWString(source.wstring())));
     QPointer<LibraryPanel> guard(this);
     auto library = library_;
-    const std::filesystem::path source(directory.toStdWString());
     import_stop_ = std::make_shared<std::stop_source>();
     import_button_->setEnabled(false);
     cancel_import_button_->show();
@@ -489,7 +786,7 @@ void LibraryPanel::import_folder() {
         auto report = library->import_paths({source}, options, stop);
         // Analysis and motif indexing follow automatically in the desktop app (section 26.6).
         std::optional<library::AnalyzeReport> analysis;
-        if (report) {
+        if (report && !stop.stop_requested()) {
             // Analysis re-reads the same untrusted bytes: it goes through the same isolated parser
             // as the import, never this process (section 28.2).
             library::AnalyzeOptions analyze;
@@ -497,6 +794,7 @@ void LibraryPanel::import_folder() {
             if (auto analyzed = library->analyze(analyze, stop))
                 analysis = *analyzed;
         }
+        const bool cancelled = stop.stop_requested() && !thread_stop.stop_requested();
         QString text;
         if (!report) {
             text = tr("Import failed: %1").arg(QString::fromStdString(report.error().describe()));
@@ -509,19 +807,101 @@ void LibraryPanel::import_folder() {
                        .arg(counts.failed)
                        .arg(counts.changed_during_read)
                        .arg(counts.discovered);
+            if (cancelled)
+                text = tr("Import cancelled. %1").arg(text);
             if (analysis)
                 text += tr("; analyzed %1").arg(analysis->revisions_analyzed);
         }
         QMetaObject::invokeMethod(
             qApp, // context outlives the task; the lambda checks the guard
-            [guard, text] {
+            [guard, text, cancelled] {
                 if (!guard)
                     return;
                 guard->import_button_->setEnabled(true);
                 guard->cancel_import_button_->hide();
                 guard->status_->setText(text);
                 emit guard->status_message(text);
-                guard->run_search();
+                guard->refresh_results();
+                if (cancelled)
+                    guard->schedule_analysis(); // files imported before the cancel are still indexed
+            },
+            Qt::QueuedConnection);
+    });
+}
+
+void LibraryPanel::schedule_analysis() {
+    if (!library_)
+        return;
+    // Idempotent: analyze() skips revisions already indexed. Runs on the import thread with the
+    // isolated parser, so melody search finds saved items without waiting for an import (ux-panels-14).
+    QPointer<LibraryPanel> guard(this);
+    auto library = library_;
+    status_->setText(tr("Indexing for melody search…"));
+    import_thread_->post([guard, library, parser = import_parser_ ? import_parser_ : parser_](std::stop_token stop) {
+        library::AnalyzeOptions analyze;
+        analyze.parser = parser;
+        auto analyzed = library->analyze(analyze, stop);
+        const QString text = analyzed ? tr("Indexed %n item(s) for melody search", nullptr,
+                                           static_cast<int>(analyzed->revisions_analyzed))
+                                      : tr("Indexing failed: %1").arg(QString::fromStdString(analyzed.error().describe()));
+        QMetaObject::invokeMethod(
+            qApp,
+            [guard, text] {
+                if (!guard)
+                    return;
+                guard->status_->setText(text);
+                guard->refresh_visible(); // status column: indexing -> ready
+            },
+            Qt::QueuedConnection);
+    });
+}
+
+void LibraryPanel::refresh_visible() {
+    for (int row = 0; row < model_->rowCount({}); ++row)
+        if (const auto* entry = model_->row_at(row))
+            refresh_row(entry->asset_id, false);
+}
+
+void LibraryPanel::refresh_results() {
+    if (mode_ == ResultMode::text)
+        run_search(true);
+    else if (mode_ == ResultMode::trash)
+        show_trash(true);
+    else
+        refresh_visible();
+}
+
+void LibraryPanel::load_current(
+    std::function<void(LibraryPanel&, DocumentData, const LibraryRow&, std::int64_t revision)> use) {
+    const LibraryRow* current = model_->row_at(table_->currentIndex().row());
+    if (!current || !library_)
+        return;
+    const LibraryRow row = *current;
+    QPointer<LibraryPanel> guard(this);
+    auto library = library_;
+    browse_thread_->post([guard, library, row, parser = parser_, use = std::move(use)](std::stop_token) {
+        std::optional<DocumentData> document;
+        QString error;
+        std::int64_t revision_id = 0;
+        auto asset = library->asset(row.asset_id);
+        if (asset && *asset && (*asset)->current_revision_id) {
+            revision_id = *(*asset)->current_revision_id;
+            if (auto opened = library->open_revision(revision_id, parser))
+                document = std::move(*opened);
+            else
+                error = QString::fromStdString(opened.error().describe());
+        } else {
+            error = tr("This item has no readable revision");
+        }
+        QMetaObject::invokeMethod(
+            qApp,
+            [guard, document = std::move(document), error, row, revision_id, use]() mutable {
+                if (!guard)
+                    return;
+                if (document)
+                    use(*guard, std::move(*document), row, revision_id);
+                else
+                    emit guard->status_message(error);
             },
             Qt::QueuedConnection);
     });
@@ -534,9 +914,19 @@ std::stop_token LibraryPanel::restart_search_cancellation() {
     return search_stop_->get_token();
 }
 
-void LibraryPanel::run_search() {
+void LibraryPanel::run_search(bool keep_position) {
     if (!library_)
         return;
+    set_mode(ResultMode::text);
+    // A refresh (save, import, external change) keeps the current item and scroll position; a
+    // new query starts at the top (section 19.4).
+    keep_asset_.reset();
+    keep_scroll_ = 0;
+    if (keep_position) {
+        if (const auto* row = model_->row_at(table_->currentIndex().row()))
+            keep_asset_ = row->asset_id;
+        keep_scroll_ = table_->verticalScrollBar()->value();
+    }
     const std::uint64_t generation = ++*generation_;
     const auto stop = restart_search_cancellation();
     QPointer<LibraryPanel> guard(this);
@@ -599,6 +989,8 @@ void LibraryPanel::search_melody(std::vector<std::pair<Tick, std::uint8_t>> onse
     const std::uint64_t generation = ++*generation_;
     const auto search_stop = restart_search_cancellation();
     next_page_.reset();
+    keep_asset_.reset();
+    set_mode(ResultMode::melody);
     status_->setText(similar ? tr("Searching similar phrases (approximate search)") : tr("Searching the melody"));
     QPointer<LibraryPanel> guard(this);
     auto library = library_;
@@ -609,7 +1001,12 @@ void LibraryPanel::search_melody(std::vector<std::pair<Tick, std::uint8_t>> onse
         std::vector<LibraryRow> rows;
         QString error;
         QString label;
-        std::vector<std::pair<std::int64_t, QString>> hits; // asset, description
+        struct Hit {
+            std::int64_t asset = 0;
+            QString description;
+            TimeRange range;
+        };
+        std::vector<Hit> hits;
         if (similar) {
             search::ApproximateQuery query;
             query.notes = notes;
@@ -619,14 +1016,15 @@ void LibraryPanel::search_melody(std::vector<std::pair<Tick, std::uint8_t>> onse
             } else {
                 label = QString::fromStdString(result->label); // always labeled approximate with its budget
                 for (const auto& match : result->matches)
-                    hits.emplace_back(match.stream.asset_id,
-                                      tr("score %1 (pitch %2, rhythm %3), transpose %4, ticks %5-%6")
-                                          .arg(match.components.score, 0, 'f', 1)
-                                          .arg(match.components.pitch, 0, 'f', 2)
-                                          .arg(match.components.rhythm, 0, 'f', 2)
-                                          .arg(match.components.transpose)
-                                          .arg(match.start_tick)
-                                          .arg(match.end_tick));
+                    hits.push_back(Hit{match.stream.asset_id,
+                                       tr("score %1 (pitch %2, rhythm %3), transpose %4, ticks %5-%6")
+                                           .arg(match.components.score, 0, 'f', 1)
+                                           .arg(match.components.pitch, 0, 'f', 2)
+                                           .arg(match.components.rhythm, 0, 'f', 2)
+                                           .arg(match.components.transpose)
+                                           .arg(match.start_tick)
+                                           .arg(match.end_tick),
+                                       TimeRange{match.start_tick, std::max(match.end_tick, match.start_tick + 1)}});
             }
         } else {
             search::ExactQuery query;
@@ -639,23 +1037,26 @@ void LibraryPanel::search_melody(std::vector<std::pair<Tick, std::uint8_t>> onse
                 label = result->partial ? tr("exact search (partial: %1)").arg(QString::fromStdString(result->partial_reason))
                                         : tr("exact search");
                 for (const auto& occurrence : result->occurrences)
-                    hits.emplace_back(occurrence.stream.asset_id, tr("transpose %1, ticks %2-%3, track %4")
-                                                                      .arg(occurrence.transpose)
-                                                                      .arg(occurrence.start_tick)
-                                                                      .arg(occurrence.end_tick)
-                                                                      .arg(occurrence.stream.track_no + 1));
+                    hits.push_back(Hit{occurrence.stream.asset_id, tr("transpose %1, ticks %2-%3, track %4")
+                                                                       .arg(occurrence.transpose)
+                                                                       .arg(occurrence.start_tick)
+                                                                       .arg(occurrence.end_tick)
+                                                                       .arg(occurrence.stream.track_no + 1),
+                                       TimeRange{occurrence.start_tick,
+                                                 std::max(occurrence.end_tick, occurrence.start_tick + 1)}});
             }
         }
         if (error.isEmpty()) {
             std::vector<std::int64_t> ids;
             for (const auto& hit : hits)
-                ids.push_back(hit.first);
+                ids.push_back(hit.asset);
             if (auto browse = library->browse_rows_for(ids)) {
                 for (const auto& hit : hits)
                     for (const auto& row : *browse)
-                        if (row.id == hit.first) {
+                        if (row.id == hit.asset) {
                             auto library_row = make_row(row, row.text[0].empty() ? row.sort_title : row.text[0]);
-                            library_row.status = hit.second;
+                            library_row.status = hit.description;
+                            library_row.match = hit.range;
                             rows.push_back(std::move(library_row));
                         }
             }
@@ -665,8 +1066,9 @@ void LibraryPanel::search_melody(std::vector<std::pair<Tick, std::uint8_t>> onse
             [guard, generation, rows = std::move(rows), error, label]() mutable {
                 if (!guard)
                     return;
+                const bool current = generation == guard->generation_->load();
                 guard->deliver_results(generation, std::move(rows), error);
-                if (error.isEmpty())
+                if (current && error.isEmpty()) // never onto a newer search's status
                     guard->status_->setText(guard->status_->text() + "  [" + label + "]");
             },
             Qt::QueuedConnection);
@@ -722,7 +1124,8 @@ void LibraryPanel::save_document(std::shared_ptr<const DocumentData> document, s
                 }
                 emit guard->saved(asset, *revision, phrase, origin_guard.data());
                 emit guard->status_message(tr("Saved to the library as a new revision"));
-                guard->run_search();
+                guard->refresh_results();
+                guard->schedule_analysis(); // saved items are found by melody search too
             },
             Qt::QueuedConnection);
     });
@@ -795,70 +1198,115 @@ void LibraryPanel::present_revisions(std::int64_t asset_id, const QString& title
                 if (!guard)
                     return;
                 emit guard->status_message(message);
-                guard->run_search();
+                guard->refresh_results();
+                guard->schedule_analysis();
             },
             Qt::QueuedConnection);
     });
 }
 
 void LibraryPanel::prepare_drag_file() {
-    const LibraryRow* row = model_->row_at(table_->currentIndex().row());
-    if (!row || !library_ || drag_cache_.empty())
+    if (!library_ || drag_cache_.empty() || mode_ == ResultMode::trash)
+        return;
+    // Every selected row (a few at most) gets its file, so a multi-row drag drops all of them.
+    std::vector<LibraryRow> rows;
+    for (const auto asset : selected_assets())
+        if (const int position = model_->position_of(asset); position >= 0 && rows.size() < 16)
+            rows.push_back(*model_->row_at(position));
+    if (rows.empty())
         return;
     QPointer<LibraryPanel> guard(this);
     auto library = library_;
-    const auto asset_id = row->asset_id;
-    const std::string title = row->title.toStdString();
     const auto cache = drag_cache_;
-    // The file is written and closed in the background before any drag can start. Only the latest
-    // row is prepared: moving through the list does not queue a parse per row.
+    // The files are written and closed in the background before any drag can start. Only the
+    // latest selection is prepared: moving through the list does not queue a parse per row.
     const std::uint64_t generation = ++*drag_latest_;
-    browse_thread_->post([guard, library, asset_id, title, cache, parser = parser_, generation,
-                          latest = drag_latest_](std::stop_token) {
-        if (generation != latest->load())
-            return;
-        auto asset = library->asset(asset_id);
-        if (!asset || !*asset || !(*asset)->current_revision_id)
-            return;
-        auto document = library->open_revision(*(*asset)->current_revision_id, parser);
-        if (!document)
-            return;
-        midi::ExportOptions options;
-        options.mode = midi::ExportMode::compatibility;
-        auto bytes = midi::export_midi(*document, options);
-        if (!bytes)
-            return;
-        auto file = write_drag_file(cache, title, *bytes);
-        if (!file)
-            return;
-        const QString path = QString::fromStdWString(file->wstring());
-        QMetaObject::invokeMethod(
-            qApp, // context outlives the task; the lambda checks the guard
-            [guard, asset_id, path] {
-                if (guard)
-                    guard->model_->set_drag_file(asset_id, path);
-            },
-            Qt::QueuedConnection);
+    browse_thread_->post([guard, library, rows, cache, parser = parser_, generation, latest = drag_latest_](std::stop_token) {
+        for (const auto& row : rows) {
+            if (generation != latest->load())
+                return;
+            auto asset = library->asset(row.asset_id);
+            if (!asset || !*asset || !(*asset)->current_revision_id)
+                continue;
+            auto document = library->open_revision(*(*asset)->current_revision_id, parser);
+            if (!document)
+                continue;
+            midi::ExportOptions options;
+            options.mode = midi::ExportMode::compatibility;
+            auto bytes = midi::export_midi(*document, options);
+            if (!bytes)
+                continue;
+            auto file = write_drag_file(cache, row.title.toStdString(), *bytes);
+            if (!file)
+                continue;
+            const QString path = QString::fromStdWString(file->wstring());
+            QMetaObject::invokeMethod(
+                qApp, // context outlives the task; the lambda checks the guard
+                [guard, asset_id = row.asset_id, modified = row.modified_ms, path] {
+                    if (guard) // ignored when the row shows a newer revision by now
+                        guard->model_->set_drag_file(asset_id, modified, path);
+                },
+                Qt::QueuedConnection);
+        }
     });
 }
 
-void LibraryPanel::run_metadata_task(std::function<Status(library::Library&, std::int64_t)> task, bool removes_row) {
-    const LibraryRow* row = model_->row_at(table_->currentIndex().row());
-    if (!row || !library_)
+void LibraryPanel::run_metadata_task(std::function<Status(library::Library&, std::int64_t)> task,
+                                     std::function<void(LibraryRow&)> optimistic, bool removes_row) {
+    const auto assets = selected_assets();
+    if (assets.empty() || !library_)
         return;
-    const auto asset_id = row->asset_id;
+    // Shown at once; the previous rows (with their positions) put things back if the library
+    // refuses (code-uiA-7).
+    struct Previous {
+        int position = 0;
+        LibraryRow row;
+    };
+    std::vector<Previous> previous;
+    for (const auto asset : assets) {
+        const int position = model_->position_of(asset);
+        if (position < 0)
+            continue;
+        previous.push_back({position, *model_->row_at(position)});
+        if (removes_row) {
+            model_->replace_row(asset, std::nullopt);
+        } else if (optimistic) {
+            LibraryRow changed = previous.back().row;
+            optimistic(changed);
+            model_->replace_row(asset, changed);
+        }
+    }
     auto library = library_;
     QPointer<LibraryPanel> guard(this);
-    write_thread_->post([guard, library, asset_id, task = std::move(task), removes_row](std::stop_token) {
-        const Status status = task(*library, asset_id);
+    write_thread_->post([guard, library, assets, task = std::move(task), removes_row, previous](std::stop_token) {
+        std::vector<std::int64_t> failed;
+        QString error;
+        for (const auto asset : assets)
+            if (const Status status = task(*library, asset); !status) {
+                failed.push_back(asset);
+                error = QString::fromStdString(status.error().describe());
+            }
         QMetaObject::invokeMethod(
             qApp, // context outlives the task; the lambda checks the guard
-            [guard, status, asset_id, removes_row] {
+            [guard, assets, failed, error, removes_row, previous] {
                 if (!guard)
                     return;
-                if (!status)
-                    emit guard->status_message(tr("Not saved: %1").arg(QString::fromStdString(status.error().describe())));
-                guard->refresh_row(asset_id, removes_row && status);
+                if (!failed.empty())
+                    emit guard->status_message(tr("Not saved for %n item(s): %1", nullptr, static_cast<int>(failed.size()))
+                                                   .arg(error));
+                for (const auto& old : previous) { // in ascending positions: reinserting keeps the order
+                    const bool refused = std::ranges::find(failed, old.row.asset_id) != failed.end();
+                    if (refused && removes_row)
+                        guard->model_->insert_row(old.position, old.row);
+                    else if (refused)
+                        guard->model_->replace_row(old.row.asset_id, old.row);
+                    else if (!removes_row)
+                        guard->refresh_row(old.row.asset_id, false); // the stored values (e.g. normalized tags)
+                }
+                // Items came back or went (restore, trash): a text search shows the library as
+                // it is now, at the same place (a search started meanwhile may not have seen it).
+                if (removes_row && failed.size() < assets.size() && guard->mode_ == ResultMode::text)
+                    guard->run_search(true);
             },
             Qt::QueuedConnection);
     });
@@ -879,13 +1327,26 @@ void LibraryPanel::deliver_results(std::uint64_t generation, std::vector<Library
     else
         model_->set_rows(std::move(rows));
     next_page_ = std::move(next);
+    if (!append && keep_asset_) {
+        // A refresh keeps the item the user was on and where the list was scrolled.
+        if (const int position = model_->position_of(*keep_asset_); position >= 0)
+            table_->setCurrentIndex(model_->index(position, 0));
+        table_->verticalScrollBar()->setValue(keep_scroll_);
+        keep_asset_.reset();
+    }
     const int count = model_->rowCount({});
     // Pages are fetched as the list scrolls; the count says when more exist (no full count query).
-    status_->setText(count == 0 && current_query_.empty()
-                         ? tr("This library is empty. Use Add Folder… to import MIDI files.")
-                     : count == 0 ? tr("No match (items still being indexed are not searched musically)")
-                     : next_page_ ? tr("%1+ results (scroll for more)").arg(count)
-                                  : tr("%n result(s)", nullptr, count));
+    QString text;
+    if (count == 0) {
+        text = mode_ == ResultMode::melody ? tr("No phrase matches the selected melody (items still being indexed are "
+                                                "not searched)")
+               : mode_ == ResultMode::trash ? tr("The trash is empty")
+               : current_query_.empty()     ? tr("This library is empty. Use Add Folder… to import MIDI files.")
+                                            : tr("No match (items still being indexed are not searched musically)");
+    } else {
+        text = next_page_ ? tr("%1+ results (scroll for more)").arg(count) : tr("%n result(s)", nullptr, count);
+    }
+    status_->setText(text);
 }
 
 void LibraryPanel::open_selected() {
@@ -896,7 +1357,8 @@ void LibraryPanel::open_selected() {
     QPointer<LibraryPanel> guard(this);
     auto library = library_;
     const auto asset_id = row->asset_id;
-    browse_thread_->post([guard, library, asset_id, parser = parser_](std::stop_token) {
+    const auto reveal = row->match;
+    browse_thread_->post([guard, library, asset_id, reveal, parser = parser_](std::stop_token) {
         std::optional<DocumentData> document;
         QString error;
         std::int64_t revision_id = 0;
@@ -913,11 +1375,11 @@ void LibraryPanel::open_selected() {
         }
         QMetaObject::invokeMethod(
             qApp, // context outlives the task; the lambda checks the guard
-            [guard, document = std::move(document), error, asset_id, revision_id]() mutable {
+            [guard, document = std::move(document), error, asset_id, revision_id, reveal]() mutable {
                 if (!guard)
                     return;
-                if (document)
-                    emit guard->open_requested(std::move(*document), asset_id, revision_id); // a working document
+                if (document) // a working document; a melody result opens at its match
+                    emit guard->open_requested(std::move(*document), asset_id, revision_id, reveal);
                 else
                     emit guard->status_message(error);
             },
@@ -929,24 +1391,15 @@ void LibraryPanel::set_metadata(int action) {
     const LibraryRow* row = model_->row_at(table_->currentIndex().row());
     if (!row || !library_)
         return;
-    const auto asset_id = row->asset_id;
-    const bool favorite = !row->favorite;
-    auto library = library_;
-    QPointer<LibraryPanel> guard(this);
-    write_thread_->post([guard, library, asset_id, action, favorite](std::stop_token) {
-        const Status status = action == 0 ? library->set_favorite(asset_id, favorite)
-                                          : library->set_rating(asset_id, action - 10);
-        QMetaObject::invokeMethod(
-            qApp, // context outlives the task; the lambda checks the guard
-            [guard, status, asset_id] {
-                if (!guard)
-                    return;
-                if (!status)
-                    emit guard->status_message(tr("Not saved: %1").arg(QString::fromStdString(status.error().describe())));
-                guard->refresh_row(asset_id, false);
-            },
-            Qt::QueuedConnection);
-    });
+    if (action == 0) {
+        const bool favorite = !row->favorite; // one new value for every selected item
+        run_metadata_task([favorite](library::Library& library, std::int64_t asset) { return library.set_favorite(asset, favorite); },
+                          [favorite](LibraryRow& changed) { changed.favorite = favorite; });
+        return;
+    }
+    const int rating = action - 10;
+    run_metadata_task([rating](library::Library& library, std::int64_t asset) { return library.set_rating(asset, rating); },
+                      [rating](LibraryRow& changed) { changed.rating = rating; });
 }
 
 void LibraryPanel::poll_changes() {
@@ -972,19 +1425,22 @@ void LibraryPanel::poll_changes() {
                 if (first)
                     return; // the first poll only learns where the outbox stands
                 if (batch.full_reload || batch.structure_changed) {
-                    guard->run_search();
+                    guard->refresh_results(); // text results keep their item and scroll position
                     return;
                 }
-                bool unseen = false;
+                std::size_t unseen = 0;
                 for (const auto asset : batch.asset_ids) {
                     if (guard->model_->contains_asset(asset))
                         guard->refresh_row(asset, false);
                     else
-                        unseen = true;
+                        ++unseen;
                 }
-                // New items join the list when every result is already loaded (no lost paging).
-                if (unseen && !guard->next_page_ && !guard->fetching_more_)
-                    guard->run_search();
+                // New items never reset the list under the user (no refresh storm during an
+                // import, code-uiA-6): the status offers Refresh instead.
+                if (unseen > 0 && guard->mode_ == ResultMode::text && !guard->cancel_import_button_->isVisible())
+                    guard->status_->setText(
+                        tr("%n new or changed item(s) are not in this list yet; press Refresh to show them", nullptr,
+                           static_cast<int>(unseen)));
             },
             Qt::QueuedConnection);
     });
@@ -1006,8 +1462,12 @@ void LibraryPanel::refresh_row(std::int64_t asset_id, bool removed) {
         QMetaObject::invokeMethod(
             qApp,
             [guard, asset_id, row] {
-                if (guard && row)
-                    guard->model_->replace_row(asset_id, row);
+                if (!guard || !row)
+                    return;
+                guard->model_->replace_row(asset_id, row);
+                // A new revision dropped the prepared drag file: prepare it again if selected.
+                if (std::ranges::contains(guard->selected_assets(), asset_id))
+                    guard->prepare_drag_file();
             },
             Qt::QueuedConnection);
     });

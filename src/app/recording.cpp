@@ -94,7 +94,12 @@ Result<std::vector<CapturedMessage>> decode_take_chunk(std::span<const std::uint
 TakeRecorder::TakeRecorder(TrackId track, RecordingOptions options, std::function<Tick(std::int64_t)> time_to_tick)
     : track_(track), options_(std::move(options)), time_to_tick_(std::move(time_to_tick)) {}
 
-void TakeRecorder::add(const CapturedMessage& message) { raw_.push_back(message); }
+void TakeRecorder::add(const CapturedMessage& message) {
+    // Mapped now, not at finish(): the transport clock that places the message (section 8.4
+    // rule 2) is only valid while its play run is going, and finish() runs after the stop.
+    ticks_.push_back(time_to_tick_(message.time_ns - options_.latency_compensation_ns));
+    raw_.push_back(message);
+}
 
 void TakeRecorder::interrupt(std::string reason) { interruption_ = std::move(reason); }
 
@@ -183,7 +188,8 @@ Result<RecordedTake> TakeRecorder::finish(const DocumentData& document, Tick sto
         return true;
     };
 
-    for (const auto& message : raw_) {
+    for (std::size_t index = 0; index < raw_.size(); ++index) {
+        const CapturedMessage& message = raw_[index];
         if (message.size == 0)
             continue;
         const std::uint8_t status = message.bytes[0];
@@ -193,7 +199,9 @@ Result<RecordedTake> TakeRecorder::finish(const DocumentData& document, Tick sto
         if (!accepted_channel(channel))
             continue;
         std::int64_t pass = 0;
-        const Tick tick = std::max<Tick>(0, fold(time_to_tick_(message.time_ns - options_.latency_compensation_ns), pass));
+        // Not clamped at 0: a message during a count-in from tick 0 maps before the take start
+        // and is handled by the punch-in rules below, never moved onto tick 0.
+        const Tick tick = fold(ticks_[index], pass);
         last_pass = std::max(last_pass, pass);
         const std::uint8_t kind = status & 0xF0;
         if (kind == 0x90 || kind == 0x80) {

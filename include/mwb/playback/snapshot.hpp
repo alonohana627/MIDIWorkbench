@@ -51,6 +51,7 @@ struct PlaybackOptions {
     std::uint32_t preflight_block_frames = 4096; ///< Largest audio block the live engine renders.
     std::size_t max_routes = 256;            ///< Upper bound on distinct routes.
     std::size_t checkpoint_interval = 1024;  ///< Events between controller checkpoints.
+    Tick minimum_end_tick = 0;               ///< Play (and click) at least to here: a take may run past the song end.
 };
 
 /// A logical destination plus MIDI channel (section 2 "Route"). Events sharing a route share

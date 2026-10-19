@@ -26,6 +26,7 @@
 #include "mwb/ui/playback_service.hpp"
 #include "mwb/ui/recording_controller.hpp"
 #include "mwb/ui/shortcut_editor.hpp"
+#include "mwb/ui/tempo_field.hpp"
 
 #include <QApplication>
 #include <QClipboard>
@@ -69,6 +70,8 @@
 #include <QTextBrowser>
 #include <QToolBar>
 #include <QVBoxLayout>
+
+#include <utility>
 
 namespace mwb::ui {
 
@@ -544,11 +547,20 @@ void MainWindow::build_actions() {
         statusBar()->showMessage(tr("Panic sent to app-owned routes"), 3000);
     }, Qt::ApplicationShortcut);
     record_action_ = add_command("transport.record", tr("Record"), QKeySequence(Qt::Key_R), [this] {
-        if (auto* tab = current_tab(); tab && transport_display_is_stopped(playback_->display())) {
-            transport_owner_ = &tab->controller();
-            publish_playback(); // recording plays the current document from the count-in
+        if (auto* tab = current_tab(); tab && !recording_->recording()) {
+            if (!transport_display_is_stopped(playback_->display()) && transport_owner_ != &tab->controller())
+                stop_transport(); // another document owns the running transport
+            const auto state = playback_->display().state;
+            if (transport_display_is_stopped(playback_->display()) || state == TransportDisplay::State::paused) {
+                transport_owner_ = &tab->controller();
+                publish_playback(); // recording plays the current document from the count-in
+                play_started_from_ = tab->controller().edit_cursor(); // Space returns here
+                paused_cursor_.reset();
+            }
+            // Otherwise this document is playing: the take punches in at the playhead.
         }
         recording_->toggle_recording();
+        record_action_->setChecked(recording_->recording()); // also when the take could not start
     });
     record_action_->setCheckable(true);
     connect(recording_, &RecordingController::recording_changed, record_action_, &QAction::setChecked);
@@ -821,6 +833,17 @@ void MainWindow::build_toolbar() {
     position->setToolTip(tr("Transport position (bar.beat.tick) and state"));
     transport_bar_->addWidget(position);
     position_label_ = position;
+    // Editable song tempo next to the readout: the BPM is the setting people change most.
+    tempo_field_ = new TempoField(this);
+    tempo_field_->setMinimumWidth(QFontMetrics(tempo_field_->font()).horizontalAdvance(QStringLiteral("000.0 BPM")) + 36);
+    transport_bar_->addWidget(tempo_field_);
+    connect(tempo_field_, &QDoubleSpinBox::valueChanged, this, [this] {
+        // The first change of a burst fixes which tempo event the burst edits, even while playing.
+        if (!tempo_edit_at_ && tempo_field_->editing())
+            if (auto* tab = current_tab())
+                tempo_edit_at_ = tempo_position(*tab);
+    });
+    connect(tempo_field_, &TempoField::tempo_committed, this, &MainWindow::commit_tempo);
 
     auto* spacer = new QWidget(this);
     spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
@@ -1667,6 +1690,30 @@ void MainWindow::publish_playback() {
                                 transport_owner_->generation());
 }
 
+Tick MainWindow::tempo_position(EditorTab& tab) const {
+    const auto display = playback_->display();
+    if (transport_owner_ == &tab.controller() && !transport_display_is_stopped(display) &&
+        display.state != TransportDisplay::State::paused)
+        return display.position;
+    return tab.controller().edit_cursor();
+}
+
+void MainWindow::commit_tempo(double bpm) {
+    auto* tab = current_tab();
+    const std::optional<Tick> at = std::exchange(tempo_edit_at_, std::nullopt);
+    if (!tab)
+        return;
+    auto& controller = tab->controller();
+    if (!controller.active_sequence().division.is_ppq()) {
+        statusBar()->showMessage(tr("This sequence uses SMPTE time; its tempo cannot be changed"), 5000);
+        return;
+    }
+    // One undo entry; while playing, document_changed republishes the snapshot and the
+    // scheduler continues from the same musical position at the new tempo.
+    if (controller.set_tempo_at(at.value_or(tempo_position(*tab)), bpm))
+        statusBar()->showMessage(tr("Tempo %1 BPM").arg(tempo_field_->textFromValue(tempo_field_->value())), 3000);
+}
+
 void MainWindow::start_playback(EditorTab& tab, Tick from) {
     if (transport_owner_ != &tab.controller()) {
         playback_->stop(0); // another document owned the transport
@@ -1818,7 +1865,8 @@ void MainWindow::update_status_from_transport() {
     }
     if (transport_owner_) {
         const auto& meter = transport_owner_->meter_map().segment_at(display.position);
-        const double bpm = 60'000'000.0 / static_cast<double>(transport_owner_->tempo_map().tempo_at(display.position));
+        // Rounded to the 0.1 BPM the field edits, so 90 BPM (666667 us) reads 90, not 90.0.
+        const double bpm = std::round(600'000'000.0 / static_cast<double>(transport_owner_->tempo_map().tempo_at(display.position))) / 10.0;
         position_label_->setText(QString("%1  %2  %3/%4  %5%6")
                                      .arg(QString::fromStdString(transport_owner_->meter_map().format(display.position)))
                                      .arg(tr("♩=%1").arg(QString::number(bpm, 'f', bpm == std::floor(bpm) ? 0 : 1)))
@@ -1837,6 +1885,13 @@ void MainWindow::update_status_from_transport() {
                                                        display.state != TransportDisplay::State::stopped
                                                    ? std::optional<Tick>(display.position)
                                                    : std::nullopt);
+    }
+    if (auto* tab = current_tab(); tab && tempo_field_) {
+        const bool ppq = tab->controller().active_sequence().division.is_ppq();
+        tempo_field_->setEnabled(ppq);
+        const auto microseconds = tab->controller().tempo_map().tempo_at(tempo_position(*tab));
+        if (ppq && microseconds > 0)
+            tempo_field_->show_tempo(60'000'000.0 / static_cast<double>(microseconds)); // skipped while being edited
     }
     // Short readout; the full device description is in the tooltip. Warnings use "!" not color alone.
     const QString device = display.device_description;

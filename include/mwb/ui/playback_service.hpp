@@ -43,7 +43,23 @@ public:
     /// Stops and returns to `return_to`.
     virtual void stop(Tick return_to) = 0;
     virtual void seek(Tick tick) = 0;
+    /// Starts a take (section 13.3). Stopped or Paused: plays from `from` after `count_in_bars`
+    /// bars of count-in clicks (CountingIn, then Recording; the count-in is measured in time, so
+    /// it also works from tick 0). Playing: punches in at the current position, no count-in.
+    /// Returns the tick where capture starts, or nullopt when the transport refuses.
+    [[nodiscard]] virtual std::optional<Tick> record(Tick from, int count_in_bars) = 0;
+    /// Recording -> Playing: the take ends and playback continues.
+    virtual void punch_out() = 0;
+    /// Linear transport tick heard at `steady_ns` (steady_clock nanoseconds) in the current play
+    /// run: the engine's audio clock minus output latency, through the playing snapshot's tempo
+    /// map, tempo multiplier and loop, with later loop passes unfolded. nullopt while the
+    /// transport is not rolling or the run has not started yet (section 8.4 rule 2).
+    [[nodiscard]] virtual std::optional<Tick> transport_tick_at(std::int64_t steady_ns) const = 0;
     virtual void set_loop(std::optional<TimeRange> loop) = 0;
+    /// Loop range of the published playback (nullopt when not looping).
+    [[nodiscard]] virtual std::optional<TimeRange> loop() const = 0;
+    /// Playback speed multiplier currently applied (1 = document tempo).
+    [[nodiscard]] virtual Rational tempo_multiplier() const = 0;
     virtual void set_metronome(bool enabled) = 0;
     virtual void set_tempo_multiplier(double multiplier) = 0;
     /// Live audition through the private audition voice (never the document's channel state).

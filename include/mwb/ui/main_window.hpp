@@ -43,6 +43,7 @@ class LibraryPanel;
 class PlaybackService;
 class DragHandle;
 class RecordingController;
+class TempoField;
 
 /// Startup options shared by the GUI and its headless test mode (section 32.2).
 struct StartupOptions {
@@ -141,6 +142,10 @@ private:
     void start_playback(EditorTab& tab, Tick from);
     void connect_tab(EditorTab* tab);
     void publish_playback();
+    /// Where the toolbar BPM field reads and writes the tempo: the playhead while this tab owns
+    /// the rolling transport, otherwise the edit cursor.
+    [[nodiscard]] Tick tempo_position(EditorTab& tab) const;
+    void commit_tempo(double bpm);
     void write_screenshot_and_exit();
 
     StartupOptions options_;
@@ -165,6 +170,8 @@ private:
     bool updating_toolbar_ = false;
     bool showing_pause_ = false;
     QDoubleSpinBox* tempo_multiplier_ = nullptr;
+    TempoField* tempo_field_ = nullptr;
+    std::optional<Tick> tempo_edit_at_; ///< Position captured when a BPM edit burst started.
     QAction* loop_action_ = nullptr;
     QAction* metronome_action_ = nullptr;
     QAction* playing_mode_action_ = nullptr;

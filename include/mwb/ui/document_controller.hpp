@@ -46,6 +46,12 @@ public:
     /// Applies one command; returns false and sets `error` when it was rejected (the document
     /// is then unchanged).
     bool apply(const ChangeSet& changes, QString* error = nullptr);
+    /// Sets the song tempo heard at `position` of the active sequence as one undo entry ("Change
+    /// tempo"). Without tempo changes after tick 0 the tempo at bar 1 is replaced (or inserted on
+    /// the first track, as the Inspector's Song section does); with tempo changes, the tempo
+    /// event in effect at `position` is replaced, so the rest of the tempo map is kept. `bpm` is
+    /// clamped to 5..999. False when the value is unchanged, the sequence is not PPQ, or refused.
+    bool set_tempo_at(Tick position, double bpm);
     bool undo();
     bool redo();
     [[nodiscard]] bool can_undo() const;

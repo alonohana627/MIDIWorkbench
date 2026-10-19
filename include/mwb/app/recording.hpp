@@ -61,8 +61,10 @@ struct RecordedTake {
     std::vector<std::string> messages;
 };
 
-/// Captures a real-time take. Messages are mapped to ticks by `time_to_tick` (the transport
-/// clock and tempo map); the raw messages are kept unchanged as evidence.
+/// Captures a real-time take. Each message is mapped to a tick by `time_to_tick` (the transport
+/// clock and tempo map) when it is added; the raw messages are kept unchanged as evidence. Ticks
+/// may be negative (a count-in before tick 0); they are linear, so loop passes after the first
+/// lie after the loop end and are folded by RecordingOptions::loop.
 class TakeRecorder {
 public:
     TakeRecorder(TrackId track, RecordingOptions options, std::function<Tick(std::int64_t)> time_to_tick);
@@ -83,6 +85,7 @@ private:
     RecordingOptions options_;
     std::function<Tick(std::int64_t)> time_to_tick_;
     std::vector<CapturedMessage> raw_;
+    std::vector<Tick> ticks_; ///< Transport tick of each raw_ message (latency compensated).
     std::size_t lost_ = 0;
     std::optional<std::string> interruption_;
 };

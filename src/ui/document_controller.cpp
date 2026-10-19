@@ -10,6 +10,8 @@
 #include <QMetaObject>
 #include <QPointer>
 
+#include <algorithm>
+#include <cmath>
 #include <thread>
 #include <unordered_map>
 
@@ -337,6 +339,45 @@ void DocumentController::set_selection(std::set<EventId> notes) {
         return;
     selection_ = std::move(notes);
     emit selection_changed();
+}
+
+bool DocumentController::set_tempo_at(Tick position, double bpm) {
+    const Sequence& sequence = active_sequence();
+    if (!sequence.division.is_ppq() || sequence.tracks.empty() || !std::isfinite(bpm))
+        return false;
+    const auto microseconds = static_cast<std::uint32_t>(std::llround(60'000'000.0 / std::clamp(bpm, 5.0, 999.0)));
+    const Event wanted = events::tempo(0, microseconds);
+    // Find the tempo event to edit: the one at tick 0 when the song has no later tempo changes,
+    // otherwise the last one at or before `position` (ties: the later in track order wins, as in
+    // the tempo map).
+    bool later_changes = false;
+    for (const Track& track : sequence.tracks)
+        for (const Event& event : track.events)
+            later_changes = later_changes || (event.tick > 0 && event.is_meta(meta_type::tempo));
+    const Tick limit = later_changes ? std::max<Tick>(position, 0) : 0;
+    const Track* target_track = nullptr;
+    const Event* target = nullptr;
+    for (const Track& track : sequence.tracks)
+        for (const Event& event : track.events) {
+            if (event.tick > limit)
+                break; // events are sorted by tick
+            if (event.is_meta(meta_type::tempo) && (!target || event.tick >= target->tick)) {
+                target_track = &track;
+                target = &event;
+            }
+        }
+    ChangeBuilder builder(document(), "Change tempo");
+    if (target) {
+        if (target->payload == wanted.payload)
+            return false;
+        Event updated = *target;
+        updated.payload = wanted.payload;
+        builder.replace(target_track->id, target->id, updated);
+    } else {
+        std::ignore = builder.insert(sequence.tracks.front().id, wanted, OrderPlacement::before_existing);
+    }
+    auto changes = builder.finish();
+    return !changes.empty() && apply(changes);
 }
 
 void DocumentController::set_edit_cursor(Tick tick) {

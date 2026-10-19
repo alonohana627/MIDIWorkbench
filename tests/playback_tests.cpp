@@ -851,3 +851,59 @@ TEST_SUITE("scheduler") {
                        (expected - 960)) <= 1);
     }
 }
+
+TEST_SUITE("scheduler") {
+    TEST_CASE("a tempo edit while playing keeps the musical position and continues at the new tempo") {
+        DocumentData document = make_blank_document();
+        add_note(document, first_track(document), 0, 100000, 60);
+        PlaybackOptions options;
+        options.sample_rate = 48000;
+        const auto before = compile(document, options);
+        bool replaced = false;
+        for (Event& event : document.sequences.front().tracks.front().events)
+            if (event.is_meta(meta_type::tempo) && event.tick == 0) {
+                event.payload = events::tempo(0, 1'000'000).payload; // 120 -> 60 BPM
+                replaced = true;
+            }
+        if (!replaced)
+            insert_event(document, first_track(document), events::tempo(0, 1'000'000));
+        const auto after = compile(document, options);
+        Scheduler scheduler;
+        NullSink ignore;
+        REQUIRE(scheduler.set_snapshot(before.get(), ignore));
+        scheduler.start(0, ignore);
+        for (int block = 0; block < 100; ++block)
+            std::ignore = scheduler.process_block(480, ignore); // 1 s at 120 BPM
+        const Tick at_swap = scheduler.position_tick();
+        CHECK(std::abs(at_swap - 1920) <= 1);
+        REQUIRE(scheduler.set_snapshot(after.get(), ignore));
+        CHECK(std::abs(scheduler.position_tick() - at_swap) <= 1); // no jump, no restart
+        CHECK(scheduler.playing());
+        for (int block = 0; block < 100; ++block)
+            std::ignore = scheduler.process_block(480, ignore); // 1 s at 60 BPM: one beat
+        CHECK(std::abs(scheduler.position_tick() - (at_swap + 960)) <= 2);
+    }
+
+    TEST_CASE("a take may run past the song end: minimum_end_tick extends the snapshot") {
+        DocumentData document = make_blank_document();
+        PlaybackOptions options;
+        options.minimum_end_tick = 1'000'000;
+        const auto snapshot = compile(document, options);
+        CHECK(snapshot->end_tick >= 1'000'000);
+    }
+
+    TEST_CASE("the transport clock follows the tempo multiplier") {
+        DocumentData document = make_blank_document();
+        add_note(document, first_track(document), 0, 100000, 60);
+        PlaybackOptions options;
+        options.sample_rate = 48000;
+        options.session.tempo_multiplier = Rational{2, 1};
+        const auto snapshot = compile(document, options);
+        Scheduler scheduler;
+        NullSink ignore;
+        REQUIRE(scheduler.set_snapshot(snapshot.get(), ignore));
+        scheduler.start(0, ignore);
+        // One second at 120 BPM and double speed is four beats.
+        CHECK(std::abs(linear_tick_at(*snapshot, scheduler.clock(), 48000) - 3840) <= 1);
+    }
+}

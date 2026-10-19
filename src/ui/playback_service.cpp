@@ -76,13 +76,30 @@ private:
                 cancel_ = std::stop_source{};
                 cancel = cancel_.get_token();
             }
-            auto compiled = playback::compile_playback(*request.document, request.options, cancel);
-            if (cancel.stop_requested())
-                continue;
-            if (compiled)
-                delivery_(std::shared_ptr<const playback::PlaybackSnapshot>(std::move(*compiled)), request.generation, {});
-            else
-                delivery_(nullptr, request.generation, QString::fromStdString(compiled.error().describe()));
+            // An exception (std::bad_alloc on a pathological document, or any other) must never
+            // escape this std::jthread, which would call std::terminate and lose unsaved work: it
+            // is delivered as a refused compile instead (round 5 finding 1).
+            try {
+                auto compiled = playback::compile_playback(*request.document, request.options, cancel);
+                if (cancel.stop_requested())
+                    continue;
+                if (compiled)
+                    delivery_(std::shared_ptr<const playback::PlaybackSnapshot>(std::move(*compiled)), request.generation, {});
+                else
+                    delivery_(nullptr, request.generation, QString::fromStdString(compiled.error().describe()));
+            } catch (const std::exception& error) {
+                deliver_failure(request.generation, QString::fromLocal8Bit(error.what()));
+            } catch (...) {
+                deliver_failure(request.generation, QObject::tr("unexpected error"));
+            }
+        }
+    }
+
+    void deliver_failure(std::uint64_t generation, const QString& reason) noexcept {
+        try {
+            delivery_(nullptr, generation, QObject::tr("could not prepare playback (%1)").arg(reason));
+        } catch (...) {
+            // Out of memory even for the message: the request is dropped, playback stays stopped.
         }
     }
 
@@ -107,6 +124,16 @@ public:
         thread_.request_stop();
         if (thread_.joinable())
             thread_.join();
+        // The engine was closed first and queued its owned note-offs and the panic messages;
+        // send what is still queued now, immediately, and wait (bounded) until the outputs have
+        // handed it to the drivers, so quitting never leaves a hardware synth with stuck notes.
+        platform::ExternalMidiEvent event;
+        std::lock_guard lock(mutex_);
+        while (engine_.wait_external(event, std::chrono::microseconds(0)))
+            if (const auto found = routes_.find(event.route_key); found != routes_.end())
+                std::ignore = found->second->send(std::span<const std::uint8_t>(event.bytes.data(), event.size), 0);
+        for (auto& [endpoint, output] : outputs_)
+            std::ignore = output->flush(std::chrono::milliseconds(200)); // a stalled driver is not waited for longer
     }
 
     /// Maps route keys of a newly published snapshot to endpoints, opening outputs as needed.
@@ -145,7 +172,11 @@ public:
         std::lock_guard lock(mutex_);
         for (auto& [endpoint, output] : opened_now)
             outputs_[endpoint] = std::move(output);
-        routes_.clear();
+        // Routes are only added, never cleared: when a route disappears (mute, solo, channel or
+        // endpoint change) the scheduler still releases its sounding notes through the old route
+        // key, and those note-offs must reach the device. A key is a hash of (output, endpoint,
+        // channel), so an old key can never point at the wrong endpoint, and the map is bounded by
+        // the endpoints times 16 channels.
         for (const auto& [key, endpoint] : wanted)
             if (const auto found = outputs_.find(endpoint); found != outputs_.end())
                 routes_[key] = found->second.get();
@@ -200,7 +231,8 @@ public:
                     Qt::QueuedConnection);
             });
         open_device();
-        retire_timer_.setInterval(250);
+        // 50 ms: also the latency of the CountingIn -> Recording transition and of the end of the song.
+        retire_timer_.setInterval(50);
         connect(&retire_timer_, &QTimer::timeout, this, [this] {
             if (engine_)
                 engine_->collect_retired(); // destroy retired snapshots off the render thread
@@ -212,12 +244,10 @@ public:
     ~EnginePlaybackService() override {
         retire_timer_.stop();
         compiler_.reset();
-        // Panic and close the engine first, so the note-offs it queues still reach external
-        // MIDI through the router; only then stop the router thread.
-        if (engine_) {
-            std::ignore = engine_->post({platform::EngineCommandKind::panic, 0}); // no stuck notes on shutdown
+        // Close the engine first: close() releases owned notes and panics every used route into
+        // the external queue; the router's destructor then sends what is queued and flushes.
+        if (engine_)
             engine_->close();
-        }
         {
             std::lock_guard lock(router_mutex_);
             router_.reset();
@@ -230,13 +260,9 @@ public:
         // Serial numbers are unique per service, so two documents with equal generations never
         // satisfy each other's request.
         std::ignore = generation;
-        requested_generation_ = ++publish_serial_;
-        playback::PlaybackOptions options;
-        options.sequence = document.sequences[std::min(sequence_index, document.sequences.size() - 1)].id;
-        options.sample_rate = engine_->sample_rate();
-        options.session.loop = loop_;
-        options.session.tempo_multiplier = tempo_multiplier_;
-        compiler_->request(std::make_shared<const DocumentData>(document), options, requested_generation_);
+        last_document_ = std::make_shared<const DocumentData>(document);
+        last_sequence_index_ = std::min(sequence_index, document.sequences.size() - 1);
+        republish();
     }
 
     void play(Tick from) override {
@@ -244,16 +270,65 @@ public:
             return;
         const auto command = transport_.state() == playback::TransportState::paused ? playback::TransportCommand::resume
                                                                                      : playback::TransportCommand::play;
-        if (transport_.state() == playback::TransportState::playing)
+        if (rolling())
             return;
         if (!transport_.apply(command))
             return;
         transport_.set_position(from);
         pending_play_from_ = from;
+        pending_count_in_ = 0;
         if (have_snapshot_ && delivered_generation_ == requested_generation_)
             start_engine(); // otherwise deliver() starts it once the current document is compiled
         emit transport_state_changed();
     }
+
+    std::optional<Tick> record(Tick from, int count_in_bars) override {
+        if (!engine_)
+            return std::nullopt;
+        const auto state = transport_.state();
+        if (state == playback::TransportState::playing) {
+            // Punch-in (section 13.3): capture starts where the transport is now.
+            if (!transport_.apply(playback::TransportCommand::punch_in))
+                return std::nullopt;
+            const Tick at = pending_play_from_ ? *pending_play_from_ : engine_->telemetry().position;
+            transport_.set_position(at);
+            recording_ = true;
+            republish(); // playback now runs on past the song end
+            emit transport_state_changed();
+            return at;
+        }
+        if (state == playback::TransportState::paused) {
+            std::ignore = transport_.apply(playback::TransportCommand::stop); // Paused -> Stopped is an edge
+            std::ignore = engine_->post({platform::EngineCommandKind::stop, from});
+        }
+        const bool count_in = count_in_bars > 0;
+        if (!transport_.apply(count_in ? playback::TransportCommand::record_with_count_in : playback::TransportCommand::record))
+            return std::nullopt;
+        transport_.set_position(from);
+        recording_ = true;
+        pending_play_from_ = from;
+        pending_count_in_ = static_cast<std::uint32_t>(std::clamp(count_in_bars, 0, 16));
+        republish(); // deliver() starts the engine once this compile (with the extended end) lands
+        emit transport_state_changed();
+        return from;
+    }
+
+    void punch_out() override {
+        if (transport_.state() != playback::TransportState::recording)
+            return;
+        std::ignore = transport_.apply(playback::TransportCommand::punch_out); // Recording -> Playing is an edge
+        recording_ = false;
+        emit transport_state_changed();
+    }
+
+    [[nodiscard]] std::optional<Tick> transport_tick_at(std::int64_t steady_ns) const override {
+        if (!engine_ || pending_play_from_ || !rolling() || current_run_ == 0)
+            return std::nullopt;
+        return engine_->transport_tick_at(steady_ns, current_run_);
+    }
+
+    [[nodiscard]] std::optional<TimeRange> loop() const override { return loop_; }
+    [[nodiscard]] Rational tempo_multiplier() const override { return tempo_multiplier_; }
 
     void pause() override {
         if (!engine_ || !transport_.apply(playback::TransportCommand::pause))
@@ -266,7 +341,12 @@ public:
     void stop(Tick return_to) override {
         if (!engine_)
             return;
-        std::ignore = transport_.apply(playback::TransportCommand::stop); // already stopped is fine
+        // CountingIn leaves through Cancel, every other rolling state through Stop; an already
+        // stopped transport refuses both, which is fine.
+        std::ignore = transport_.apply(transport_.state() == playback::TransportState::counting_in
+                                           ? playback::TransportCommand::cancel
+                                           : playback::TransportCommand::stop);
+        recording_ = false;
         pending_play_from_.reset();
         std::ignore = engine_->post({platform::EngineCommandKind::stop, return_to});
         paused_at_ = return_to;
@@ -335,7 +415,7 @@ public:
         if (!engine_)
             return display;
         const auto telemetry = engine_->telemetry();
-        display.position = transport_.state() == playback::TransportState::playing ? telemetry.position : paused_at_;
+        display.position = rolling() ? telemetry.position : paused_at_;
         display.snapshot_generation = telemetry.snapshot_generation;
         display.playing_older_generation = requested_generation_ != delivered_generation_;
         const auto peaks = engine_->meter().take();
@@ -389,10 +469,19 @@ private:
     }
 
     void check_device() {
-        if (engine_ && transport_.state() == playback::TransportState::playing) {
+        if (engine_ && rolling() && !pending_play_from_) {
             const auto telemetry = engine_->telemetry();
-            if (telemetry.reached_end && !telemetry.playing && !pending_play_from_) {
-                std::ignore = transport_.apply(playback::TransportCommand::stop); // end of song
+            // The engine reports which play run it is in, so state from an earlier run is ignored.
+            const bool this_run = telemetry.run == current_run_;
+            if (transport_.state() == playback::TransportState::counting_in && this_run && telemetry.playing &&
+                !telemetry.counting_in) {
+                std::ignore = transport_.apply(playback::TransportCommand::count_in_complete); // CountingIn -> Recording
+                emit transport_state_changed();
+            } else if (this_run && telemetry.reached_end && !telemetry.playing) {
+                std::ignore = transport_.apply(transport_.state() == playback::TransportState::counting_in
+                                                   ? playback::TransportCommand::cancel
+                                                   : playback::TransportCommand::stop); // end of song
+                recording_ = false;
                 paused_at_ = 0;
                 emit transport_state_changed();
             }
@@ -400,6 +489,9 @@ private:
         if (!engine_ || !engine_->device_lost() || transport_.state() == playback::TransportState::device_lost)
             return;
         engine_->handle_device_lost(); // voices released, position kept
+        if (transport_.state() == playback::TransportState::counting_in)
+            std::ignore = transport_.apply(playback::TransportCommand::cancel); // no device_failure edge from CountingIn
+        recording_ = false;
         std::ignore = transport_.apply(playback::TransportCommand::device_failure);
         device_description_ = tr("Audio device lost; choose another output and restart playback");
         emit device_lost(device_description_);
@@ -427,16 +519,46 @@ private:
         }
         delivered_generation_ = generation;
         have_snapshot_ = true;
-        if (pending_play_from_ && transport_.state() == playback::TransportState::playing &&
-            delivered_generation_ == requested_generation_)
+        if (pending_play_from_ && rolling() && delivered_generation_ == requested_generation_)
             start_engine();
     }
 
     void start_engine() {
         if (!pending_play_from_)
             return;
-        std::ignore = engine_->post({platform::EngineCommandKind::play, *pending_play_from_}); // queue full only under flood
+        // Each applied play command starts a new engine run; counting the posted ones tells
+        // transport_tick_at() which run is ours (a full queue only happens under a flood).
+        if (engine_->post({platform::EngineCommandKind::play, *pending_play_from_, pending_count_in_}))
+            ++current_run_;
         pending_play_from_.reset();
+        pending_count_in_ = 0;
+    }
+
+    /// Playing, CountingIn or Recording.
+    [[nodiscard]] bool rolling() const {
+        const auto state = transport_.state();
+        return state == playback::TransportState::playing || state == playback::TransportState::counting_in ||
+               state == playback::TransportState::recording;
+    }
+
+    /// Compiles the last published document again with the current session settings.
+    void republish() {
+        if (!engine_ || !last_document_)
+            return;
+        requested_generation_ = ++publish_serial_;
+        const Sequence& sequence = last_document_->sequences[last_sequence_index_];
+        playback::PlaybackOptions options;
+        options.sequence = sequence.id;
+        options.sample_rate = engine_->sample_rate();
+        options.session.loop = loop_;
+        options.session.tempo_multiplier = tempo_multiplier_;
+        if (recording_) {
+            // A take may run past the end of the song: keep the transport (and the click) going
+            // for 2000 bars of 4/4 after the current position instead of stopping at the end.
+            const Tick ppq = sequence.division.is_ppq() ? sequence.division.ppq : default_ppq;
+            options.minimum_end_tick = std::max<Tick>(transport_.position(), 0) + 2000 * 4 * ppq;
+        }
+        compiler_->request(last_document_, options, requested_generation_);
     }
 
     std::unique_ptr<SnapshotCompiler> compiler_;
@@ -451,7 +573,12 @@ private:
     QString device_description_;
     std::optional<TimeRange> loop_;
     Rational tempo_multiplier_{1, 1};
+    std::shared_ptr<const DocumentData> last_document_; ///< What publish_document() last asked for.
+    std::size_t last_sequence_index_ = 0;
     std::optional<Tick> pending_play_from_;
+    std::uint32_t pending_count_in_ = 0;  ///< Count-in bars of the pending play command.
+    std::uint64_t current_run_ = 0;       ///< Play commands posted (= the engine run they start).
+    bool recording_ = false;              ///< A take is running (snapshots extend past the song end).
     Tick paused_at_ = 0;
     std::uint64_t publish_serial_ = 0;
     std::uint64_t requested_generation_ = 0;

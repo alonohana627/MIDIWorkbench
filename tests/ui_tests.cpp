@@ -11,11 +11,15 @@
 #include "mwb/ui/keyboard_widget.hpp"
 #include "mwb/ui/controller_lane.hpp"
 #include "mwb/ui/piano_roll.hpp"
+#include "mwb/ui/playback_service.hpp"
+#include "mwb/ui/recording_controller.hpp"
+#include "mwb/ui/tempo_field.hpp"
 
 #include <QApplication>
 
 #include <chrono>
 #include <QKeyEvent>
+#include <QLineEdit>
 #include <QMimeData>
 #include <QSignalSpy>
 #include <QTest>
@@ -403,5 +407,302 @@ TEST_SUITE("clipboard") {
         CHECK(notes[0].end == 3840 + 480);
         CHECK(notes[1].start == 3840 + 962);
         CHECK(message.contains("PPQ 480"));
+    }
+}
+
+namespace {
+
+/// PlaybackService double for RecordingController: the test decides which transport tick the
+/// "engine clock" reports for the next captured message.
+class FakePlayback final : public PlaybackService {
+public:
+    void publish_document(const DocumentData&, std::size_t, std::uint64_t) override {}
+    void play(Tick from) override {
+        state = TransportDisplay::State::playing;
+        position = from;
+    }
+    void pause() override { state = TransportDisplay::State::paused; }
+    void stop(Tick return_to) override {
+        ++stops;
+        state = TransportDisplay::State::stopped;
+        position = return_to;
+        emit transport_state_changed();
+    }
+    void seek(Tick tick) override { position = tick; }
+    std::optional<Tick> record(Tick from, int count_in_bars) override {
+        count_in = count_in_bars;
+        if (state == TransportDisplay::State::playing) {
+            state = TransportDisplay::State::recording;
+            emit transport_state_changed();
+            return position;
+        }
+        state = count_in_bars > 0 ? TransportDisplay::State::counting_in : TransportDisplay::State::recording;
+        position = from;
+        emit transport_state_changed();
+        return from;
+    }
+    void punch_out() override {
+        ++punch_outs;
+        state = TransportDisplay::State::playing;
+        emit transport_state_changed();
+    }
+    std::optional<Tick> transport_tick_at(std::int64_t) const override { return clock; }
+    void set_loop(std::optional<TimeRange> range) override { loop_range = range; }
+    std::optional<TimeRange> loop() const override { return loop_range; }
+    Rational tempo_multiplier() const override { return Rational{1, 1}; }
+    void set_metronome(bool) override { ++metronome_calls; }
+    void set_tempo_multiplier(double) override {}
+    void audition_note_on(int, int, int, const std::string&) override {}
+    void audition_note_off(int, int) override {}
+    void panic(bool) override {}
+    TransportDisplay display() const override {
+        TransportDisplay display;
+        display.state = state;
+        display.position = position;
+        return display;
+    }
+    bool has_device() const override { return true; }
+
+    TransportDisplay::State state = TransportDisplay::State::stopped;
+    Tick position = 0;
+    std::optional<Tick> clock;
+    std::optional<TimeRange> loop_range;
+    int count_in = -1;
+    int stops = 0;
+    int punch_outs = 0;
+    int metronome_calls = 0;
+};
+
+/// Sends one live note message whose transport position is `tick`.
+void live(RecordingController& recording, FakePlayback& playback, Tick tick, int pitch, bool on) {
+    playback.clock = tick;
+    recording.live_note(pitch, 90, on);
+}
+
+std::int64_t steady_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+template <typename Predicate>
+bool wait_until(Predicate predicate, int milliseconds) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() > deadline)
+            return false;
+        QTest::qWait(10);
+    }
+    return true;
+}
+
+} // namespace
+
+TEST_SUITE("recording") {
+    TEST_CASE("takes are placed by the transport clock; count-in input before the start is dropped") {
+        auto controller = make_controller();
+        FakePlayback playback;
+        RecordingController recording(playback);
+        recording.set_target(controller.get(), nullptr);
+        recording.set_count_in_bars(1);
+        controller->set_edit_cursor(0);
+        recording.toggle_recording();
+        REQUIRE(recording.recording());
+        CHECK(playback.count_in == 1);        // the engine plays the count-in, also from bar 1
+        CHECK(playback.metronome_calls == 0); // recording leaves the Metronome toggle alone
+        live(recording, playback, -1500, 50, true); // played and released during the count-in
+        live(recording, playback, -1000, 50, false);
+        live(recording, playback, -200, 52, true); // held into the take: starts at the boundary
+        live(recording, playback, 300, 52, false);
+        // At a practice tempo the engine clock already maps time through the multiplier; the take
+        // uses those ticks unchanged (no wall-clock arithmetic in the controller).
+        live(recording, playback, 480, 60, true);
+        live(recording, playback, 960, 60, false);
+        playback.clock = 1920;
+        recording.toggle_recording();
+        CHECK_FALSE(recording.recording());
+        CHECK(playback.stops == 1);
+        const auto& notes = controller->notes().notes;
+        REQUIRE(notes.size() == 2);
+        CHECK(notes[0].pitch == 52);
+        CHECK(notes[0].start == 0);
+        CHECK(notes[0].end == 300);
+        CHECK(notes[1].start == 480);
+        CHECK(notes[1].end == 960);
+    }
+
+    TEST_CASE("loop takes fold the unfolded passes and keep the last complete one") {
+        auto controller = make_controller();
+        FakePlayback playback;
+        playback.loop_range = TimeRange{0, 1920};
+        RecordingController recording(playback);
+        recording.set_target(controller.get(), nullptr);
+        recording.set_count_in_bars(0);
+        recording.toggle_recording();
+        REQUIRE(recording.recording());
+        live(recording, playback, 100, 60, true); // pass 1
+        live(recording, playback, 200, 60, false);
+        live(recording, playback, 1920 + 480, 64, true); // pass 2
+        live(recording, playback, 1920 + 960, 64, false);
+        playback.clock = 2 * 1920 + 100; // stopped early in pass 3
+        recording.toggle_recording();
+        const auto& notes = controller->notes().notes;
+        REQUIRE(notes.size() == 1);
+        CHECK(notes[0].pitch == 64);
+        CHECK(notes[0].start == 480);
+        CHECK(notes[0].end == 960);
+    }
+
+    TEST_CASE("record while playing punches in at the playhead and punches out on the second press") {
+        auto controller = make_controller();
+        FakePlayback playback;
+        playback.play(3840);
+        RecordingController recording(playback);
+        recording.set_target(controller.get(), nullptr);
+        controller->set_edit_cursor(0); // the edit cursor is not where a punch-in starts
+        recording.toggle_recording();
+        REQUIRE(recording.recording());
+        CHECK(playback.count_in == 0);
+        live(recording, playback, 3000, 60, true); // before the punch-in: dropped
+        live(recording, playback, 3500, 60, false);
+        live(recording, playback, 4000, 62, true);
+        live(recording, playback, 4400, 62, false);
+        playback.clock = 4800;
+        recording.toggle_recording();
+        CHECK(playback.punch_outs == 1);
+        CHECK(playback.stops == 0); // playback goes on
+        const auto& notes = controller->notes().notes;
+        REQUIRE(notes.size() == 1);
+        CHECK(notes[0].start == 4000);
+    }
+
+    TEST_CASE("a take ends with the transport when it leaves Recording on its own") {
+        auto controller = make_controller();
+        FakePlayback playback;
+        RecordingController recording(playback);
+        recording.set_target(controller.get(), nullptr);
+        recording.set_count_in_bars(0);
+        recording.toggle_recording();
+        live(recording, playback, 0, 60, true);
+        playback.clock = 480;
+        playback.stop(0); // e.g. the end of the song or a lost device
+        CHECK_FALSE(recording.recording());
+        REQUIRE(controller->notes().notes.size() == 1);
+        CHECK(controller->notes().notes[0].end == 480);
+    }
+
+    TEST_CASE("the engine counts in from tick 0, enters Recording and maps time through the speed") {
+        application();
+        auto playback = create_playback_service();
+        REQUIRE(playback);
+        if (!playback->has_device())
+            return; // no audio backend in this environment
+        auto document = make_blank_document("Count-in");
+        playback->set_tempo_multiplier(4.0); // 1 bar of 4/4 at 120 bpm lasts 0.5 s
+        playback->publish_document(document, 0, 1);
+        const auto started = playback->record(0, 1);
+        REQUIRE(started);
+        CHECK(*started == 0);
+        CHECK(playback->display().state == TransportDisplay::State::counting_in);
+        REQUIRE(wait_until([&] { return playback->transport_tick_at(steady_ns()).has_value(); }, 3000));
+        if (playback->display().state == TransportDisplay::State::counting_in) {
+            const auto during = playback->transport_tick_at(steady_ns());
+            REQUIRE(during);
+            CHECK(*during < 0); // the count-in lies before the take start
+        }
+        REQUIRE(wait_until([&] { return playback->display().state == TransportDisplay::State::recording; }, 3000));
+        const std::int64_t now = steady_ns();
+        const auto first = playback->transport_tick_at(now);
+        const auto later = playback->transport_tick_at(now + 250'000'000); // 250 ms later
+        REQUIRE(first);
+        REQUIRE(later);
+        CHECK(*first >= 0);
+        // 250 ms at 120 bpm and 4x speed is two beats: 1920 ticks at PPQ 960.
+        CHECK(std::abs((*later - *first) - 1920) <= 2);
+        playback->stop(0);
+        CHECK(playback->display().state == TransportDisplay::State::stopped);
+        CHECK_FALSE(playback->transport_tick_at(steady_ns()));
+    }
+}
+
+TEST_SUITE("tempo") {
+    TEST_CASE("the BPM edit replaces the bar-1 tempo as one undo entry, and undo restores it") {
+        auto controller = make_controller();
+        const auto before = controller->tempo_map().tempo_at(0);
+        CHECK(before == 500000); // 120 BPM
+        CHECK(controller->set_tempo_at(1920, 90.0));
+        CHECK(controller->tempo_map().tempo_at(0) == 666667);
+        CHECK(controller->tempo_map().tempo_at(100000) == 666667); // no later change: the whole song
+        CHECK_FALSE(controller->set_tempo_at(0, 90.0));          // unchanged: no undo entry
+        REQUIRE(controller->undo());
+        CHECK(controller->tempo_map().tempo_at(0) == before);
+        CHECK_FALSE(controller->can_undo());
+    }
+
+    TEST_CASE("with tempo changes the BPM edit changes the tempo in effect at the play position") {
+        auto controller = make_controller();
+        ChangeBuilder builder(controller->document(), "add tempo change");
+        std::ignore = builder.insert(controller->active_track(), events::tempo(3840, 600000)); // 100 BPM at bar 2
+        REQUIRE(controller->apply(builder.finish()));
+        CHECK(controller->set_tempo_at(5000, 140.0)); // inside bar 2: edits the change at 3840
+        CHECK(controller->tempo_map().tempo_at(0) == 500000);
+        CHECK(controller->tempo_map().tempo_at(3840) == 428571);
+        CHECK(controller->set_tempo_at(100, 80.0)); // before the change: edits bar 1 only
+        CHECK(controller->tempo_map().tempo_at(0) == 750000);
+        CHECK(controller->tempo_map().tempo_at(3840) == 428571);
+    }
+
+    TEST_CASE("the BPM field commits a drag, a wheel or arrow burst and typing once each") {
+        application();
+        TempoField field;
+        field.show();
+        std::vector<double> committed;
+        QObject::connect(&field, &TempoField::tempo_committed, [&](double bpm) { committed.push_back(bpm); });
+        field.show_tempo(120.0);
+        CHECK(field.value() == doctest::Approx(120.0));
+        CHECK(committed.empty()); // showing the song tempo is not an edit
+
+        // Drag up 20 px: 5 BPM, one commit on release.
+        QWidget* text = field.findChild<QLineEdit*>();
+        REQUIRE(text);
+        const QPoint start(text->width() / 2, text->height() / 2);
+        QTest::mousePress(text, Qt::LeftButton, Qt::NoModifier, start);
+        for (int step = 1; step <= 5; ++step) {
+            QMouseEvent move(QEvent::MouseMove, QPointF(start.x(), start.y() - 4 * step), text->mapToGlobal(QPointF(start)),
+                             Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(text, &move);
+        }
+        CHECK(field.value() == doctest::Approx(125.0));
+        CHECK(committed.empty()); // nothing is written while dragging
+        field.show_tempo(60.0);   // a display update never overwrites a drag in progress
+        CHECK(field.value() == doctest::Approx(125.0));
+        QTest::mouseRelease(text, Qt::LeftButton, Qt::NoModifier, QPoint(start.x(), start.y() - 20));
+        REQUIRE(committed.size() == 1);
+        CHECK(committed[0] == doctest::Approx(125.0));
+
+        // Shift drag: 0.1 BPM per 4 px.
+        QTest::mousePress(text, Qt::LeftButton, Qt::NoModifier, start);
+        QMouseEvent fine(QEvent::MouseMove, QPointF(start.x(), start.y() + 8), text->mapToGlobal(QPointF(start)), Qt::NoButton,
+                         Qt::LeftButton, Qt::ShiftModifier);
+        QApplication::sendEvent(text, &fine);
+        QTest::mouseRelease(text, Qt::LeftButton, Qt::NoModifier, QPoint(start.x(), start.y() + 8));
+        REQUIRE(committed.size() == 2);
+        CHECK(committed[1] == doctest::Approx(124.8));
+
+        // Three arrow steps in a row are one edit, committed after the idle time.
+        field.setFocus();
+        QTest::keyClick(&field, Qt::Key_Up);
+        QTest::keyClick(&field, Qt::Key_Up);
+        QTest::keyClick(&field, Qt::Key_Up);
+        CHECK(committed.size() == 2);
+        QTest::qWait(TempoField::idle_commit_ms + 200);
+        REQUIRE(committed.size() == 3);
+        CHECK(committed[2] == doctest::Approx(127.8));
+
+        // Typing commits on Enter.
+        text->setFocus();
+        QTest::keyClick(text, Qt::Key_A, Qt::ControlModifier);
+        QTest::keyClicks(text, "90");
+        QTest::keyClick(text, Qt::Key_Return);
+        REQUIRE(committed.size() == 4);
+        CHECK(committed[3] == doctest::Approx(90.0));
     }
 }

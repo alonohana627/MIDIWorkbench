@@ -431,7 +431,7 @@ Result<std::unique_ptr<const PlaybackSnapshot>> compile_playback(const DocumentD
         }
     }
 
-    Tick end_tick = sequence->effective_end();
+    Tick end_tick = std::max(sequence->effective_end(), options.minimum_end_tick);
     for (const PendingEvent& event : pending)
         end_tick = std::max(end_tick, event.key.tick);
 

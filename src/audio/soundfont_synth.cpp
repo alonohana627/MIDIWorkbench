@@ -74,6 +74,14 @@ Result<std::unique_ptr<SoundFontSynth>> SoundFontSynth::load_memory(std::span<co
 
 Result<std::unique_ptr<SoundFontSynth>> SoundFontSynth::load_file(const std::filesystem::path& path,
                                                                   const SoundFontOptions& options) {
+    auto bytes = read_file(path, options);
+    if (!bytes)
+        return std::unexpected(std::move(bytes).error());
+    return load_memory(*bytes, options);
+}
+
+Result<std::vector<std::uint8_t>> SoundFontSynth::read_file(const std::filesystem::path& path,
+                                                           const SoundFontOptions& options) {
     MWB_TRY(validate_options(options));
     std::error_code error;
     const auto size = std::filesystem::file_size(path, error);
@@ -89,7 +97,7 @@ Result<std::unique_ptr<SoundFontSynth>> SoundFontSynth::load_file(const std::fil
     stream.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     if (stream.gcount() != static_cast<std::streamsize>(bytes.size()))
         return make_error(ErrorCode::io, "the SoundFont file could not be read completely");
-    return load_memory(bytes, options);
+    return bytes;
 }
 
 Status SoundFontSynth::prepare(std::uint32_t sample_rate, std::uint32_t max_block_frames) {

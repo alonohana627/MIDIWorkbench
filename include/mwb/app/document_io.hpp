@@ -61,11 +61,19 @@ public:
     /// A MidiParser bound to this object (which must outlive it).
     [[nodiscard]] midi::MidiParser parser();
     [[nodiscard]] bool isolated() const;
+    /// Loads an SF2 bank in the worker (in this process when the worker is not built) and returns
+    /// its preset count; the caller loads the bank only after this succeeded.
+    [[nodiscard]] Result<std::size_t> validate_soundfont(std::span<const std::uint8_t> bytes, std::stop_token stop = {});
+    /// What isolation applies, for reports (`capabilities`).
+    [[nodiscard]] std::string isolation_description() const;
 
 private:
     struct State;
     std::unique_ptr<State> state_;
 };
+
+/// Full path of the running executable (empty when unknown).
+[[nodiscard]] std::filesystem::path current_executable_path();
 
 /// Display name of a path as UTF-8.
 [[nodiscard]] std::string path_to_utf8(const std::filesystem::path& path);

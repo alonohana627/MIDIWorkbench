@@ -39,7 +39,7 @@ literally (Unicode is fine).
 | `library repair --library DIR [--rebuild-fts] [--rebuild-derived]` | Safety backup, then rebuilds the full-text index and/or drops the derived indexes (fingerprints, motif, features) so the next `library analyze` rebuilds them |
 | `library gc --library DIR [--grace-days D]` | Removes objects no revision references (and stray files in `objects/`) once older than the grace period (default 30 days); suspended while a backup runs |
 | `devices` | Audio endpoints and MIDI ports with stable IDs |
-| `capabilities` | Build ID, compiler, Qt, dependency versions, SQLite options, backends |
+| `capabilities` | Build ID, compiler, Qt, dependency versions, SQLite options, backends, parser isolation |
 | `bench --library DIR [--rows N] [--motif-rows M]` | Synthetic catalog; times hot queries (SQL and the in-memory browse index) and checks their plans; `--motif-rows` adds indexed melody streams with a planted motif and times exact and similar melody search (M10K: 10000) |
 
 ## Recipe example
@@ -69,3 +69,11 @@ mwb-cli library import --library D:\MidiLibrary --from D:\Downloads\midi
 mwb-cli library search --library D:\MidiLibrary --query "tag:bass bpm:120..130"
 mwb-cli library melody --library D:\MidiLibrary --notes "E4 G4 A4 B4" --mode transposed
 ```
+
+## Untrusted input
+
+MIDI files (inspect, validate, convert, transform, render, library import and analyze) are parsed
+in `mwb-worker` next to `mwb-cli`, and a `--synth` SoundFont bank is loaded there first; a crash or
+limit in the worker fails that file or bank only. Set `MWB_WORKER` to use another worker
+executable. Without a worker the CLI parses in process, which `capabilities` reports as
+`parser_isolation`.

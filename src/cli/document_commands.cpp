@@ -144,7 +144,7 @@ bool has_extension(const std::string& path, const char* extension) {
 } // namespace
 
 CommandOutput command_inspect(const CommandOptions& options) {
-    auto opened = app::open_document(app::path_from_utf8(options.input));
+    auto opened = app::open_document(app::path_from_utf8(options.input), {}, {}, worker_parser().parser());
     if (!opened)
         return failure("inspect", opened.error());
     nlohmann::json warnings = nlohmann::json::array();
@@ -165,7 +165,7 @@ CommandOutput command_inspect(const CommandOptions& options) {
 }
 
 CommandOutput command_validate(const CommandOptions& options) {
-    auto opened = app::open_document(app::path_from_utf8(options.input));
+    auto opened = app::open_document(app::path_from_utf8(options.input), {}, {}, worker_parser().parser());
     if (!opened)
         return failure("validate", opened.error());
     auto diagnostics = opened->diagnostics;
@@ -240,7 +240,7 @@ CommandOutput command_create(const CommandOptions& options) {
 }
 
 CommandOutput command_convert(const CommandOptions& options) {
-    auto opened = app::open_document(app::path_from_utf8(options.input));
+    auto opened = app::open_document(app::path_from_utf8(options.input), {}, {}, worker_parser().parser());
     if (!opened)
         return failure("convert", opened.error());
     const std::string profile = options.profile.empty() ? (has_extension(options.output, "mwb") ? "native" : "preserving")
@@ -303,6 +303,7 @@ CommandOutput command_capabilities(const CommandOptions&) {
     output.json = nlohmann::json::parse(app::capabilities_json());
     output.json["status"] = "ok";
     output.json["command"] = "capabilities";
+    output.json["parser_isolation"] = worker_parser().isolation_description();
     output.json["warnings"] = nlohmann::json::array();
     output.json["errors"] = nlohmann::json::array();
     return output;

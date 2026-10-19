@@ -62,6 +62,20 @@ CommandOutput failure(const std::string& command, const Error& error) {
     return output;
 }
 
+app::WorkerParser& worker_parser() {
+    static app::WorkerParser parser([] {
+        if (const char* configured = std::getenv("MWB_WORKER"); configured != nullptr && *configured != '\0')
+            return app::path_from_utf8(configured);
+#ifdef _WIN32
+        constexpr const char* name = "mwb-worker.exe";
+#else
+        constexpr const char* name = "mwb-worker";
+#endif
+        return app::current_executable_path().parent_path() / name;
+    }());
+    return parser;
+}
+
 int run(const std::vector<std::string>& arguments, std::string& standard_output, std::string& standard_error) {
     // Every option is bound to storage owned by this function and used before it returns
     // (section 31: bindings must outlive the parse).

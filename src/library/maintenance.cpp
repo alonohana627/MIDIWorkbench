@@ -353,10 +353,11 @@ Result<RepairReport> repair_library(Library& library, const RepairOptions& optio
         report.full_backup = true;
     } else {
         // Damaged objects prevent a verified full backup; keep at least the catalog evidence.
-        const auto catalog_only = report.safety_backup.string() + "-catalog";
+        auto catalog_only = report.safety_backup; // native form: any library path, any code page
+        catalog_only += "-catalog";
         std::error_code error;
         std::filesystem::create_directories(catalog_only, error);
-        MWB_TRY(library.backup_catalog(std::filesystem::path(catalog_only) / "library.sqlite"));
+        MWB_TRY(library.backup_catalog(catalog_only / "library.sqlite"));
         report.safety_backup = catalog_only;
     }
     if (options.rebuild_fts) {

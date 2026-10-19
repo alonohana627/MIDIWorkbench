@@ -2,9 +2,20 @@
 
 #include "mwb/core/text.hpp"
 
+#include "mwb/audio/soundfont_synth.hpp"
 #include "mwb/document/file_system.hpp"
 #include "mwb/document/native_format.hpp"
 #include "mwb/worker/worker.hpp"
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #include <cstring>
 #include <mutex>
@@ -153,6 +164,48 @@ WorkerParser::~WorkerParser() {
 }
 
 bool WorkerParser::isolated() const { return state_->available; }
+
+Result<std::size_t> WorkerParser::validate_soundfont(std::span<const std::uint8_t> bytes, std::stop_token stop) {
+    if (!state_->available) {
+        auto bank = audio::SoundFontSynth::load_memory(bytes); // developer build without the worker
+        if (!bank)
+            return std::unexpected(std::move(bank).error());
+        return (*bank)->presets().size();
+    }
+    std::lock_guard lock(state_->mutex);
+    if (!state_->client || !state_->client->is_alive()) {
+        auto started = worker::WorkerClient::start(state_->executable);
+        if (!started)
+            return std::unexpected(started.error().with_context("starting the parser worker"));
+        state_->client = std::move(*started);
+    }
+    return state_->client->validate_soundfont(bytes, std::move(stop)); // a dead worker restarts next time
+}
+
+std::string WorkerParser::isolation_description() const {
+    if (!state_->available)
+        return "in process (mwb-worker was not found next to the executable)";
+    return "mwb-worker: separate process with a memory and time limit (" + path_to_utf8(state_->executable) + ")";
+}
+
+std::filesystem::path current_executable_path() {
+#ifdef _WIN32
+    std::wstring buffer(MAX_PATH, L'\0');
+    while (true) {
+        const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (length == 0)
+            return {};
+        if (length < buffer.size()) {
+            buffer.resize(length);
+            return std::filesystem::path(buffer);
+        }
+        buffer.resize(buffer.size() * 2); // truncated: a long path
+    }
+#else
+    std::error_code error;
+    return std::filesystem::read_symlink("/proc/self/exe", error);
+#endif
+}
 
 midi::MidiParser WorkerParser::parser() {
     return [this](std::span<const std::uint8_t> bytes, std::string_view name, const midi::ParseLimits& limits,

@@ -1,6 +1,7 @@
 #include "mwb/worker/protocol.hpp"
 #include "mwb/worker/worker.hpp"
 
+#include "mwb/audio/soundfont_synth.hpp"
 #include "mwb/document/native_format.hpp"
 
 namespace mwb::worker {
@@ -84,12 +85,25 @@ private:
             return send(FrameKind::parse_result, frame.request_id,
                         {{"transfer", transfer}, {"report", parsed->report.to_json()}});
         }
+        case FrameKind::validate_soundfont: {
+            // The untrusted bank is parsed here first (TinySoundFont), so a hostile file crashes
+            // or exhausts this limited process, never the caller (section 28.2).
+            std::ignore = send(FrameKind::heartbeat, frame.request_id, {{"stage", "soundfont"}}); // progress only
+            auto bank = audio::SoundFontSynth::load_memory(input_bytes_);
+            input_bytes_.clear();
+            if (!bank) {
+                fail(frame.request_id, bank.error());
+                return true;
+            }
+            return send(FrameKind::soundfont_result, frame.request_id, {{"presets", (*bank)->presets().size()}});
+        }
         case FrameKind::cancel:
             input_ = ChunkAssembler{};
             input_bytes_.clear();
             return true;
         case FrameKind::shutdown: return false;
         case FrameKind::parse_result:
+        case FrameKind::soundfont_result:
         case FrameKind::heartbeat:
         case FrameKind::failure: return true; // not sent to a worker; ignored
         }

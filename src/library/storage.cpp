@@ -326,6 +326,10 @@ Result<FileDigest> hash_file(const std::filesystem::path& path, std::stop_token 
     return digest;
 }
 
+std::filesystem::path path_from_utf8_text(std::string_view text) {
+    return std::filesystem::path(std::u8string(text.begin(), text.end()));
+}
+
 std::string filesystem_comparison_key(std::string_view utf8_relative_path) {
 #ifdef _WIN32
     if (utf8_relative_path.empty())

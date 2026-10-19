@@ -3,9 +3,11 @@
 #include <doctest/doctest.h>
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <thread>
+#include <vector>
 
 namespace mwb::test {
 
@@ -34,5 +36,9 @@ inline bool wait_until(const std::function<bool()>& condition,
     }
     return condition();
 }
+
+/// A minimal valid SoundFont 2 bank built in memory: one looped sine sample, one instrument and
+/// one preset (bank 0, program 0) named "Test Sine". Generated at test time; no bank is shipped.
+[[nodiscard]] std::vector<std::uint8_t> make_test_soundfont();
 
 } // namespace mwb::test

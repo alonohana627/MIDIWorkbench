@@ -65,6 +65,8 @@ struct FileDigest {
 
 /// UTF-8 text of a path (generic separators).
 [[nodiscard]] std::string path_utf8(const std::filesystem::path& path);
+/// Path from UTF-8 text (the inverse of path_utf8).
+[[nodiscard]] std::filesystem::path path_from_utf8_text(std::string_view text);
 
 /// Content-addressed immutable objects under `objects/ab/<sha256>.<ext>` (section 22.1).
 class ObjectStore {

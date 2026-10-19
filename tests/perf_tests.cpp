@@ -4,11 +4,15 @@
 #include "test_support.hpp"
 
 #include "mwb/core/change_set.hpp"
+#include "mwb/core/serialization.hpp"
+#include "mwb/core/validation.hpp"
 #include "mwb/core/note_edit.hpp"
 #include "mwb/core/notes.hpp"
 #include "mwb/core/random.hpp"
 #include "mwb/core/tempo_map.hpp"
 #include "mwb/library/bench.hpp"
+#include "mwb/document/recovery.hpp"
+#include "mwb/document/session.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -128,5 +132,47 @@ TEST_SUITE("perf_library") {
             else
                 CHECK(timing.p95_ms <= 150.0);
         }
+    }
+}
+
+TEST_SUITE("perf_large") {
+    // Spec-sized documents that only optimized builds handle in reasonable time.
+    TEST_CASE("a document above the editable event limit still recovers, and edits cannot grow past it (code-document-3)") {
+        DocumentData document = make_blank_document("Huge");
+        auto& track = document.sequences.front().tracks.front();
+        const std::size_t count = DocumentLimits{}.max_events_per_document + 1;
+        track.events.clear();
+        track.events.reserve(count);
+        for (std::size_t index = 0; index < count; ++index) {
+            auto event = events::control_change(static_cast<Tick>(index / 4), 0, 1, static_cast<std::uint8_t>(index % 128));
+            event.order_key = (index + 1) * order_key_spacing;
+            track.events.push_back(std::move(event));
+        }
+        track.end_tick = track.events.back().tick;
+        document.sequences.front().end_tick = track.end_tick;
+        const auto expected = semantic_hash(document);
+
+        test::TemporaryDirectory directory;
+        document::RecoveryPolicy policy;
+        policy.checkpoint_command_count = 1;
+        auto created = document::RecoveryJournal::create(directory.path(), document,
+                                                         document::SourceReference{"Huge", {}, {}, {}}, policy);
+        REQUIRE(created);
+        std::shared_ptr<document::RecoveryJournal> journal = std::move(*created);
+        REQUIRE(journal->flush(true));
+        const Uuid session_id = journal->session_id();
+        journal.reset(); // crash
+        const auto recovered = document::recover_session(directory.path(), session_id);
+        REQUIRE_MESSAGE(recovered, (recovered ? "" : recovered.error().describe()));
+        CHECK(recovered->document.sequences.front().tracks.front().events.size() == count);
+        CHECK(semantic_hash(recovered->document) == expected);
+
+        // Editing cannot push a document past the limit (it would only open read-only later).
+        document::WorkingSession session(std::move(document), document::SessionOrigin::recovered);
+        ChangeBuilder builder(session.document(), "one more");
+        builder.insert(session.document().sequences.front().tracks.front().id, events::control_change(0, 0, 7, 100));
+        const auto grown = session.apply(builder.finish());
+        REQUIRE_FALSE(grown);
+        CHECK(grown.error().code == ErrorCode::limit_exceeded);
     }
 }

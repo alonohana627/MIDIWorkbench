@@ -7,6 +7,9 @@
 #include "mwb/search/sql.hpp"
 #include "mwb/ui/task_thread.hpp"
 
+#include "mwb/jobs/jobs.hpp"
+#include "mwb/platform/file_watcher.hpp"
+
 #include <QAbstractTableModel>
 #include <QTimer>
 #include <QWidget>
@@ -122,6 +125,8 @@ public:
     [[nodiscard]] bool is_open() const { return library_ != nullptr; }
     /// The open library (null before one is open); shared with the panel's background threads.
     [[nodiscard]] std::shared_ptr<library::Library> library() const { return library_; }
+    /// Folders the watcher follows now (tests, diagnostics).
+    [[nodiscard]] const std::vector<std::filesystem::path>& watched_folders() const { return watched_roots_; }
     /// Moves the selected results to the trash after a confirmation (context menu, Delete key).
     void trash_selected();
     /// Shows the trash (restore, delete permanently) instead of the search results.
@@ -157,6 +162,11 @@ private:
     void import_path(const std::filesystem::path& source);
     /// Indexes items for melody search in the background (after saves and cancelled imports).
     void schedule_analysis();
+    /// Reads the library's watched folders (on the job pool) and (re)starts the watcher on them.
+    void start_watching();
+    /// Applies the batched watcher hints: changed files are re-imported into their folder, deleted
+    /// ones marked missing, an overflow re-imports the whole folder.
+    void apply_watch_hints();
     /// Builds the browse index on the maintenance thread (after open and after a full outbox reload);
     /// `collect_garbage` also runs the idle object collection afterwards.
     void schedule_browse_index(bool collect_garbage);
@@ -231,8 +241,15 @@ private:
     std::unique_ptr<TaskThread> browse_thread_ = std::make_unique<TaskThread>();
     std::unique_ptr<TaskThread> write_thread_ = std::make_unique<TaskThread>(true);
     std::unique_ptr<TaskThread> import_thread_ = std::make_unique<TaskThread>();
-    /// Background upkeep after open: the in-memory browse index (section 19.4), then object GC.
-    std::unique_ptr<TaskThread> maintenance_thread_ = std::make_unique<TaskThread>();
+    /// Bounded, prioritized background jobs (section 28.1): library upkeep after open (the
+    /// in-memory browse index of section 19.4, then object GC) and reading the watched folders.
+    std::unique_ptr<jobs::JobCoordinator> jobs_ = std::make_unique<jobs::JobCoordinator>(2);
+    /// Watches the folders imported with "Add Folder" (section 22.4); hints are batched by
+    /// watch_flush_ and turned into re-imports and "source missing" marks on the import thread.
+    std::unique_ptr<platform::DirectoryWatcher> watcher_;
+    std::vector<std::filesystem::path> watched_roots_;
+    std::vector<platform::FileChangeHint> pending_hints_;
+    QTimer watch_flush_;
     std::shared_ptr<std::atomic<std::uint64_t>> drag_latest_ = std::make_shared<std::atomic<std::uint64_t>>(0);
 };
 

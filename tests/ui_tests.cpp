@@ -28,6 +28,8 @@
 #include <QApplication>
 
 #include <chrono>
+#include <deque>
+#include <fstream>
 #include <cmath>
 #include <mutex>
 #include <QAction>
@@ -2196,6 +2198,9 @@ TEST_SUITE("library_ui") {
         REQUIRE(said);
         CHECK_FALSE(fixture.status().contains("library is empty"));
         CHECK_FALSE(fixture.table()->horizontalHeader()->isSectionHidden(6)); // match details shown for melody hits
+        CHECK(fixture.table()->horizontalHeader()->isSectionHidden(3)); // BPM, Key, Length make room for them
+        CHECK(fixture.table()->horizontalHeader()->isSectionHidden(4));
+        CHECK(fixture.table()->horizontalHeader()->isSectionHidden(5));
         // A save would have re-run the text search before; melody results stay.
         DocumentData document = make_blank_document("Later");
         fixture.panel->save_document(std::make_shared<const DocumentData>(document), std::nullopt, std::nullopt, "Later",
@@ -2208,6 +2213,7 @@ TEST_SUITE("library_ui") {
         back->click();
         REQUIRE(wait_until([&] { return fixture.table()->model()->rowCount() == 2; }, 3000));
         CHECK(fixture.table()->horizontalHeader()->isSectionHidden(6)); // the user's column choice again
+        CHECK_FALSE(fixture.table()->horizontalHeader()->isSectionHidden(3));
     }
 
     TEST_CASE("an open library builds its browse index in the background and searches then use it") {
@@ -2505,5 +2511,362 @@ TEST_SUITE("window") {
         fixture.window->current_tab()->piano_roll().setFocus();
         fixture.key(Qt::Key_Space);
         CHECK(wait_until([&] { return label->text().contains("Stop"); }, 2000));
+    }
+}
+
+TEST_SUITE("reviewer_probe7") {
+    TEST_CASE("probe7: preview readout and melody Status column, with screenshots") {
+        WindowFixture fixture;
+        auto* library = fixture.window->findChild<LibraryPanel*>();
+        REQUIRE(library);
+        const std::filesystem::path reviewer_library = std::filesystem::path("C:/Users/user/AppData/Local/Temp/claude/C--Users-user-SoundStaff/e1a24cfc-98ee-406f-b798-a61ae3fd6517/scratchpad/lib5/Test Library");
+        std::error_code exists_error;
+        if (!std::filesystem::exists(reviewer_library / "library.sqlite", exists_error))
+            return; // the reviewer's CLI-made library exists only on the review machine
+        library->open_library(reviewer_library, false, true);
+        auto* table = library->findChild<QTableView*>();
+        REQUIRE(table);
+        REQUIRE(wait_until([&] { return table->model()->rowCount() >= 12; }, 8000));
+        std::vector<std::pair<Tick, std::uint8_t>> onsets;
+        std::vector<Tick> durations;
+        const int motif[] = {0, 2, 4, 5, 7};
+        for (int k = 0; k < 5; ++k) {
+            onsets.emplace_back(k * 240, static_cast<std::uint8_t>(67 + motif[k]));
+            durations.push_back(220);
+        }
+        library->search_melody(onsets, durations, false);
+        REQUIRE(wait_until([&] { return table->model()->rowCount() == 2; }, 5000));
+        QTest::qWait(300);
+        CHECK_FALSE(table->horizontalHeader()->isSectionHidden(6));
+        MESSAGE("status of row 0: " << table->model()->index(0, 6).data().toString().toStdString());
+        fixture.window->grab().save(QString::fromStdWString((fixture.directory.path() / "melody_window.png").wstring()));
+        // Preview the first hit (the melody match plays with a lead-in).
+        table->setCurrentIndex(table->model()->index(0, 0));
+        table->setFocus();
+        QTest::keyClick(table, Qt::Key_Return, Qt::ControlModifier); // Ctrl+Enter = Preview
+        auto* label = fixture.window->findChild<QLabel*>("transport.position");
+        REQUIRE(label);
+        const bool moved = wait_until([&] { return label->text().contains("Play") && !label->text().startsWith("1.1.000"); }, 4000);
+        MESSAGE("readout during preview: '" << label->text().toStdString() << "' tooltip '" << label->toolTip().toStdString() << "'");
+        CHECK(moved);
+        fixture.window->grab().save(QString::fromStdWString((fixture.directory.path() / "preview_window.png").wstring()));
+        // Back to Search hides Status again (saved choice).
+        for (auto* button : library->findChildren<QPushButton*>())
+            if (button->text() == "Back to Search")
+                button->click();
+        QTest::qWait(500);
+        CHECK(table->horizontalHeader()->isSectionHidden(6));
+        // Space stops the preview; the readout says Stop.
+        fixture.window->current_tab()->piano_roll().setFocus();
+        fixture.key(Qt::Key_Space);
+        QTest::qWait(300);
+        MESSAGE("readout after stop: '" << label->text().toStdString() << "'");
+    }
+}
+
+TEST_SUITE("library_ui") {
+    TEST_CASE("an added folder is watched: edits create revisions, deletions mark the source missing (code-runtime-15)") {
+        application();
+        test::TemporaryDirectory directory;
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, QString::fromStdWString(directory.path().wstring()));
+        QSettings().remove("library");
+        const auto write_phrase = [](const std::filesystem::path& path, std::uint8_t first_pitch) {
+            DocumentData document = make_blank_document("phrase");
+            ChangeBuilder builder(document, "notes");
+            for (std::uint8_t index = 0; index < 4; ++index)
+                builder.add_note(document.sequences.front().tracks.front().id, index * 480, index * 480 + 400, 0,
+                                 static_cast<std::uint8_t>(first_pitch + index), 100);
+            REQUIRE(apply_change_set(document, builder.finish()));
+            const auto bytes = midi::export_midi(document, {});
+            REQUIRE(bytes);
+            std::filesystem::create_directories(path.parent_path());
+            std::ofstream file(path, std::ios::binary);
+            file.write(reinterpret_cast<const char*>(bytes->data()), static_cast<std::streamsize>(bytes->size()));
+        };
+        const auto folder = directory.path() / "watched";
+        write_phrase(folder / "a.mid", 60);
+        write_phrase(folder / "b.mid", 48);
+        LibraryPanel panel;
+        panel.show();
+        QSignalSpy messages(&panel, &LibraryPanel::status_message);
+        const auto said = [&](const QString& prefix) {
+            for (const auto& message : messages)
+                if (message.at(0).toString().startsWith(prefix))
+                    return true;
+            return false;
+        };
+        panel.open_library(directory.path() / "lib", true, true, folder);
+        // The folder is watched from the start of its import; edits are made once it finished.
+        REQUIRE(wait_until([&] { return said("Imported") && panel.watched_folders().size() == 1; }, 10000));
+        auto library = panel.library();
+        REQUIRE(library);
+        const auto asset_of = [&](const std::string& name) -> std::int64_t {
+            library::SearchRequest request;
+            request.query_text = "source:" + name;
+            auto page = library->search(request);
+            return page && page->rows.size() == 1 ? page->rows.front().id : 0;
+        };
+        REQUIRE(wait_until([&] { return asset_of("a") != 0 && asset_of("b") != 0; }, 5000));
+        const auto a = asset_of("a");
+        const auto b = asset_of("b");
+        // Edited in another program: a new revision of the same item, no new item.
+        write_phrase(folder / "b.mid", 72);
+        CHECK(wait_until([&] { return library->revisions(b) && library->revisions(b)->size() == 2; }, 10000));
+        CHECK(wait_until([&] { return said("Watched folders"); }, 5000)); // the user is told what changed
+
+        // Deleted: the item stays, its source is reported missing.
+        std::filesystem::remove(folder / "a.mid");
+        CHECK(wait_until([&] {
+            auto rows = library->browse_rows_for({a});
+            return rows && rows->size() == 1 && rows->front().source_missing;
+        }, 10000));
+        CHECK_FALSE(library->browse_rows_for({a})->front().deleted);
+        CHECK(library->source_roots()->size() == 1); // updates went to the folder's own locations
+    }
+}
+
+// --- Window-level data-loss, recording and library paths (code-uiA-12) ---------------------------
+
+namespace {
+
+/// Answers the modal message boxes that appear, one button each, in order (a prompt, then the
+/// error it may lead to). Stops when the list is used up.
+void answer_message_boxes(std::vector<QMessageBox::StandardButton> buttons) {
+    auto queue = std::make_shared<std::deque<QMessageBox::StandardButton>>(buttons.begin(), buttons.end());
+    auto* timer = new QTimer(qApp);
+    timer->setInterval(50);
+    QObject::connect(timer, &QTimer::timeout, timer, [queue, timer] {
+        if (queue->empty()) {
+            timer->deleteLater();
+            return;
+        }
+        auto* box = qobject_cast<QMessageBox*>(QApplication::activeModalWidget());
+        if (!box || !box->isVisible())
+            return;
+        auto* button = box->button(queue->front());
+        queue->pop_front();
+        if (button)
+            button->click();
+    });
+    timer->start();
+}
+
+/// Adds one note to the current tab's first track (a real, undoable edit).
+void edit_current(MainWindow& window, std::uint8_t pitch) {
+    auto* tab = window.current_tab();
+    REQUIRE(tab);
+    ChangeBuilder builder(tab->controller().document(), "note");
+    builder.add_note(tab->controller().document().sequences.front().tracks.front().id, 0, 480, 0, pitch, 100);
+    REQUIRE(tab->controller().apply(builder.finish()));
+}
+
+std::size_t note_count(const DocumentData& document) { return pair_notes(document.sequences.front()).notes.size(); }
+
+} // namespace
+
+TEST_SUITE("window") {
+    TEST_CASE("closing a dirty document: Cancel keeps it, a failed save keeps it, Save writes it (code-uiA-12)") {
+        WindowFixture fixture;
+        const auto path = fixture.directory.path() / "close me.mwb";
+        REQUIRE(document::save_native(make_blank_document("Close me"), path));
+        REQUIRE(fixture.window->open_path(path));
+        REQUIRE(wait_until([&] {
+            auto* tab = fixture.window->current_tab();
+            return tab && tab->controller().file_path() == path;
+        }, 5000));
+        QPointer<EditorTab> tab = fixture.window->current_tab();
+        auto* tabs = fixture.window->findChild<QTabWidget*>();
+        REQUIRE(tabs);
+        edit_current(*fixture.window, 60);
+        REQUIRE(tab->controller().is_dirty());
+
+        answer_message_boxes({QMessageBox::Cancel});
+        emit tabs->tabCloseRequested(tabs->indexOf(tab));
+        QTest::qWait(100);
+        REQUIRE(tab);
+        CHECK(tabs->indexOf(tab) >= 0);
+        CHECK(tab->controller().is_dirty());
+
+#ifdef _WIN32
+        // The file cannot be written: the user is told, and the document stays open and dirty.
+        std::filesystem::permissions(path, std::filesystem::perms::owner_write | std::filesystem::perms::group_write |
+                                               std::filesystem::perms::others_write,
+                                     std::filesystem::perm_options::remove);
+        answer_message_boxes({QMessageBox::Save, QMessageBox::Ok});
+        emit tabs->tabCloseRequested(tabs->indexOf(tab));
+        QTest::qWait(200);
+        std::filesystem::permissions(path, std::filesystem::perms::owner_write, std::filesystem::perm_options::add);
+        REQUIRE(tab);
+        CHECK(tabs->indexOf(tab) >= 0);
+        CHECK(tab->controller().is_dirty());
+        CHECK(note_count(document::load_native(path).value()) == 0); // the file was not touched
+#endif
+
+        answer_message_boxes({QMessageBox::Save});
+        emit tabs->tabCloseRequested(tabs->indexOf(tab));
+        REQUIRE(wait_until([&] { return tab.isNull(); }, 5000));
+        const auto saved = document::load_native(path);
+        REQUIRE(saved);
+        CHECK(note_count(*saved) == 1);
+        CHECK(fixture.window->current_tab() != nullptr); // the window never ends up without a document
+    }
+
+    TEST_CASE("Discard closes without writing and removes the document's recovery session (code-uiA-12)") {
+        WindowFixture fixture;
+        const auto path = fixture.directory.path() / "discard.mwb";
+        REQUIRE(document::save_native(make_blank_document("Discard me"), path));
+        REQUIRE(fixture.window->open_path(path));
+        REQUIRE(wait_until([&] {
+            auto* tab = fixture.window->current_tab();
+            return tab && tab->controller().file_path() == path && tab->controller().recovery_journal();
+        }, 5000));
+        QPointer<EditorTab> tab = fixture.window->current_tab();
+        edit_current(*fixture.window, 64);
+        const auto session = tab->controller().recovery_journal()->session_id();
+        const auto recovery = app::resolve_data_directories(fixture.directory.path()).recovery;
+        auto* tabs = fixture.window->findChild<QTabWidget*>();
+        answer_message_boxes({QMessageBox::Discard});
+        emit tabs->tabCloseRequested(tabs->indexOf(tab));
+        REQUIRE(wait_until([&] { return tab.isNull(); }, 5000));
+        CHECK(note_count(document::load_native(path).value()) == 0);
+        // Closing is a clean close: the session is not offered for recovery next time.
+        CHECK(wait_until([&] {
+            auto sessions = document::list_recoverable_sessions(recovery);
+            return sessions && std::ranges::none_of(*sessions, [&](const auto& listed) { return listed.session_id == session; });
+        }, 5000));
+    }
+
+    TEST_CASE("closing while a background save runs waits for it and does not ask again (code-uiA-12)") {
+        WindowFixture fixture;
+        const auto path = fixture.directory.path() / "saving.mwb";
+        REQUIRE(document::save_native(make_blank_document("Saving"), path));
+        REQUIRE(fixture.window->open_path(path));
+        REQUIRE(wait_until([&] {
+            auto* tab = fixture.window->current_tab();
+            return tab && tab->controller().file_path() == path;
+        }, 5000));
+        QPointer<EditorTab> tab = fixture.window->current_tab();
+        edit_current(*fixture.window, 67);
+        tab->controller().save_native_async(path);
+        bool asked = false;
+        QTimer watch;
+        QObject::connect(&watch, &QTimer::timeout, [&] {
+            if (auto* box = qobject_cast<QMessageBox*>(QApplication::activeModalWidget())) {
+                asked = true;
+                box->button(QMessageBox::Cancel)->click();
+            }
+        });
+        watch.start(20);
+        auto* tabs = fixture.window->findChild<QTabWidget*>();
+        emit tabs->tabCloseRequested(tabs->indexOf(tab));
+        REQUIRE(wait_until([&] { return tab.isNull(); }, 5000));
+        watch.stop();
+        CHECK_FALSE(asked); // the save in flight made it clean before the question
+        CHECK(note_count(document::load_native(path).value()) == 1);
+    }
+
+    TEST_CASE("closing a document while recording ends the take first, so the prompt covers it (code-uiA-12)") {
+        WindowFixture fixture;
+        auto* recording = fixture.window->findChild<RecordingController*>();
+        REQUIRE(recording);
+        auto* record = fixture.window->findChild<QAction*>("transport.record");
+        REQUIRE(record);
+        QPointer<EditorTab> tab = fixture.window->current_tab();
+        REQUIRE(tab);
+        edit_current(*fixture.window, 60); // unsaved work: closing must ask
+        record->trigger();
+        if (!recording->recording()) {
+            MESSAGE("recording could not start here (no audio device); skipped");
+            return;
+        }
+        auto* tabs = fixture.window->findChild<QTabWidget*>();
+        answer_message_boxes({QMessageBox::Cancel});
+        emit tabs->tabCloseRequested(tabs->indexOf(tab));
+        QTest::qWait(200);
+        CHECK_FALSE(recording->recording()); // never recording into a document that is closing
+        CHECK(tab);                          // Cancel keeps it open, with the take in its history
+    }
+}
+
+TEST_SUITE("window") {
+    TEST_CASE("crashed work is offered: Recover opens it as a new document, Discard deletes it after asking (code-uiA-12)") {
+        WindowFixture fixture;
+        const auto recovery = app::resolve_data_directories(fixture.directory.path()).recovery;
+        const auto crash = [&](const std::string& title, int notes) {
+            DocumentData document = make_blank_document(title);
+            ChangeBuilder builder(document, "notes");
+            for (int index = 0; index < notes; ++index)
+                builder.add_note(document.sequences.front().tracks.front().id, index * 480, index * 480 + 400, 0,
+                                 static_cast<std::uint8_t>(60 + index), 100);
+            REQUIRE(apply_change_set(document, builder.finish()));
+            auto journal = document::RecoveryJournal::create(recovery, document, document::SourceReference{title, {}, {}, {}});
+            REQUIRE(journal);
+            REQUIRE((*journal)->flush(true));
+            return (*journal)->session_id(); // destroyed without a clean close: a crash
+        };
+        const auto pick = [](const QString& button_text, bool confirm_discard) {
+            QTimer::singleShot(200, [button_text, confirm_discard] {
+                auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+                if (!dialog)
+                    return; // the wait below then fails with a clear message
+                if (confirm_discard)
+                    answer_message_boxes({QMessageBox::Discard});
+                for (auto* button : dialog->findChildren<QPushButton*>())
+                    if (button->text() == button_text)
+                        button->click();
+            });
+        };
+        const auto recovered_session = crash("Crashed song", 3);
+        auto sessions = document::list_recoverable_sessions(recovery);
+        REQUIRE(sessions);
+        REQUIRE(sessions->size() == 1);
+        pick("Recover Checked", false);
+        fixture.window->present_recovery(*sessions);
+        REQUIRE(wait_until([&] {
+            auto* tab = fixture.window->current_tab();
+            return tab && tab->controller().document().title == "Crashed song";
+        }, 5000));
+        auto* tab = fixture.window->current_tab();
+        CHECK(note_count(tab->controller().document()) == 3);
+        CHECK(tab->controller().is_dirty());          // a new unsaved document, never the saved file
+        CHECK(tab->controller().file_path().empty());
+        // Its evidence is replaced by the new document's own journal.
+        CHECK(wait_until([&] {
+            auto listed = document::list_recoverable_sessions(recovery);
+            return listed && std::ranges::none_of(*listed, [&](const auto& item) { return item.session_id == recovered_session; });
+        }, 5000));
+
+        const auto discarded_session = crash("Throw away", 1);
+        sessions = document::list_recoverable_sessions(recovery);
+        REQUIRE(sessions);
+        std::erase_if(*sessions, [&](const auto& item) { return item.session_id != discarded_session; });
+        REQUIRE(sessions->size() == 1);
+        pick("Discard Checked", true);
+        fixture.window->present_recovery(*sessions);
+        CHECK(wait_until([&] {
+            auto listed = document::list_recoverable_sessions(recovery);
+            return listed && std::ranges::none_of(*listed, [&](const auto& item) { return item.session_id == discarded_session; });
+        }, 5000));
+        CHECK(fixture.window->current_tab()->controller().document().title == "Crashed song"); // nothing opened
+    }
+}
+
+TEST_SUITE("library_ui") {
+    TEST_CASE("an item added elsewhere is announced without moving the current row (code-uiA-12)") {
+        LibraryFixture fixture(3);
+        auto* table = fixture.table();
+        table->setCurrentIndex(table->model()->index(1, 0));
+        const auto current = table->model()->index(1, 0).data().toString();
+        auto library = fixture.panel->library();
+        REQUIRE(library);
+        QTest::qWait(2500); // the first change poll has learned where the outbox stands
+        // Another writer (the CLI, another window) adds an item.
+        DocumentData document = make_blank_document("From elsewhere");
+        REQUIRE(library->create_asset(document, "From elsewhere", library::AssetKind::phrase).has_value());
+        REQUIRE(wait_until([&] { return fixture.status().contains("not in this list yet"); }, 6000));
+        CHECK(table->model()->rowCount() == 3);
+        CHECK(table->currentIndex().row() == 1);
+        CHECK(table->currentIndex().data().toString() == current);
     }
 }

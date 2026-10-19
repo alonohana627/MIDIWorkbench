@@ -16,6 +16,7 @@
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <array>
 #include <tuple>
 
 namespace mwb::ui {
@@ -183,15 +184,52 @@ const QString& EventTableModel::search_key(int row) const {
         track_labels.reserve(sequence.tracks.size());
         for (std::size_t track = 0; track < sequence.tracks.size(); ++track)
             track_labels.push_back(QString("%1 %2").arg(track + 1).arg(QString::fromStdString(sequence.tracks[track].name)));
+        for (auto& label : track_labels)
+            label = label.toLower();
+        // Note and controller rows are almost all rows: their names are translated and lowered
+        // once per pass from small tables instead of per row (QObject::tr, arg() and toLower()
+        // per row took 1.9 s for E100K's 212,000 events; uiB-23).
+        std::array<QString, 128> pitches;
+        std::array<QString, 128> controllers;
+        for (std::size_t value = 0; value < 128; ++value) {
+            pitches[value] = QString::fromStdString(pitch_name(static_cast<std::uint8_t>(value))).toLower();
+            controllers[value] = controller_name(static_cast<int>(value)).toLower();
+        }
+        Event sample = events::note_on(0, 0, 60, 100);
+        const QString note_on = event_type_name(sample).toLower();
+        sample = events::note_on(0, 0, 60, 0);
+        const QString note_on_zero = event_type_name(sample).toLower();
+        sample = events::note_off(0, 0, 60, 0);
+        const QString note_off = event_type_name(sample).toLower();
+        sample = events::control_change(0, 0, 1, 0);
+        const QString control_change = event_type_name(sample).toLower();
+        const QString velocity = QStringLiteral("  vel ");
+        const QString equals = QStringLiteral(" = ");
+        const QChar separator(u'\n');
         for (std::size_t index = 0; index < rows_.size(); ++index) {
             const Event* event = event_at(static_cast<int>(index));
             if (!event)
                 continue;
             // Fields are joined by a line break, which a typed filter cannot contain, so a match
             // never spans two fields.
-            search_keys_[index] = (event_type_name(*event) + QChar(u'\n') + describe_event(*event) + QChar(u'\n') +
-                                   track_labels[rows_[index].track])
-                                      .toLower();
+            const QString& track = track_labels[rows_[index].track];
+            QString& key = search_keys_[index];
+            if (event->category == EventCategory::channel &&
+                (event->message() == ChannelMessage::note_on || event->message() == ChannelMessage::note_off)) {
+                const QString& type = event->message() == ChannelMessage::note_off ? note_off
+                                      : event->data2() == 0                         ? note_on_zero
+                                                                                    : note_on;
+                key.reserve(type.size() + pitches[event->data1() & 0x7F].size() + 16 + track.size());
+                key.append(type).append(separator).append(pitches[event->data1() & 0x7F]).append(velocity);
+                key.append(QString::number(event->data2())).append(separator).append(track);
+                continue;
+            }
+            if (event->category == EventCategory::channel && event->message() == ChannelMessage::control_change) {
+                key.append(control_change).append(separator).append(controllers[event->data1() & 0x7F]).append(equals);
+                key.append(QString::number(event->data2())).append(separator).append(track);
+                continue;
+            }
+            key = (event_type_name(*event) + separator + describe_event(*event)).toLower() + separator + track;
         }
     }
     return search_keys_[static_cast<std::size_t>(row)];
@@ -201,9 +239,11 @@ void EventFilterProxy::set_needle(const QString& text) {
     const QString needle = text.trimmed().toLower();
     if (needle == needle_)
         return;
-    beginFilterChange();
     needle_ = needle;
-    endFilterChange(Direction::Rows);
+    // One full re-map (a layout change) instead of an incremental filter change: with note-on and
+    // note-off rows interleaved, the incremental path removed rows in ~100,000 separate ranges
+    // and took 1.8 s for E100K's first typed character (uiB-23).
+    invalidate();
 }
 
 bool EventFilterProxy::filterAcceptsRow(int source_row, const QModelIndex& source_parent) const {

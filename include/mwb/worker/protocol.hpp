@@ -33,6 +33,8 @@ enum class FrameKind : std::uint16_t {
     cancel = 6,         ///< Parent -> worker: cancel the request.
     failure = 7,        ///< Worker -> parent: structured error for a request.
     shutdown = 8,       ///< Parent -> worker: exit cleanly.
+    validate_soundfont = 9, ///< Parent -> worker: load the transferred bytes as an SF2 bank.
+    soundfont_result = 10,  ///< Worker -> parent: the bank loaded; {presets}.
 };
 
 /// A decoded frame.

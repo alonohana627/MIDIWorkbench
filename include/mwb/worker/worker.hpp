@@ -56,6 +56,10 @@ public:
     [[nodiscard]] Result<ParsedFile> parse_midi(std::span<const std::uint8_t> bytes, const std::string& name,
                                                 const midi::ParseLimits& limits, std::stop_token stop = {});
 
+    /// Loads an SF2 bank in the worker before the caller loads it (section 28.2); returns the
+    /// number of presets. A crash or limit kill fails the bank only.
+    [[nodiscard]] Result<std::size_t> validate_soundfont(std::span<const std::uint8_t> bytes, std::stop_token stop = {});
+
     [[nodiscard]] bool is_alive() const;
     /// Sends shutdown and waits briefly; terminates if needed.
     void stop();

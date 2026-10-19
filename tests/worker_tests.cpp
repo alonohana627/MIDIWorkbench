@@ -86,6 +86,22 @@ TEST_SUITE("ipc") {
 }
 
 TEST_SUITE("worker") {
+    TEST_CASE("mwb-worker loads an SF2 bank before the caller does (code-runtime-14)") {
+        auto client = WorkerClient::start(MWB_WORKER_PATH);
+        REQUIRE(client);
+        auto presets = (*client)->validate_soundfont(test::make_test_soundfont());
+        REQUIRE_MESSAGE(presets, (presets ? "" : presets.error().describe()));
+        CHECK(*presets == 1);
+        // A bank that does not load fails that bank only; the worker keeps serving.
+        auto truncated = test::make_test_soundfont();
+        truncated.resize(truncated.size() / 2);
+        CHECK_FALSE((*client)->validate_soundfont(truncated));
+        CHECK_FALSE((*client)->validate_soundfont(std::vector<std::uint8_t>{'R', 'I', 'F', 'F', 1, 2, 3}));
+        CHECK((*client)->is_alive());
+        CHECK((*client)->parse_midi(small_midi(), "after.mid", {})); // MIDI requests still work
+        (*client)->stop();
+    }
+
     TEST_CASE("mwb-worker parses a file in a separate limited process") {
         auto client = WorkerClient::start(MWB_WORKER_PATH);
         REQUIRE(client);

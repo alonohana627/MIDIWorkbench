@@ -110,8 +110,11 @@ private:
 std::filesystem::path temporary_path_for(const std::filesystem::path& target) {
     static std::atomic<std::uint64_t> counter{0};
     const auto stamp = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
-    const std::string name = std::format(".{}.partial-{:x}-{}.tmp", target.filename().string(), stamp,
-                                         counter.fetch_add(1, std::memory_order_relaxed));
+    // Built in native form: path::string() throws for names outside the ANSI code page when the
+    // process does not run with the UTF-8 code page (tests, tools embedding the renderer).
+    std::filesystem::path name(".");
+    name += target.filename();
+    name += std::format(".partial-{:x}-{}.tmp", stamp, counter.fetch_add(1, std::memory_order_relaxed));
     return target.parent_path() / name;
 }
 

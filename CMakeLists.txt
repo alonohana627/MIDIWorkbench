@@ -89,7 +89,7 @@ endif()
 mwb_module(platform MODULES core audio playback
   LIBRARIES mwb::libremidi mwb::miniaudio mwb::efsw mwb::readerwriterqueue mwb::concurrentqueue
             ${MWB_PLATFORM_SYSTEM_LIBRARIES})
-mwb_module(worker MODULES core midi music document)
+mwb_module(worker MODULES core midi music document playback audio)
 mwb_module(app MODULES core midi music document library search playback audio platform jobs worker
   LIBRARIES mwb::spdlog mwb::sqlite)
 include(ThirdPartyNotices)
@@ -104,20 +104,26 @@ mwb_module(cli MODULES core midi music document library search playback audio pl
 
 # --- Executables -------------------------------------------------------------------------------
 if(EXISTS "${PROJECT_SOURCE_DIR}/src/cli/main/mwb_cli_main.cpp")
-  add_executable(mwb-cli src/cli/main/mwb_cli_main.cpp)
+  # The console tools embed the same manifest as the GUI (UTF-8 active code page, long paths),
+  # so file names outside the ANSI code page work everywhere (section 32.5).
+  set(mwb_console_resources)
+  if(WIN32)
+    set(mwb_console_resources resources/console.rc)
+  endif()
+  add_executable(mwb-cli src/cli/main/mwb_cli_main.cpp ${mwb_console_resources})
   mwb_apply_owned_options(mwb-cli)
   target_link_libraries(mwb-cli PRIVATE mwb::cli)
 endif()
 
 if(EXISTS "${PROJECT_SOURCE_DIR}/src/worker/main/mwb_worker_main.cpp")
-  add_executable(mwb-worker src/worker/main/mwb_worker_main.cpp)
+  add_executable(mwb-worker src/worker/main/mwb_worker_main.cpp ${mwb_console_resources})
   mwb_apply_owned_options(mwb-worker)
   target_link_libraries(mwb-worker PRIVATE mwb::worker)
 endif()
 
 if(MWB_BUILD_GUI AND EXISTS "${PROJECT_SOURCE_DIR}/src/ui/main/midiworkbench_main.cpp")
   set(CMAKE_AUTORCC ON)
-  mwb_module(ui QT MODULES core midi music document library search playback audio platform app
+  mwb_module(ui QT MODULES core midi music document library search playback audio platform jobs app
     LIBRARIES Qt6::Core Qt6::Gui Qt6::Widgets mwb::rapidfuzz)
   add_executable(midiworkbench WIN32 src/ui/main/midiworkbench_main.cpp resources/midiworkbench.rc
     resources/resources.qrc)

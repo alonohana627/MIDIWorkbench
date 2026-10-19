@@ -13,6 +13,7 @@
 #include <SQLiteCpp/Statement.h>
 
 #include <algorithm>
+#include <atomic>
 #include <format>
 #include <fstream>
 #include <set>
@@ -1228,5 +1229,83 @@ TEST_SUITE("analysis") {
         // The remaining heads get streams on a second call; nothing is written twice.
         CHECK(library->populate_synthetic_motifs(1000, 9).value() == 50);
         CHECK(library->populate_synthetic_motifs(10, 9).value() == 0);
+    }
+}
+
+TEST_SUITE("catalog") {
+    TEST_CASE("a search that meets a full outbox reload drops the browse index and asks for a rebuild (review_6)") {
+        test::TemporaryDirectory temporary;
+        auto library = make_library(temporary.path() / "library");
+        REQUIRE(library->populate_synthetic(50, 2).has_value());
+        std::atomic<int> requests{0};
+        library->set_browse_index_dropped_listener([&] { ++requests; });
+        REQUIRE(library->build_browse_index()->ready);
+        SearchRequest request;
+        CHECK(library->search(request)->from_browse_index);
+        // More changes than one outbox read covers: the index cannot catch up row by row.
+        for (int index = 0; index < 1001; ++index)
+            REQUIRE(library->set_rating(1, index % 6).has_value());
+        auto page = library->search(request);
+        REQUIRE(page.has_value());
+        CHECK_FALSE(page->from_browse_index); // SQL answered
+        CHECK(requests.load() == 1);
+        CHECK_FALSE(library->browse_index_status().ready);
+        REQUIRE(library->build_browse_index()->ready); // what the panel schedules
+        CHECK(library->search(request)->from_browse_index);
+        CHECK(requests.load() == 1);
+    }
+}
+
+TEST_SUITE("import") {
+    TEST_CASE("watched folders: changed files update their own locations, deleted ones are marked missing (code-runtime-15)") {
+        test::TemporaryDirectory temporary;
+        auto library = make_library(temporary.path() / "library");
+        const auto folder = temporary.path() / "watched";
+        write_bytes(folder / "a.mid", phrase_smf(Phrase{}));
+        write_bytes(folder / "sub" / "b.mid", phrase_smf(Phrase{}.set_pitches({50, 52})));
+        ImportOptions options;
+        options.watch = true;
+        auto first = library->import_paths({folder}, options);
+        REQUIRE(first.has_value());
+        REQUIRE(first->counts.imported == 2);
+        auto roots = library->source_roots();
+        REQUIRE(roots.has_value());
+        REQUIRE(roots->size() == 1);
+        CHECK(roots->at(0).watched);
+        const auto asset = only_asset(*first, "b.mid");
+
+        // A changed file is re-imported against the folder it belongs to: same location, new
+        // revision, no new source root.
+        write_bytes(folder / "sub" / "b.mid", phrase_smf(Phrase{}.set_pitches({60, 62, 64})));
+        ImportOptions follow;
+        follow.root = folder;
+        auto changed = library->import_paths({folder / "sub" / "b.mid"}, follow);
+        REQUIRE(changed.has_value());
+        CHECK(changed->counts.imported == 1);
+        CHECK(*changed->items[0].asset_id == asset);
+        CHECK(library->revisions(asset)->size() == 2);
+        CHECK(library->source_roots()->size() == 1);
+        // A file outside the given root is refused, not registered elsewhere.
+        write_bytes(temporary.path() / "elsewhere.mid", phrase_smf(Phrase{}));
+        auto outside = library->import_paths({temporary.path() / "elsewhere.mid"}, follow);
+        REQUIRE(outside.has_value());
+        CHECK(outside->counts.failed == 1);
+
+        // A deleted file marks its location missing; the asset stays (never trashed).
+        std::filesystem::remove(folder / "sub" / "b.mid");
+        auto missing = library->mark_sources_missing(folder, {folder / "sub" / "b.mid"});
+        REQUIRE(missing.has_value());
+        CHECK(*missing == 1);
+        CHECK(*library->mark_sources_missing(folder, {folder / "sub" / "b.mid"}) == 0); // already missing
+        auto rows = library->browse_rows_for({asset});
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        CHECK(rows->front().source_missing);
+        CHECK_FALSE(rows->front().deleted);
+        CHECK_FALSE(library->mark_sources_missing(temporary.path() / "not a root", {}).has_value());
+        // The file coming back makes the location present again.
+        write_bytes(folder / "sub" / "b.mid", phrase_smf(Phrase{}.set_pitches({60, 62, 64})));
+        REQUIRE(library->import_paths({folder / "sub" / "b.mid"}, follow).has_value());
+        CHECK_FALSE(library->browse_rows_for({asset})->front().source_missing);
     }
 }

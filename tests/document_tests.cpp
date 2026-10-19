@@ -9,17 +9,32 @@
 #include "mwb/core/serialization.hpp"
 #include "mwb/core/validation.hpp"
 #include "mwb/document/command_codec.hpp"
+#include "mwb/document/file_system.hpp"
 #include "mwb/document/history.hpp"
 #include "mwb/document/migration.hpp"
 #include "mwb/document/native_format.hpp"
 #include "mwb/document/recovery.hpp"
 #include "mwb/document/session.hpp"
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include <SQLiteCpp/Database.h>
 #include <SQLiteCpp/Statement.h>
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
+#include <format>
+#include <fstream>
+#include <thread>
 #include <memory>
 #include <string>
 #include <vector>
@@ -460,6 +475,34 @@ TEST_CASE("opaque records make a file inspection-only") {
     check_same_document(opened->document, original);
 }
 
+#ifdef _WIN32
+TEST_CASE("a save waits out another program briefly holding the file (code-document-5)") {
+    test::TemporaryDirectory directory;
+    const auto path = directory.path() / "busy.mwb";
+    REQUIRE(save_native(rich_document("First", false), path));
+    // A virus scanner or indexer opens the file without FILE_SHARE_DELETE: replacing it fails
+    // with a sharing violation until the handle closes.
+    HANDLE held = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+    REQUIRE(held != INVALID_HANDLE_VALUE);
+    std::atomic<bool> released{false};
+    std::jthread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        released = true;
+        CloseHandle(held);
+    });
+    DocumentData second = rich_document("Second", false);
+    const auto status = save_native(second, path);
+    CHECK(released.load()); // it really had to wait
+    REQUIRE_MESSAGE(status, (status ? "" : status.error().describe()));
+    releaser.join();
+    const auto loaded = load_native(path);
+    REQUIRE(loaded);
+    CHECK(loaded->title == "Second");
+    CHECK(files_containing(directory.path(), "mwb-tmp") == 0);
+}
+#endif
+
 TEST_CASE("a failed save keeps the previous file") {
     test::TemporaryDirectory directory;
     const auto path = directory.path() / "keep.mwb";
@@ -499,6 +542,73 @@ TEST_CASE("a failed save keeps the previous file") {
     REQUIRE(loaded);
     check_same_document(*loaded, first);
     CHECK(files_containing(directory.path(), "mwb-tmp") == 0);
+}
+
+TEST_CASE("a file whose event index lost rows is refused instead of opening without those events (code-document-4)") {
+    test::TemporaryDirectory directory;
+    DocumentData document = make_blank_document("Index");
+    {
+        ChangeBuilder builder(document, "notes");
+        for (int index = 0; index < 60; ++index)
+            builder.add_note(first_track(document), index * 240, index * 240 + 200, 0, static_cast<std::uint8_t>(40 + index), 90);
+        REQUIRE(apply_change_set(document, builder.finish()));
+    }
+    const auto path = directory.path() / "index.mwb";
+    REQUIRE(save_native(document, path));
+    REQUIRE(load_native(path)); // intact
+    const auto root_page = [](SQLite::Database& database, const std::string& name) {
+        SQLite::Statement query(database, "SELECT rootpage FROM sqlite_schema WHERE name = ?1");
+        query.bind(1, name);
+        REQUIRE(query.executeStep());
+        return query.getColumn(0).getInt64();
+    };
+    {
+        // A shadow table with the same rowids, where a third of the rows carry another track id,
+        // gets two indexes with the event indexes' key layout. Their B-trees are swapped under
+        // both event indexes: every index has the right number of entries (so PRAGMA quick_check,
+        // which counts entries but does not compare their content, stays clean), yet a read by
+        // track misses a third of the events.
+        SQLite::Database database(path.string(), SQLite::OPEN_READWRITE);
+        database.exec("CREATE TABLE shadow(r INTEGER PRIMARY KEY, track_id BLOB, tick INTEGER, order_key INTEGER)");
+        database.exec("INSERT INTO shadow SELECT rowid, CASE WHEN rowid % 3 = 0 THEN randomblob(16) ELSE track_id END, "
+                      "tick, order_key FROM midi_event");
+        database.exec("CREATE INDEX tamper_a ON shadow(track_id, tick, order_key)");
+        database.exec("CREATE UNIQUE INDEX tamper_b ON shadow(track_id, tick, order_key)");
+        SQLite::Statement autoindex(database, "SELECT name FROM sqlite_schema WHERE tbl_name = 'midi_event' AND type = "
+                                              "'index' AND sql IS NULL AND name LIKE 'sqlite_autoindex_midi_event_%' "
+                                              "ORDER BY name DESC LIMIT 1");
+        REQUIRE(autoindex.executeStep());
+        const std::string unique_index = autoindex.getColumn(0).getString();
+        const auto time_page = root_page(database, "event_time");
+        const auto unique_page = root_page(database, unique_index);
+        const auto a_page = root_page(database, "tamper_a");
+        const auto b_page = root_page(database, "tamper_b");
+        database.exec("PRAGMA writable_schema = ON");
+        database.exec(std::format("UPDATE sqlite_schema SET rootpage = {} WHERE name = 'event_time'", a_page));
+        database.exec(std::format("UPDATE sqlite_schema SET rootpage = {} WHERE name = 'tamper_a'", time_page));
+        database.exec(std::format("UPDATE sqlite_schema SET rootpage = {} WHERE name = '{}'", b_page, unique_index));
+        database.exec(std::format("UPDATE sqlite_schema SET rootpage = {} WHERE name = 'tamper_b'", unique_page));
+        database.exec("PRAGMA writable_schema = OFF");
+    }
+    {
+        SQLite::Database database(path.string(), SQLite::OPEN_READWRITE);
+        database.exec("DROP INDEX tamper_a"); // frees the original B-trees now listed under the helpers
+        database.exec("DROP INDEX tamper_b");
+        database.exec("DROP TABLE shadow");
+        SQLite::Statement check(database, "PRAGMA quick_check");
+        REQUIRE(check.executeStep());
+        CHECK(check.getColumn(0).getString() == "ok"); // the damage quick_check cannot see
+        SQLite::Statement indexed(database, "SELECT count(*) FROM midi_event INDEXED BY event_time WHERE track_id IN "
+                                            "(SELECT id FROM track)");
+        SQLite::Statement scanned(database, "SELECT count(*) FROM midi_event NOT INDEXED WHERE track_id IN (SELECT id FROM track)");
+        REQUIRE(indexed.executeStep());
+        REQUIRE(scanned.executeStep());
+        REQUIRE(indexed.getColumn(0).getInt64() < scanned.getColumn(0).getInt64());
+    }
+    const auto loaded = load_native(path);
+    REQUIRE_FALSE(loaded);
+    CHECK(loaded.error().code == ErrorCode::invalid_data);
+    CHECK(loaded.error().message.find("index does not match") != std::string::npos);
 }
 
 TEST_CASE("schema checksums and version classification") {
@@ -711,6 +821,8 @@ TEST_CASE("command codec round-trips every operation kind") {
         SequenceInsert{1, document.sequences[1]},
         SequenceRemove{0, sequence},
         DocumentPropertiesChange{"a", "b", "{}", R"({"x":1})"},
+        TakeInsert{1, document.takes[0]}, // recording evidence (raw capture chunks) round-trips too
+        TakeRemove{0, document.takes[0]},
     };
     const auto bytes = encode_command(envelope);
     REQUIRE(bytes);
@@ -728,6 +840,9 @@ TEST_CASE("command codec round-trips every operation kind") {
     CHECK(replace.after == moved);
     CHECK(std::get<TrackInsert>(decoded->changes.operations[3]).track == sequence.tracks[1]);
     CHECK(std::get<SequenceRemove>(decoded->changes.operations[9]).sequence == sequence);
+    CHECK(std::get<TakeInsert>(decoded->changes.operations[11]).take == document.takes[0]);
+    CHECK(std::get<TakeInsert>(decoded->changes.operations[11]).index == 1);
+    CHECK(std::get<TakeRemove>(decoded->changes.operations[12]).take == document.takes[0]);
 
     SUBCASE("damaged envelopes are rejected") {
         auto damaged = *bytes;
@@ -963,6 +1078,147 @@ TEST_CASE("the journal refuses non-contiguous generations") {
     const auto status = (*created)->record(CommandKind::edit, changes, document.generation + 3, document.generation + 4, document);
     REQUIRE_FALSE(status);
     CHECK(status.error().code == ErrorCode::invalid_argument);
+}
+
+TEST_CASE("recording on one thread while another flushes recovers the exact document (code-document-7)") {
+    test::TemporaryDirectory directory;
+    WorkingSession session(make_blank_document("Concurrent"), SessionOrigin::opened_file);
+    RecoveryPolicy policy;
+    policy.checkpoint_command_count = 50; // checkpoints are prepared while flushes run
+    auto created = RecoveryJournal::create(directory.path(), session.document(), SourceReference{"Concurrent", {}, {}, {}},
+                                           policy);
+    REQUIRE(created);
+    std::shared_ptr<RecoveryJournal> journal = std::move(*created);
+    connect_recovery(session, journal);
+    std::atomic<bool> editing{true};
+    std::atomic<int> flush_failures{0};
+    std::atomic<int> flushes{0};
+    {
+        std::jthread flusher([&] {
+            while (editing.load()) {
+                if (!journal->flush(false)) // never waits for a checkpoint still being serialized
+                    ++flush_failures;
+                ++flushes;
+            }
+        });
+        std::jthread editor([&] {
+            for (int index = 0; index < 2000; ++index) {
+                ChangeBuilder builder(session.document(), "Add note");
+                builder.add_note(first_track(session.document()), index * 120, index * 120 + 100, 0,
+                                 static_cast<std::uint8_t>(36 + index % 60), 100);
+                if (!session.apply(builder.finish()))
+                    break;
+            }
+            editing = false;
+        });
+    }
+    CHECK(flush_failures.load() == 0);
+    CHECK(flushes.load() > 0);
+    CHECK_FALSE(journal->last_error().has_value());
+    REQUIRE(journal->flush(true));
+    CHECK(journal->pending_commands() == 0);
+    const auto expected = semantic_hash(session.document());
+    const Uuid session_id = journal->session_id();
+    journal.reset(); // crash
+    const auto recovered = recover_session(directory.path(), session_id);
+    REQUIRE_MESSAGE(recovered, (recovered ? "" : recovered.error().describe()));
+    CHECK(semantic_hash(recovered->document) == expected);
+    CHECK(recovered->document.generation == session.generation());
+    CHECK_FALSE(recovered->report.stop_reason.has_value());
+}
+
+TEST_CASE("a flush that cannot write keeps its buffer and the next flush commits it (code-document-7)") {
+    test::TemporaryDirectory directory;
+    WorkingSession session(make_blank_document("Busy"), SessionOrigin::opened_file);
+    RecoveryPolicy policy;
+    policy.busy_timeout = std::chrono::milliseconds{0}; // fail at once while another writer holds the file
+    auto created = RecoveryJournal::create(directory.path(), session.document(), SourceReference{"Busy", {}, {}, {}}, policy);
+    REQUIRE(created);
+    std::shared_ptr<RecoveryJournal> journal = std::move(*created);
+    connect_recovery(session, journal);
+    REQUIRE(journal->flush(true));
+    for (int index = 0; index < 3; ++index)
+        add_note(session, index * 480, static_cast<std::uint8_t>(60 + index));
+    REQUIRE(journal->pending_commands() == 3);
+    {
+        // Another instance (or document) writing the shared recovery database.
+        SQLite::Database other((directory.path() / recovery_database_name).string(), SQLite::OPEN_READWRITE);
+        other.exec("BEGIN EXCLUSIVE");
+        const auto blocked = journal->flush(true);
+        CHECK_FALSE(blocked.has_value());
+        CHECK(journal->pending_commands() == 3); // nothing lost
+        add_note(session, 4000, 72);             // recording continues meanwhile
+        CHECK(journal->pending_commands() == 4);
+        other.exec("COMMIT");
+    }
+    REQUIRE(journal->flush(true));
+    CHECK(journal->pending_commands() == 0);
+    const auto expected = semantic_hash(session.document());
+    const Uuid session_id = journal->session_id();
+    journal.reset();
+    const auto recovered = recover_session(directory.path(), session_id);
+    REQUIRE(recovered);
+    CHECK(semantic_hash(recovered->document) == expected);
+    CHECK(recovered->report.applied_commands == 4);
+}
+
+TEST_CASE("the session lock is exclusive across handles and released on destruction (code-document-7)") {
+    test::TemporaryDirectory directory;
+    const auto path = directory.path() / std::filesystem::path(u8"session ✓.lock");
+    {
+        auto first = file_system::ExclusiveFileLock::acquire(path);
+        REQUIRE(first);
+        CHECK(file_system::ExclusiveFileLock::is_held(path));
+        auto second = file_system::ExclusiveFileLock::acquire(path);
+        REQUIRE_FALSE(second);
+        CHECK(second.error().code == ErrorCode::conflict);
+        auto moved = std::move(*first); // ownership moves with the handle
+        CHECK(file_system::ExclusiveFileLock::is_held(path));
+    }
+    CHECK_FALSE(file_system::ExclusiveFileLock::is_held(path));
+    auto again = file_system::ExclusiveFileLock::acquire(path);
+    CHECK(again.has_value());
+    // A path that cannot exist is an I/O error, not "locked by another process".
+    auto missing = file_system::ExclusiveFileLock::acquire(directory.path() / "no such dir" / "x.lock");
+    REQUIRE_FALSE(missing);
+    CHECK(missing.error().code != ErrorCode::conflict);
+}
+
+TEST_CASE("a damaged recovery database is set aside and a newer one gets its own file (code-document-2)") {
+    test::TemporaryDirectory directory;
+    std::ignore = take_recovery_database_notice(); // earlier tests in this process
+    {
+        std::ofstream damaged(directory.path() / recovery_database_name, std::ios::binary);
+        damaged << "this is not a database, just bytes left by a broken disk or another program";
+    }
+    const DocumentData document = make_blank_document("After damage");
+    {
+        auto created = RecoveryJournal::create(directory.path(), document, SourceReference{"After damage", {}, {}, {}});
+        REQUIRE_MESSAGE(created, (created ? "" : created.error().describe()));
+        REQUIRE((*created)->flush(true));
+        REQUIRE((*created)->mark_cleanly_closed());
+    }
+    const auto notice = take_recovery_database_notice();
+    REQUIRE(notice.has_value());
+    CHECK_FALSE(take_recovery_database_notice().has_value()); // shown once
+    std::size_t evidence = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(directory.path()))
+        if (entry.path().filename().string().starts_with("recovery.corrupt-"))
+            ++evidence;
+    CHECK(evidence >= 1); // the damaged file is kept, renamed
+
+    // A database written by a newer version (after a downgrade): this version uses its own file.
+    {
+        SQLite::Database newer((directory.path() / recovery_database_name).string(), SQLite::OPEN_READWRITE);
+        newer.exec("PRAGMA user_version = 99");
+    }
+    auto created = RecoveryJournal::create(directory.path(), document, SourceReference{"Downgraded", {}, {}, {}});
+    REQUIRE_MESSAGE(created, (created ? "" : created.error().describe()));
+    REQUIRE((*created)->flush(true));
+    CHECK(std::filesystem::exists(directory.path() / recovery_fallback_database_name));
+    const auto sessions = list_recoverable_sessions(directory.path());
+    REQUIRE(sessions);
+    CHECK(sessions->size() == 1); // the live session, found through the fallback file
 }
 
 TEST_CASE("create() leaves the first checkpoint to the background; flush(true) makes the session recoverable") {

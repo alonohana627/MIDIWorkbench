@@ -14,6 +14,18 @@ using namespace mwb;
 
 namespace {
 
+#ifdef MWB_WORKER_PATH
+/// The CLI looks for mwb-worker next to its executable; the test executable lives elsewhere, so
+/// the variable points it at the built worker before any command runs (static initialization).
+[[maybe_unused]] const bool worker_configured = [] {
+#ifdef _WIN32
+    return _putenv_s("MWB_WORKER", MWB_WORKER_PATH) == 0;
+#else
+    return setenv("MWB_WORKER", MWB_WORKER_PATH, 1) == 0;
+#endif
+}();
+#endif
+
 struct Run {
     int code = 0;
     nlohmann::json json;
@@ -151,6 +163,24 @@ TEST_SUITE("cli") {
         CHECK(run({"render", path_text(source), "--output", path_text(wav)}).code == cli::exit_filesystem);
     }
 
+    TEST_CASE("render writes to names outside the ANSI code page (code-runtime-13)") {
+        // This test process has no UTF-8 manifest, like any tool embedding the renderer: names
+        // with Japanese and an emoji must not go through the ANSI code page.
+        test::TemporaryDirectory directory;
+        const auto source = write_phrase(directory.path(), "phrase.mid");
+        const auto folder = directory.path() / app::path_from_utf8("\xF0\x9F\x8E\xB5 out");
+        std::filesystem::create_directories(folder);
+        const auto wav = folder / app::path_from_utf8("\xE6\x97\xA5\xE6\x9C\xAC\xF0\x9F\x8E\xB5.wav");
+        const auto result = run({"render", path_text(source), "--output", path_text(wav), "--tail", "0"});
+        INFO(result.json.dump());
+        REQUIRE(result.code == cli::exit_success);
+        CHECK(std::filesystem::file_size(wav) > 44u);
+        std::size_t leftovers = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(folder))
+            leftovers += entry.path() != wav ? 1u : 0u;
+        CHECK(leftovers == 0); // the temporary file was renamed, not left behind
+    }
+
     TEST_CASE("library import, search, analyze, backup, verify and repair") {
         test::TemporaryDirectory directory;
         const auto sources = directory.path() / "sources";
@@ -209,6 +239,51 @@ TEST_SUITE("cli") {
         CHECK(run({"library", "gc", "--library", path_text(library), "--grace-days", "-1"}).code ==
               cli::exit_invalid_arguments);
         CHECK(run({"library", "verify", "--library", path_text(library), "--objects"}).code == cli::exit_success);
+    }
+
+    TEST_CASE("untrusted MIDI files and SF2 banks are parsed in mwb-worker (code-runtime-14)") {
+        const auto capabilities = run({"capabilities", "--json"});
+        REQUIRE(capabilities.code == cli::exit_success);
+        INFO(capabilities.json["parser_isolation"].dump());
+        CHECK(capabilities.json["parser_isolation"].get<std::string>().starts_with("mwb-worker:"));
+        test::TemporaryDirectory directory;
+        const auto source = write_phrase(directory.path(), "phrase.mid");
+        // A broken bank is refused by the worker; the CLI reports it and keeps running.
+        const auto broken = directory.path() / "broken.sf2";
+        {
+            auto bytes = test::make_test_soundfont();
+            bytes.resize(bytes.size() / 2);
+            std::ofstream file(broken, std::ios::binary);
+            file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        }
+        const auto refused = run({"render", path_text(source), "--output", path_text(directory.path() / "a.wav"), "--synth",
+                                  path_text(broken)});
+        INFO(refused.json.dump());
+        CHECK(refused.code != cli::exit_success);
+        CHECK(refused.json.dump().find("SoundFont") != std::string::npos);
+        CHECK_FALSE(std::filesystem::exists(directory.path() / "a.wav"));
+        const auto good = directory.path() / "good.sf2";
+        {
+            const auto bytes = test::make_test_soundfont();
+            std::ofstream file(good, std::ios::binary);
+            file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        }
+        const auto rendered = run({"render", path_text(source), "--output", path_text(directory.path() / "b.wav"), "--synth",
+                                   path_text(good), "--tail", "0"});
+        INFO(rendered.json.dump());
+        CHECK(rendered.code == cli::exit_success);
+        // Import and analysis go through the same worker.
+        const auto sources = directory.path() / "sources";
+        std::filesystem::create_directories(sources);
+        write_phrase(sources, "good.mid");
+        const auto imported = run({"library", "import", "--library", path_text(directory.path() / "lib"), "--from",
+                                   path_text(sources)});
+        INFO(imported.json["report"]["counts"].dump());
+        CHECK(imported.code == cli::exit_success);
+        CHECK(imported.json["report"]["counts"]["imported"].get<int>() == 1);
+        const auto analyzed = run({"library", "analyze", "--library", path_text(directory.path() / "lib")});
+        CHECK(analyzed.code == cli::exit_success);
+        CHECK(analyzed.json["report"]["analyzed"].get<int>() == 1);
     }
 
     TEST_CASE("capabilities lists dependencies and SQLite options") {

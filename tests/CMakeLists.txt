@@ -34,7 +34,7 @@ foreach(entry IN LISTS MWB_TEST_AREAS)
     mwb_test_suite(${area} MODULES ${modules})
   endif()
 endforeach()
-foreach(tests IN ITEMS mwb_worker_tests mwb_app_tests)
+foreach(tests IN ITEMS mwb_worker_tests mwb_app_tests mwb_cli_tests)
   if(TARGET ${tests} AND TARGET mwb-worker)
     target_compile_definitions(${tests} PRIVATE MWB_WORKER_PATH="$<TARGET_FILE:mwb-worker>")
     add_dependencies(${tests} mwb-worker)
@@ -45,6 +45,13 @@ if(TARGET mwb_midi_tests)
 endif()
 if(MWB_BUILD_GUI AND TARGET mwb_ui AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ui_tests.cpp")
   mwb_test_suite(ui QT MODULES core midi music document library search playback audio platform app ui
+    LIBRARIES Qt6::Test)
+endif()
+
+# UI frame and drag budgets on E100K only mean something in optimized builds (section 33.3).
+if(MWB_BUILD_GUI AND TARGET mwb_ui AND (CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/uiperf_tests.cpp")
+  mwb_test_suite(uiperf QT MODULES core midi music document library search playback audio platform jobs app ui
     LIBRARIES Qt6::Test)
 endif()
 

@@ -115,9 +115,16 @@ nlohmann/json, xxHash and picosha2.
   punch-out and replace-range controls in the GUI (the recorder supports them; the GUI records
   from the edit cursor with count-in).
 - SoundFont playback in the live engine from the GUI (SF2 works in offline rendering).
-- Library: file watching (the efsw adapter exists in `platform`), ZIP
-  backups, duplicate review/merge, collections and tags UI beyond favorite/rating, saved searches
-  UI, export portable library, coalesced change notifications.
+- Library: ZIP backups, duplicate review/merge, collections and tags UI beyond favorite/rating,
+  saved searches UI, export portable library, coalesced change notifications. File watching
+  (section 22.4) covers folders added with "Add Folder": edits become revisions (or review
+  candidates), deletions mark the source missing, an overflow re-imports the folder; there is no
+  per-folder watch toggle in the UI yet, and offline drives are re-watched only when the library
+  reopens. The library panel's upkeep (browse index, object GC, reading watched folders) runs on
+  the bounded `jobs::JobCoordinator`; imports and analysis keep their ordered import thread.
+- The CLI parses MIDI files and validates SF2 banks in mwb-worker (or the worker named by the
+  MWB_WORKER environment variable); without a worker next to it, it parses in process and
+  `capabilities` says so.
 - Region/marker editing UI, insert/delete time, split-by-channel/pitch, merge tracks, type-2
   sequence selector UI (the controller supports switching sequences).
 - Preview of cached audio (preview cache), library preview audition.
@@ -125,8 +132,8 @@ nlohmann/json, xxHash and picosha2.
 - Still on the GUI thread: the recovery list dialog and recovering a session, and the first
   recovery checkpoint of a new blank document (small). Open, export, save, journal flushes,
   per-edit hashing and checkpoints run on background threads.
-- Library analysis of stored revisions and restore parse in process (the bytes were validated at
-  import); imports and file open parse in the worker process.
+- Restoring a revision parses in process (the bytes were validated at import); imports, analysis
+  and file open parse in the worker process, in the desktop app and in the CLI.
 - A library import is one task on the library's write thread; searches and opens use a separate
   read thread and are not delayed, but other writes (saves, tags) wait for the import.
 - Retrieval-corpus calibration of similarity and key-estimation confidence.

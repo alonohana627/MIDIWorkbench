@@ -334,9 +334,55 @@ Result<ParsedFile> WorkerClient::parse_midi_checked(std::span<const std::uint8_t
         }
         case FrameKind::hello:
         case FrameKind::parse_midi:
+        case FrameKind::validate_soundfont:
+        case FrameKind::soundfont_result:
         case FrameKind::cancel:
         case FrameKind::shutdown: break;
         }
+    }
+}
+
+Result<std::size_t> WorkerClient::validate_soundfont(std::span<const std::uint8_t> bytes, std::stop_token stop) {
+    try {
+        if (!is_alive())
+            return make_error(ErrorCode::internal, "the worker is not running");
+        const std::uint64_t request = next_request_++;
+        for (const auto& chunk : chunk_payloads(request, bytes)) {
+            auto frame = encode_frame(FrameKind::data_chunk, request, chunk);
+            if (!frame || !process_->write(*frame))
+                return make_error(ErrorCode::internal, "could not send data to the worker");
+        }
+        auto frame = encode_frame(FrameKind::validate_soundfont, request, nlohmann::json::object());
+        if (!frame || !process_->write(*frame))
+            return make_error(ErrorCode::internal, "could not send the SoundFont check to the worker");
+        const auto deadline = std::chrono::steady_clock::now() + limits_.parse_timeout;
+        while (true) {
+            auto reply = process_->next_frame(deadline, stop);
+            if (!reply) {
+                process_->terminate(); // timeout, cancel, crash or malformed stream: retire the worker
+                return std::unexpected(reply.error());
+            }
+            if (reply->request_id != request)
+                continue; // fenced
+            switch (reply->kind) {
+            case FrameKind::soundfont_result:
+                return reply->payload.at("presets").get<std::size_t>();
+            case FrameKind::failure:
+                return make_error(static_cast<ErrorCode>(std::clamp(reply->payload.value("code", 12), 1, 12)),
+                                  reply->payload.value("message", std::string("worker failure")));
+            case FrameKind::heartbeat:
+            case FrameKind::data_chunk:
+            case FrameKind::hello:
+            case FrameKind::parse_midi:
+            case FrameKind::parse_result:
+            case FrameKind::validate_soundfont:
+            case FrameKind::cancel:
+            case FrameKind::shutdown: break;
+            }
+        }
+    } catch (const std::exception& error) {
+        stop_process_after_protocol_error();
+        return make_error(ErrorCode::invalid_data, std::string("the worker sent a malformed reply: ") + error.what());
     }
 }
 

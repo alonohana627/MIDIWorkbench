@@ -34,7 +34,7 @@ core ─────────────────────────
  ├─ library     (core, midi, music, document, search) catalog, objects, import, revisions, backup
  ├─ audio       (core, playback) ISynth, built-in synth, SoundFont, block renderer, WAV render
  ├─ platform    (core, audio, playback) WASAPI/null output, audio engine, WinMM/null MIDI, watcher
- ├─ worker      (core, midi, music, document) IPC protocol, mwb-worker service, worker client
+ ├─ worker      (core, midi, music, document, playback, audio) IPC protocol, mwb-worker service (MIDI parsing, SF2 validation), worker client
  ├─ app         (all of the above) file I/O, data directories, logging, recording logic
  ├─ cli         (app and below) mwb-cli commands
  └─ ui          (app and below, Qt) main window and editors

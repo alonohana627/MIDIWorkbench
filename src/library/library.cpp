@@ -269,6 +269,7 @@ struct Library::State {
         std::unique_ptr<search::BrowseIndex> index; ///< Null until built, after a full reload or over budget.
         std::int64_t revision = 0;                   ///< Outbox revision the index reflects.
         bool over_budget = false;
+        std::function<void()> dropped;               ///< Rebuild request after a full reload.
     } browse;
 
     State(std::filesystem::path library_root, LibraryOptions library_options, WriterLock acquired_lock)
@@ -964,17 +965,35 @@ Result<ImportReport> Library::import_paths(const std::vector<std::filesystem::pa
             add_item(path_utf8(source.filename()), ImportOutcome::failed, std::nullopt, "the source does not exist");
             continue;
         }
+        if (options.root) {
+            const auto given = std::filesystem::absolute(*options.root, error).lexically_normal();
+            const auto inside = absolute.lexically_relative(given);
+            if (inside.empty() || *inside.begin() == "..") {
+                add_item(path_utf8(source.filename()), ImportOutcome::failed, std::nullopt,
+                         "the source is not inside the given source folder");
+                continue;
+            }
+            root = given;
+        }
         const auto root_display = path_utf8(root);
         auto root_id = state.write("register source root", [&](SQLite::Database& database) -> Result<std::int64_t> {
             Statement find(database, "SELECT id FROM source_root WHERE display_path = ?1");
             find.bind(1, root_display);
-            if (find.executeStep())
-                return find.getColumn(0).getInt64();
+            if (find.executeStep()) {
+                const auto existing = find.getColumn(0).getInt64();
+                if (options.watch) {
+                    Statement watch(database, "UPDATE source_root SET watch_enabled = 1 WHERE id = ?1");
+                    watch.bind(1, existing);
+                    watch.exec();
+                }
+                return existing;
+            }
             Statement insert(database, "INSERT INTO source_root(uuid, display_path, watch_enabled, policy_json) VALUES "
-                                       "(?1, ?2, 0, ?3)");
+                                       "(?1, ?2, ?4, ?3)");
             sqlite_support::bind_uuid(insert, 1, Uuid::generate());
             insert.bind(2, root_display);
             insert.bind(3, Json{{"version", 1}, {"recursive", options.recursive}}.dump());
+            insert.bind(4, options.watch ? 1 : 0);
             insert.exec();
             const auto id = database.getLastInsertRowid();
             state.record_change(database, "source_root.create", {}, true);
@@ -2098,6 +2117,53 @@ Result<ChangeSet> Library::changes_since(std::int64_t revision, std::size_t max_
     });
 }
 
+Result<std::vector<SourceRootInfo>> Library::source_roots() {
+    auto reader = state_->reader();
+    if (!reader)
+        return std::unexpected(std::move(reader).error());
+    return sqlite_support::guarded("source roots", [&]() -> Result<std::vector<SourceRootInfo>> {
+        Statement query(***reader, "SELECT id, display_path, watch_enabled FROM source_root ORDER BY id");
+        std::vector<SourceRootInfo> roots;
+        while (query.executeStep())
+            roots.push_back(SourceRootInfo{query.getColumn(0).getInt64(), path_from_utf8_text(query.getColumn(1).getString()),
+                                           query.getColumn(2).getInt() != 0});
+        return roots;
+    });
+}
+
+Result<std::size_t> Library::mark_sources_missing(const std::filesystem::path& root,
+                                                  const std::vector<std::filesystem::path>& files) {
+    auto& state = *state_;
+    std::error_code error;
+    const auto root_display = path_utf8(std::filesystem::absolute(root, error).lexically_normal());
+    return state.write("source.missing", [&](SQLite::Database& database) -> Result<std::size_t> {
+        Statement find(database, "SELECT id FROM source_root WHERE display_path = ?1");
+        find.bind(1, root_display);
+        if (!find.executeStep())
+            return make_error(ErrorCode::not_found, "the folder is not a registered source", root_display);
+        const auto root_id = find.getColumn(0).getInt64();
+        Statement update(database, "UPDATE source_location SET state = 'missing', last_seen_ms = ?1 WHERE root_id = ?2 AND "
+                                   "comparison_key = ?3 AND state <> 'missing' RETURNING asset_id");
+        std::vector<std::int64_t> assets;
+        for (const auto& file : files) {
+            std::error_code file_error;
+            const auto relative = std::filesystem::absolute(file, file_error).lexically_normal().lexically_relative(
+                path_from_utf8_text(root_display));
+            if (relative.empty() || *relative.begin() == "..")
+                continue; // not inside this root
+            update.reset();
+            update.bind(1, now_utc_ms());
+            update.bind(2, root_id);
+            update.bind(3, filesystem_comparison_key(path_utf8(relative)));
+            while (update.executeStep())
+                assets.push_back(update.getColumn(0).getInt64());
+        }
+        if (!assets.empty())
+            state.record_change(database, "source.missing", assets, false); // rows show "source missing"
+        return assets.size();
+    });
+}
+
 void Library::set_change_listener(std::function<void(std::int64_t)> listener) {
     std::lock_guard lock(state_->listener_mutex);
     state_->listener = std::move(listener);
@@ -2232,6 +2298,14 @@ Result<SearchPage> Library::search(const SearchRequest& request, std::stop_token
 std::optional<SearchPage> Library::search_browse_index(const search::Query& query, const search::SearchOptions& options,
                                                        const SearchRequest& request) {
     auto& cache = state_->browse;
+    std::function<void()> rebuild; // called after the lock is released
+    struct Notify {
+        std::function<void()>& callback;
+        ~Notify() {
+            if (callback)
+                callback();
+        }
+    } notify{rebuild};
     std::lock_guard lock(cache.mutex);
     if (!cache.index)
         return std::nullopt;
@@ -2241,6 +2315,7 @@ std::optional<SearchPage> Library::search_browse_index(const search::Query& quer
         return std::nullopt;
     if (changes->full_reload) {
         cache.index.reset(); // too much changed (or the catalog was restored): SQL until rebuilt
+        rebuild = cache.dropped;
         return std::nullopt;
     }
     if (!changes->asset_ids.empty()) {
@@ -2335,6 +2410,12 @@ Result<BrowseIndexStatus> Library::build_browse_index(std::stop_token stop, std:
     cache.revision = revision;
     status.ready = true;
     return status;
+}
+
+void Library::set_browse_index_dropped_listener(std::function<void()> listener) {
+    auto& cache = state_->browse;
+    std::lock_guard lock(cache.mutex);
+    cache.dropped = std::move(listener);
 }
 
 BrowseIndexStatus Library::browse_index_status() {

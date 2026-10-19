@@ -62,6 +62,12 @@ struct ImportOptions {
     midi::MidiParser parser;
     /// Called after each file with (files done, files found so far); runs on the import thread.
     std::function<void(std::size_t done, std::size_t found)> progress;
+    /// Mark the imported folder as watched (spec 22.4): the desktop then follows its changes.
+    bool watch = false;
+    /// Source root the imported files belong to, instead of the folder (or a file's parent)
+    /// itself; must contain every source. A watched folder's changed files are re-imported this
+    /// way, so they update their existing locations instead of registering new roots.
+    std::optional<std::filesystem::path> root;
     /// Fault-injection point between capture and the identity recheck (tests, diagnostics).
     std::function<void(const std::filesystem::path& source, std::size_t attempt)> after_capture;
 };
@@ -77,6 +83,13 @@ enum class ImportOutcome : std::uint8_t {
     source_changed,      ///< Source has new bytes but the asset has user-authored edits: needs review.
 };
 [[nodiscard]] std::string_view import_outcome_name(ImportOutcome outcome) noexcept;
+
+/// A folder files were imported from (section 22.4).
+struct SourceRootInfo {
+    std::int64_t id = 0;
+    std::filesystem::path path;
+    bool watched = false;
+};
 
 /// One imported item.
 struct ImportItem {
@@ -333,6 +346,13 @@ public:
     [[nodiscard]] Result<ImportReport> import_paths(const std::vector<std::filesystem::path>& sources,
                                                     const ImportOptions& options = {}, std::stop_token stop = {});
 
+    /// Registered source folders, in id order.
+    [[nodiscard]] Result<std::vector<SourceRootInfo>> source_roots();
+    /// Marks the locations of `files` (inside the registered `root`) missing: their assets stay
+    /// playable and are never trashed (section 22.4). Returns the number of locations changed.
+    [[nodiscard]] Result<std::size_t> mark_sources_missing(const std::filesystem::path& root,
+                                                           const std::vector<std::filesystem::path>& files);
+
     // --- Assets and metadata -------------------------------------------------------------------
     [[nodiscard]] Result<std::optional<AssetInfo>> asset(std::int64_t asset_id);
     /// Creates a new asset from a document (saved as a native object).
@@ -425,6 +445,9 @@ public:
     [[nodiscard]] Result<BrowseIndexStatus> build_browse_index(
         std::stop_token stop = {}, std::size_t budget_bytes = search::BrowseIndex::default_budget_bytes);
     [[nodiscard]] BrowseIndexStatus browse_index_status();
+    /// Called (on the searching thread) when a search drops the browse index because the change
+    /// outbox asked for a full reload; the owner schedules build_browse_index() again.
+    void set_browse_index_dropped_listener(std::function<void()> listener);
     /// Search options with collection names resolved (shared by SQL and the browse index).
     [[nodiscard]] Result<search::SearchOptions> resolve_search_options(const search::Query& query,
                                                                        std::optional<std::int64_t> scope,

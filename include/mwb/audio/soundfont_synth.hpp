@@ -52,6 +52,10 @@ public:
     /// Loads a bank from a file (size checked before reading).
     [[nodiscard]] static Result<std::unique_ptr<SoundFontSynth>> load_file(const std::filesystem::path& path,
                                                                            const SoundFontOptions& options = {});
+    /// Reads a bank file's bytes (size checked against `options.max_file_bytes` before reading)
+    /// without parsing them, so they can be validated in the worker first (section 28.2).
+    [[nodiscard]] static Result<std::vector<std::uint8_t>> read_file(const std::filesystem::path& path,
+                                                                     const SoundFontOptions& options = {});
     /// Loads a bank from memory.
     [[nodiscard]] static Result<std::unique_ptr<SoundFontSynth>> load_memory(std::span<const std::uint8_t> bytes,
                                                                              const SoundFontOptions& options = {});

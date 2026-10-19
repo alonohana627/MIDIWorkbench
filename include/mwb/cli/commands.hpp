@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mwb/app/document_io.hpp"
 #include "mwb/core/error.hpp"
 #include "mwb/core/validation.hpp"
 
@@ -51,6 +52,11 @@ struct CommandOutput {
     std::string message;
     int exit_code = 0;
 };
+
+/// The parser worker shared by every command of this process (section 28.2): untrusted MIDI files
+/// and SF2 banks are parsed in mwb-worker next to the executable (or the one named by the
+/// MWB_WORKER environment variable); without it, in this process.
+[[nodiscard]] app::WorkerParser& worker_parser();
 
 [[nodiscard]] int exit_code_for(ErrorCode code);
 [[nodiscard]] nlohmann::json diagnostics_json(const std::vector<Diagnostic>& diagnostics);

@@ -1,0 +1,3 @@
+// Windows resources of the console tools (mwb-cli, mwb-worker): the application manifest only,
+// for the UTF-8 active code page and long-path awareness (section 32.5).
+1 24 "midiworkbench.manifest"

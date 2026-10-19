@@ -5,6 +5,7 @@
 #include "mwb/core/tempo_map.hpp"
 #include "mwb/midi/codec.hpp"
 
+#include <map>
 #include <MidiFile.h>
 
 #include <sstream>
@@ -427,6 +428,61 @@ TEST_SUITE("export") {
         }
         CHECK(program);
         CHECK(volume);
+    }
+
+    TEST_CASE("export-selected-range replays RPN and NRPN state as select-then-data blocks (code-core-3)") {
+        auto document = make_blank_document();
+        const TrackId track = document.sequences[0].tracks[0].id;
+        ChangeBuilder builder(document, "fixture");
+        Tick tick = 0;
+        const auto cc = [&](std::uint8_t controller, std::uint8_t value) {
+            builder.insert(track, events::control_change(tick++, 0, controller, value));
+        };
+        // Pitch-bend range (RPN 0,0) first set to 2, then to 12; fine tuning (RPN 0,1) 64/0;
+        // then an NRPN (1,8) = 50, which stays the selected parameter at the range start.
+        cc(101, 0), cc(100, 0), cc(6, 2), cc(38, 0), cc(6, 12);
+        cc(101, 0), cc(100, 1), cc(6, 64), cc(38, 0);
+        cc(99, 1), cc(98, 8), cc(6, 50);
+        builder.add_note(track, 1000, 1200, 0, 60, 100);
+        REQUIRE(apply_change_set(document, builder.finish()));
+        midi::ExportOptions options;
+        options.range = TimeRange{1000, 2000};
+        auto bytes = midi::export_midi(document, options);
+        REQUIRE(bytes);
+        auto reread = import(*bytes);
+        REQUIRE(reread);
+
+        // Replays the controllers in file order through the data-entry protocol.
+        struct Replay {
+            int active = 0; // 1 registered, 2 non-registered
+            int rpn_msb = -1, rpn_lsb = -1, nrpn_msb = -1, nrpn_lsb = -1;
+            std::map<std::tuple<int, int, int>, std::pair<int, int>> values;
+            int orphan_data = 0; // data entry before any parameter was selected
+            void apply(int controller, int value) {
+                if (controller == 101) { rpn_msb = value; active = 1; }
+                else if (controller == 100) { rpn_lsb = value; active = 1; }
+                else if (controller == 99) { nrpn_msb = value; active = 2; }
+                else if (controller == 98) { nrpn_lsb = value; active = 2; }
+                else if (controller == 6 || controller == 38) {
+                    if (active == 0) { ++orphan_data; return; }
+                    const auto key = active == 1 ? std::tuple{1, rpn_msb, rpn_lsb} : std::tuple{2, nrpn_msb, nrpn_lsb};
+                    auto& stored = values.try_emplace(key, -1, -1).first->second;
+                    (controller == 6 ? stored.first : stored.second) = value;
+                }
+            }
+        };
+        Replay replay;
+        for (const auto& event : reread->document.sequences[0].tracks[0].events)
+            if (event.is_channel() && event.message() == ChannelMessage::control_change && event.tick == 0)
+                replay.apply(event.data1(), event.data2());
+        CHECK(replay.orphan_data == 0); // never CC 6/38 before its parameter select
+        CHECK(replay.values[std::tuple{1, 0, 0}] == std::pair{12, 0}); // the last value, not the first
+        CHECK(replay.values[std::tuple{1, 0, 1}] == std::pair{64, 0});
+        CHECK(replay.values[std::tuple{2, 1, 8}].first == 50);
+        // The parameter selected at the range start is still selected after the replay.
+        CHECK(replay.active == 2);
+        CHECK(replay.nrpn_msb == 1);
+        CHECK(replay.nrpn_lsb == 8);
     }
 
     TEST_CASE("the craigsapp/midifile oracle agrees with exported files") {

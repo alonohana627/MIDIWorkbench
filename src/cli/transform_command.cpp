@@ -23,7 +23,7 @@ bool ends_with_extension(const std::string& path, const char* extension) {
 /// several. Each step may carry "targets" in the selection_to_json form; by default a step targets
 /// every note of the first sequence. The same recipe and input always produce the same events.
 CommandOutput command_transform(const CommandOptions& options) {
-    auto opened = app::open_document(app::path_from_utf8(options.input));
+    auto opened = app::open_document(app::path_from_utf8(options.input), {}, {}, worker_parser().parser());
     if (!opened)
         return failure("transform", opened.error());
     auto recipe_bytes = app::read_file_bytes(app::path_from_utf8(options.recipe), 4u * 1024u * 1024u);

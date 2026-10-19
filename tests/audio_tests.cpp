@@ -91,153 +91,6 @@ std::unique_ptr<BuiltinSynth> make_synth(std::size_t voices = 256) {
     return std::move(*synth);
 }
 
-/// Appends little-endian values to a byte vector (SF2 fixture builder).
-struct ByteWriter {
-    std::vector<std::uint8_t> bytes;
-    void u8(std::uint8_t value) { bytes.push_back(value); }
-    void u16(std::uint16_t value) {
-        u8(static_cast<std::uint8_t>(value & 0xFF));
-        u8(static_cast<std::uint8_t>(value >> 8));
-    }
-    void u32(std::uint32_t value) {
-        u16(static_cast<std::uint16_t>(value & 0xFFFF));
-        u16(static_cast<std::uint16_t>(value >> 16));
-    }
-    void tag(const char* text) { bytes.insert(bytes.end(), text, text + 4); }
-    void name(const char* text, std::size_t width) {
-        const std::size_t length = std::min(std::strlen(text), width);
-        bytes.insert(bytes.end(), text, text + length);
-        bytes.insert(bytes.end(), width - length, 0);
-    }
-    void chunk(const char* id, const std::vector<std::uint8_t>& payload) {
-        tag(id);
-        u32(static_cast<std::uint32_t>(payload.size()));
-        bytes.insert(bytes.end(), payload.begin(), payload.end());
-        if (payload.size() % 2 != 0)
-            u8(0);
-    }
-    void list(const char* type, const std::vector<std::uint8_t>& payload) {
-        tag("LIST");
-        u32(static_cast<std::uint32_t>(payload.size() + 4));
-        tag(type);
-        bytes.insert(bytes.end(), payload.begin(), payload.end());
-    }
-};
-
-/// Builds a minimal valid SoundFont 2 bank in memory: one looped sine sample, one instrument and
-/// one preset (bank 0, program 0) named "Test Sine". Generated at test time; no bank is shipped.
-std::vector<std::uint8_t> make_test_soundfont() {
-    constexpr std::uint32_t sample_count = 2000;
-    ByteWriter samples;
-    for (std::uint32_t index = 0; index < sample_count + 46; ++index) {
-        const double value = index < sample_count ? std::sin(2.0 * std::numbers::pi * index / 100.0) * 12000.0 : 0.0;
-        samples.u16(static_cast<std::uint16_t>(static_cast<std::int16_t>(std::lround(value))));
-    }
-    ByteWriter info;
-    {
-        ByteWriter version;
-        version.u16(2);
-        version.u16(1);
-        info.chunk("ifil", version.bytes);
-        ByteWriter engine;
-        engine.name("EMU8000", 8);
-        info.chunk("isng", engine.bytes);
-        ByteWriter title;
-        title.name("MWB test", 10);
-        info.chunk("INAM", title.bytes);
-    }
-    ByteWriter sdta;
-    sdta.chunk("smpl", samples.bytes);
-
-    ByteWriter pdta;
-    ByteWriter phdr;
-    phdr.name("Test Sine", 20);
-    phdr.u16(0); // preset
-    phdr.u16(0); // bank
-    phdr.u16(0); // bag index
-    phdr.u32(0);
-    phdr.u32(0);
-    phdr.u32(0);
-    phdr.name("EOP", 20);
-    phdr.u16(0);
-    phdr.u16(0);
-    phdr.u16(1);
-    phdr.u32(0);
-    phdr.u32(0);
-    phdr.u32(0);
-    pdta.chunk("phdr", phdr.bytes);
-    ByteWriter pbag;
-    pbag.u16(0);
-    pbag.u16(0);
-    pbag.u16(1);
-    pbag.u16(0);
-    pdta.chunk("pbag", pbag.bytes);
-    ByteWriter pmod;
-    for (int index = 0; index < 5; ++index)
-        pmod.u16(0);
-    pdta.chunk("pmod", pmod.bytes);
-    ByteWriter pgen;
-    pgen.u16(41); // instrument
-    pgen.u16(0);
-    pgen.u16(0);
-    pgen.u16(0);
-    pdta.chunk("pgen", pgen.bytes);
-    ByteWriter inst;
-    inst.name("Sine", 20);
-    inst.u16(0);
-    inst.name("EOI", 20);
-    inst.u16(1);
-    pdta.chunk("inst", inst.bytes);
-    ByteWriter ibag;
-    ibag.u16(0);
-    ibag.u16(0);
-    ibag.u16(2);
-    ibag.u16(0);
-    pdta.chunk("ibag", ibag.bytes);
-    ByteWriter imod;
-    for (int index = 0; index < 5; ++index)
-        imod.u16(0);
-    pdta.chunk("imod", imod.bytes);
-    ByteWriter igen;
-    igen.u16(54); // sampleModes: continuous loop
-    igen.u16(1);
-    igen.u16(53); // sampleID (last generator of the zone)
-    igen.u16(0);
-    igen.u16(0);
-    igen.u16(0);
-    pdta.chunk("igen", igen.bytes);
-    ByteWriter shdr;
-    shdr.name("Sine", 20);
-    shdr.u32(0);
-    shdr.u32(sample_count);
-    shdr.u32(100);
-    shdr.u32(1100);
-    shdr.u32(44100);
-    shdr.u8(69);
-    shdr.u8(0);
-    shdr.u16(0);
-    shdr.u16(1);
-    shdr.name("EOS", 20);
-    for (int index = 0; index < 5; ++index)
-        shdr.u32(0);
-    shdr.u8(0);
-    shdr.u8(0);
-    shdr.u16(0);
-    shdr.u16(0);
-    pdta.chunk("shdr", shdr.bytes);
-
-    ByteWriter body;
-    body.list("INFO", info.bytes);
-    body.list("sdta", sdta.bytes);
-    body.list("pdta", pdta.bytes);
-    ByteWriter file;
-    file.tag("RIFF");
-    file.u32(static_cast<std::uint32_t>(body.bytes.size() + 4));
-    file.tag("sfbk");
-    file.bytes.insert(file.bytes.end(), body.bytes.begin(), body.bytes.end());
-    return file.bytes;
-}
-
 double energy(const std::vector<float>& buffer, std::size_t channel) {
     double sum = 0.0;
     for (std::size_t index = channel; index < buffer.size(); index += 2)
@@ -366,14 +219,14 @@ TEST_SUITE("audio") {
         CHECK(missing.error().code == ErrorCode::io);
 
         // RIFF sfbk header with truncated contents.
-        std::vector<std::uint8_t> truncated = make_test_soundfont();
+        std::vector<std::uint8_t> truncated = test::make_test_soundfont();
         truncated.resize(200);
         auto broken = SoundFontSynth::load_memory(truncated);
         CHECK_FALSE(broken);
 
         SoundFontOptions tiny_limit;
         tiny_limit.max_file_bytes = 1024;
-        const std::vector<std::uint8_t> bank = make_test_soundfont();
+        const std::vector<std::uint8_t> bank = test::make_test_soundfont();
         auto limited = SoundFontSynth::load_memory(bank, tiny_limit);
         REQUIRE_FALSE(limited);
         CHECK(limited.error().code == ErrorCode::limit_exceeded);
@@ -383,7 +236,7 @@ TEST_SUITE("audio") {
         test::TemporaryDirectory directory;
         const auto path = directory.path() / "test.sf2";
         {
-            const std::vector<std::uint8_t> bank = make_test_soundfont();
+            const std::vector<std::uint8_t> bank = test::make_test_soundfont();
             std::ofstream stream(path, std::ios::binary);
             stream.write(reinterpret_cast<const char*>(bank.data()), static_cast<std::streamsize>(bank.size()));
         }

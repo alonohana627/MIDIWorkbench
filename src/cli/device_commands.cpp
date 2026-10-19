@@ -16,7 +16,7 @@ namespace mwb::cli {
 /// render INPUT --output FILE.wav [--synth builtin|bank.sf2]: offline rendering through the same
 /// snapshot, scheduler and synths as live playback. No external MIDI is ever sent.
 CommandOutput command_render(const CommandOptions& options) {
-    auto opened = app::open_document(app::path_from_utf8(options.input));
+    auto opened = app::open_document(app::path_from_utf8(options.input), {}, {}, worker_parser().parser());
     if (!opened)
         return failure("render", opened.error());
     DocumentData document = std::move(opened->document);
@@ -43,7 +43,14 @@ CommandOutput command_render(const CommandOptions& options) {
 
     std::unique_ptr<audio::SoundFontSynth> soundfont;
     if (ascii_lower(options.synth) != "builtin") {
-        auto loaded = audio::SoundFontSynth::load_file(app::path_from_utf8(options.synth));
+        // The bank is parsed in the worker first; only a bank that loaded there is loaded here.
+        auto bytes = audio::SoundFontSynth::read_file(app::path_from_utf8(options.synth));
+        if (!bytes)
+            return failure("render", bytes.error());
+        auto checked = worker_parser().validate_soundfont(*bytes);
+        if (!checked)
+            return failure("render", checked.error().with_context("checking the SoundFont"));
+        auto loaded = audio::SoundFontSynth::load_memory(*bytes);
         if (!loaded)
             return failure("render", loaded.error());
         soundfont = std::move(*loaded);

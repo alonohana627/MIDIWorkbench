@@ -392,6 +392,9 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
     auto* outer = new QVBoxLayout(this);
     outer->setContentsMargins(0, 0, 0, 0);
     outer->addWidget(pages_);
+    watch_flush_.setSingleShot(true);
+    watch_flush_.setInterval(1000);
+    connect(&watch_flush_, &QTimer::timeout, this, &LibraryPanel::apply_watch_hints);
     change_poll_.setInterval(2000);
     connect(&change_poll_, &QTimer::timeout, this, &LibraryPanel::poll_changes);
     debounce_.setSingleShot(true);
@@ -504,8 +507,9 @@ LibraryPanel::~LibraryPanel() {
         search_stop_->request_stop();
     if (import_stop_)
         import_stop_->request_stop();
+    watcher_.reset(); // no more hints
     import_thread_.reset();
-    maintenance_thread_.reset(); // the index build stops at its next page
+    jobs_.reset(); // cancels upkeep jobs (the index build stops at its next page) and waits
     read_thread_.reset();
     browse_thread_.reset();
     write_thread_.reset(); // drains
@@ -626,9 +630,12 @@ void LibraryPanel::apply_column_visibility() {
     for (int column = column_title + 1; column < library_column_count; ++column)
         header->setSectionHidden(column, hidden.contains(QString::number(column)));
     // A melody hit's Status says where it matched (transposition, ticks, track): two hits in one
-    // file differ only there, so it is always shown for melody results (review_5).
+    // file differ only there, so melody results show Title and Status only, and the match
+    // details fit the default 350 px dock instead of being clipped behind BPM, Key and Length
+    // (review_5, review_6). Back to Search restores the saved choice.
     if (mode_ == ResultMode::melody)
-        header->setSectionHidden(column_status, false);
+        for (int column = column_title + 1; column < library_column_count; ++column)
+            header->setSectionHidden(column, column != column_status);
 }
 
 void LibraryPanel::configure_columns() {
@@ -749,6 +756,16 @@ void LibraryPanel::open_library(const std::filesystem::path& root, bool create, 
                     return;
                 }
                 guard->library_ = std::shared_ptr<library::Library>(std::move(**opened));
+                // A search that finds the outbox reset drops the index; rebuild it in the background.
+                guard->library_->set_browse_index_dropped_listener([guard] {
+                    QMetaObject::invokeMethod(
+                        qApp,
+                        [guard] {
+                            if (guard)
+                                guard->schedule_browse_index(false);
+                        },
+                        Qt::QueuedConnection);
+                });
                 guard->model_->clear_drag_files(); // asset ids repeat across libraries
                 guard->change_revision_.reset();
                 guard->change_poll_.start();
@@ -759,6 +776,11 @@ void LibraryPanel::open_library(const std::filesystem::path& root, bool create, 
                 guard->trash_button_->setEnabled(true);
                 guard->run_search();
                 guard->schedule_browse_index(true);
+                // The previous library's folders are no longer followed.
+                guard->watcher_.reset();
+                guard->watched_roots_.clear();
+                guard->pending_hints_.clear();
+                guard->start_watching();
                 if (import_after)
                     guard->import_path(*import_after);
             },
@@ -790,6 +812,8 @@ void LibraryPanel::import_path(const std::filesystem::path& source) {
         const auto stop = cancel->get_token();
         library::ImportOptions options;
         options.parser = parser; // parsing runs in the isolated worker process (section 28.2)
+        std::error_code folder_error;
+        options.watch = std::filesystem::is_directory(source, folder_error); // folders are followed (section 22.4)
         auto last_report = std::make_shared<std::chrono::steady_clock::time_point>();
         options.progress = [guard, last_report](std::size_t done, std::size_t found) {
             const auto now = std::chrono::steady_clock::now();
@@ -843,6 +867,7 @@ void LibraryPanel::import_path(const std::filesystem::path& source) {
                 guard->status_->setText(text);
                 emit guard->status_message(text);
                 guard->refresh_results();
+                guard->start_watching(); // a newly imported folder is followed from now on
                 if (cancelled)
                     guard->schedule_analysis(); // files imported before the cancel are still indexed
             },
@@ -854,11 +879,147 @@ void LibraryPanel::schedule_browse_index(bool collect_garbage) {
     if (!library_)
         return;
     auto library = library_;
-    maintenance_thread_->post([library, collect_garbage](std::stop_token stop) {
+    std::ignore = jobs_->submit("Library upkeep", jobs::JobPriority::maintenance, [library, collect_garbage](jobs::JobRecord& job) -> Status {
         // Failures only mean searches keep using SQL paging; nothing to report to the user.
+        const auto stop = job.stop_token();
         std::ignore = library->build_browse_index(stop);
         if (collect_garbage && !stop.stop_requested())
             std::ignore = library->collect_garbage(); // default 30-day grace: only long-unreferenced objects
+        return stop.stop_requested() ? make_error(ErrorCode::cancelled, "library upkeep cancelled") : ok();
+    });
+}
+
+void LibraryPanel::start_watching() {
+    if (!library_)
+        return;
+    QPointer<LibraryPanel> guard(this);
+    auto library = library_;
+    std::ignore = jobs_->submit("Watched folders", jobs::JobPriority::maintenance, [guard, library](jobs::JobRecord&) -> Status {
+        auto roots = library->source_roots();
+        if (!roots)
+            return std::unexpected(roots.error());
+        std::vector<std::filesystem::path> watched;
+        for (const auto& root : *roots) {
+            std::error_code error;
+            if (root.watched && std::filesystem::is_directory(root.path, error))
+                watched.push_back(root.path); // a disconnected drive is simply not watched now
+        }
+        // Weak: a queued call must not keep a closed library (and its writer lock) alive.
+        QMetaObject::invokeMethod(
+            qApp,
+            [guard, weak = std::weak_ptr<library::Library>(library), watched = std::move(watched)] {
+                const auto library = weak.lock();
+                if (!guard || !library || guard->library_ != library)
+                    return; // closed, or another library was opened meanwhile
+                guard->watcher_.reset();
+                guard->watched_roots_.clear();
+                if (watched.empty())
+                    return;
+                auto created = platform::DirectoryWatcher::create(
+                    platform::FileWatcherSettings{}, [guard](std::vector<platform::FileChangeHint> hints) {
+                        // On the watcher's thread: hand the batch to the GUI thread.
+                        QMetaObject::invokeMethod(
+                            qApp,
+                            [guard, hints = std::move(hints)]() mutable {
+                                if (!guard)
+                                    return;
+                                guard->pending_hints_.insert(guard->pending_hints_.end(), hints.begin(), hints.end());
+                                guard->watch_flush_.start(); // restarts: one batch per quiet second
+                            },
+                            Qt::QueuedConnection);
+                    });
+                if (!created)
+                    return; // watching is a convenience; imports still work
+                // The library may live inside a watched folder: its own files are never sources.
+                (*created)->exclude(library->root());
+                for (const auto& root : watched)
+                    if ((*created)->add_directory(root))
+                        guard->watched_roots_.push_back(root);
+                guard->watcher_ = std::move(*created);
+            },
+            Qt::QueuedConnection);
+        return ok();
+    });
+}
+
+void LibraryPanel::apply_watch_hints() {
+    if (!library_ || pending_hints_.empty())
+        return;
+    const auto hints = std::exchange(pending_hints_, {});
+    // Group by the watched folder each path belongs to (the deepest one).
+    struct Work {
+        std::vector<std::filesystem::path> changed;
+        std::vector<std::filesystem::path> missing;
+        bool rescan = false;
+    };
+    std::map<std::filesystem::path, Work> work;
+    const auto root_of = [this](const std::filesystem::path& path) -> std::optional<std::filesystem::path> {
+        std::optional<std::filesystem::path> best;
+        for (const auto& root : watched_roots_) {
+            const auto relative = path.lexically_normal().lexically_relative(root);
+            if (!relative.empty() && *relative.begin() != ".." &&
+                (!best || root.native().size() > best->native().size()))
+                best = root;
+        }
+        return best;
+    };
+    for (const auto& hint : hints) {
+        if (hint.kind == platform::FileChangeKind::rescan_required) {
+            for (const auto& root : watched_roots_)
+                work[root].rescan = true;
+            continue;
+        }
+        if (hint.kind == platform::FileChangeKind::renamed && !hint.previous_path.empty())
+            if (const auto root = root_of(hint.previous_path))
+                work[*root].missing.push_back(hint.previous_path);
+        const auto root = root_of(hint.path);
+        if (!root)
+            continue;
+        std::error_code error;
+        if (std::filesystem::is_regular_file(hint.path, error))
+            work[*root].changed.push_back(hint.path);
+        else if (!std::filesystem::exists(hint.path, error))
+            work[*root].missing.push_back(hint.path);
+        // A changed directory itself carries no file to import; its files have their own hints.
+    }
+    QPointer<LibraryPanel> guard(this);
+    auto library = library_;
+    import_thread_->post([guard, library, work = std::move(work),
+                          parser = import_parser_ ? import_parser_ : parser_](std::stop_token stop) {
+        std::size_t updated = 0;
+        std::size_t missing = 0;
+        for (const auto& [root, items] : work) {
+            library::ImportOptions options;
+            options.parser = parser; // the isolated worker, as for every import (section 28.2)
+            options.root = root;     // update the existing locations, never register a new folder
+            std::vector<std::filesystem::path> sources = items.changed;
+            if (items.rescan)
+                sources = {root}; // notifications were lost: reconcile the whole folder
+            std::ranges::sort(sources);
+            sources.erase(std::ranges::unique(sources).begin(), sources.end());
+            if (!sources.empty())
+                if (auto report = library->import_paths(sources, options, stop))
+                    updated += report->counts.imported + report->counts.source_changed;
+            if (!items.missing.empty())
+                if (auto marked = library->mark_sources_missing(root, items.missing))
+                    missing += *marked;
+        }
+        if (updated > 0) {
+            library::AnalyzeOptions analyze;
+            analyze.parser = parser;
+            std::ignore = library->analyze(analyze, stop); // melody search follows the new revisions
+        }
+        QMetaObject::invokeMethod(
+            qApp,
+            [guard, updated, missing] {
+                if (!guard || (updated == 0 && missing == 0))
+                    return;
+                emit guard->status_message(tr("Watched folders: %1 item(s) updated, %2 source file(s) missing")
+                                               .arg(updated)
+                                               .arg(missing));
+                guard->refresh_results();
+            },
+            Qt::QueuedConnection);
     });
 }
 

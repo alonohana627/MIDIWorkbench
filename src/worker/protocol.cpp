@@ -27,7 +27,9 @@ std::uint64_t get(const std::uint8_t* data, int bytes) {
     return value;
 }
 
-bool known_kind(std::uint16_t kind) { return kind >= 1 && kind <= 8; }
+bool known_kind(std::uint16_t kind) {
+    return kind >= static_cast<std::uint16_t>(FrameKind::hello) && kind <= static_cast<std::uint16_t>(FrameKind::soundfont_result);
+}
 
 } // namespace
 

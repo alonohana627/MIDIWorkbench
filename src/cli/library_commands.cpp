@@ -39,7 +39,9 @@ CommandOutput command_library_import(const CommandOptions& options) {
     auto library = open_library(options.library, true);
     if (!library)
         return failure("library import", library.error());
-    auto report = (*library)->import_paths({app::path_from_utf8(options.from)});
+    library::ImportOptions import;
+    import.parser = worker_parser().parser(); // one crashing file fails that item, not the batch
+    auto report = (*library)->import_paths({app::path_from_utf8(options.from)}, import);
     if (!report)
         return failure("library import", report.error());
     auto output = success("library import", {{"report", nlohmann::json::parse(report->to_json())}});
@@ -190,6 +192,7 @@ CommandOutput command_library_analyze(const CommandOptions& options) {
     if (!library)
         return failure("library analyze", library.error());
     library::AnalyzeOptions analyze;
+    analyze.parser = worker_parser().parser(); // analysis re-reads the same untrusted bytes
     if (options.profile == "fingerprints") {
         analyze.motif = false;
         analyze.features = false;

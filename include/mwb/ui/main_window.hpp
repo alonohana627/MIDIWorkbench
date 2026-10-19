@@ -111,7 +111,7 @@ private:
     bool confirm_close(EditorTab* tab);
     void apply_layout(const QString& name);
     void reset_layout();
-    void show_command_palette();
+    void show_command_palette(const QString& query = {});
     void show_about();
     void show_diagnostics();
     void transpose_selection(int semitones);

@@ -4,6 +4,7 @@
 #include "mwb/ui/document_controller.hpp"
 #include "mwb/ui/theme.hpp"
 
+#include <QApplication>
 #include <QContextMenuEvent>
 #include <QInputDialog>
 #include <QKeyEvent>
@@ -176,16 +177,45 @@ void ControllerLane::paintEvent(QPaintEvent*) {
     if (target_.kind == LaneTarget::Kind::velocity || target_.kind == LaneTarget::Kind::release_velocity) {
         const auto& index = controller_.note_index();
         const auto& selection = controller_.selection();
-        for (const auto position : index.query(TimeRange{first, last})) {
-            const auto& note = index.notes()[position];
-            if (!active || note.on_track != *active)
-                continue;
-            const int value = target_.kind == LaneTarget::Kind::velocity ? note.velocity : note.release_velocity;
-            const double x = mapping_.tick_to_x(note.start);
-            const bool selected = selection.contains(note.on_id);
-            painter.setPen(QPen(selected ? palette().color(QPalette::WindowText) : palette().color(QPalette::Highlight), selected ? 3 : 2));
-            painter.drawLine(QPointF(x, height()), QPointF(x, y_for_value(value)));
-            painter.drawEllipse(QPointF(x, y_for_value(value)), 2.5, 2.5);
+        const auto visible = index.query(TimeRange{first, last});
+        // Level of detail: with more notes than pixel columns, one stem per column (its highest
+        // value; selected wins) instead of one per note.
+        const auto columns = static_cast<std::size_t>(std::max(1.0, area_width));
+        if (visible.size() > columns) {
+            std::vector<int> highest(columns, -1);
+            std::vector<char> marked(columns, 0);
+            for (const auto position : visible) {
+                const auto& note = index.notes()[position];
+                if (!active || note.on_track != *active)
+                    continue;
+                const double x = mapping_.tick_to_x(note.start);
+                if (x < 0 || x >= area_width)
+                    continue;
+                const auto column = static_cast<std::size_t>(x);
+                const int value = target_.kind == LaneTarget::Kind::velocity ? note.velocity : note.release_velocity;
+                highest[column] = std::max(highest[column], value);
+                if (selection.contains(note.on_id))
+                    marked[column] = 1;
+            }
+            for (std::size_t column = 0; column < columns; ++column) {
+                if (highest[column] < 0)
+                    continue;
+                painter.setPen(QPen(marked[column] ? palette().color(QPalette::WindowText) : palette().color(QPalette::Highlight), 1));
+                const double x = static_cast<double>(column) + 0.5;
+                painter.drawLine(QPointF(x, height()), QPointF(x, y_for_value(highest[column])));
+            }
+        } else {
+            for (const auto position : visible) {
+                const auto& note = index.notes()[position];
+                if (!active || note.on_track != *active)
+                    continue;
+                const int value = target_.kind == LaneTarget::Kind::velocity ? note.velocity : note.release_velocity;
+                const double x = mapping_.tick_to_x(note.start);
+                const bool selected = selection.contains(note.on_id);
+                painter.setPen(QPen(selected ? palette().color(QPalette::WindowText) : palette().color(QPalette::Highlight), selected ? 3 : 2));
+                painter.drawLine(QPointF(x, height()), QPointF(x, y_for_value(value)));
+                painter.drawEllipse(QPointF(x, y_for_value(value)), 2.5, 2.5);
+            }
         }
     } else if (active) {
         const auto& track = controller_.active_sequence().tracks[*active];
@@ -205,10 +235,35 @@ void ControllerLane::paintEvent(QPaintEvent*) {
             previous = value_of(track.events[*std::prev(begin)]);
             steps << QPointF(0, y_for_value(previous));
         }
-        for (auto iterator = begin; iterator != positions.end(); ++iterator) {
+        auto end_visible = std::upper_bound(begin, positions.end(), last,
+                                                  [&](Tick tick, std::size_t position) { return tick < track.events[position].tick; });
+        if (static_cast<double>(end_visible - begin) > area_width) {
+            // Level of detail: dense data draws one min-max bar per pixel column.
+            const auto columns = static_cast<std::size_t>(std::max(1.0, area_width));
+            std::vector<int> low(columns, INT32_MAX);
+            std::vector<int> high(columns, -1);
+            for (auto iterator = begin; iterator != end_visible; ++iterator) {
+                const auto& event = track.events[*iterator];
+                const double x = mapping_.tick_to_x(event.tick);
+                if (x < 0 || x >= area_width)
+                    continue;
+                const auto column = static_cast<std::size_t>(x);
+                const int value = value_of(event);
+                low[column] = std::min(low[column], value);
+                high[column] = std::max(high[column], value);
+            }
+            painter.setPen(QPen(colors.loop, 1));
+            for (std::size_t column = 0; column < columns; ++column)
+                if (high[column] >= 0) {
+                    const double x = static_cast<double>(column) + 0.5;
+                    painter.drawLine(QPointF(x, y_for_value(low[column]) + 0.5), QPointF(x, y_for_value(high[column]) - 0.5));
+                }
+            end_visible = begin; // the per-event step line below is skipped
+            steps.clear();
+            previous = -1;
+        }
+        for (auto iterator = begin; iterator != end_visible; ++iterator) {
             const auto& event = track.events[*iterator];
-            if (event.tick > last)
-                break;
             const int value = target_.kind == LaneTarget::Kind::pitch_bend ? event.pitch_bend_value()
                               : target_.kind == LaneTarget::Kind::controller ? event.data2()
                                                                               : event.data1();
@@ -360,6 +415,17 @@ void ControllerLane::mouseMoveEvent(QMouseEvent* event) {
 void ControllerLane::mouseReleaseEvent(QMouseEvent*) {
     if (!stroke_)
         return;
+    if (stroke_->erase) {
+        // A right-click (no drag) is for the context menu; erasing needs a right-drag.
+        const auto [first, last] = std::minmax_element(stroke_->points.begin(), stroke_->points.end());
+        const double span = stroke_->points.empty() ? 0.0
+                                                    : static_cast<double>(last->first - first->first) / mapping_.ticks_per_pixel;
+        if (span < QApplication::startDragDistance()) {
+            stroke_.reset();
+            update();
+            return;
+        }
+    }
     if (target_.kind == LaneTarget::Kind::velocity || target_.kind == LaneTarget::Kind::release_velocity)
         commit_velocity_stroke();
     else

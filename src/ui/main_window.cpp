@@ -189,7 +189,7 @@ MainWindow::MainWindow(StartupOptions options, app::DataDirectories directories,
     cursor_label_->setToolTip(tr("Position and pitch under the mouse"));
     cursor_label_->setText(tr("Pointer: —"));
     bool first_readout = true;
-    for (auto* label : {cursor_label_, selection_label_, snap_label_, recovery_label_, device_label_}) {
+    for (auto* label : {cursor_label_, selection_label_, snap_label_, device_label_, recovery_label_}) {
         if (!first_readout) {
             auto* separator = new QFrame(this);
             separator->setFrameShape(QFrame::VLine);
@@ -391,7 +391,7 @@ void MainWindow::build_actions() {
     add_command("view.previous_zoom", tr("Previous Zoom"), {}, with_tab([](EditorTab& tab) { tab.piano_roll().return_to_previous_zoom(); }));
     add_command("view.zoom_in", tr("Zoom In"), QKeySequence::ZoomIn, with_tab([](EditorTab& tab) { tab.piano_roll().zoom_time(1.5); }));
     add_command("view.zoom_out", tr("Zoom Out"), QKeySequence::ZoomOut, with_tab([](EditorTab& tab) { tab.piano_roll().zoom_time(1 / 1.5); }));
-    add_command("view.drum_grid", tr("Toggle Drum Grid"), {}, with_tab([](EditorTab& tab) { tab.show_drum_grid(!tab.showing_drum_grid()); }));
+    add_command("view.drum_grid", tr("Toggle Drum Grid"), QKeySequence(Qt::CTRL | Qt::Key_G), with_tab([](EditorTab& tab) { tab.show_drum_grid(!tab.showing_drum_grid()); }));
     add_command("view.add_cc_lane", tr("Add Controller Lane…"), {}, with_tab([this](EditorTab& tab) {
         bool ok_value = false;
         const QStringList kinds = {tr("CC number…"), tr("Pitch bend"), tr("Channel pressure"), tr("Release velocity")};
@@ -846,9 +846,9 @@ void MainWindow::build_toolbar() {
     corner_layout->addWidget(command_search_);
     menuBar()->setCornerWidget(corner, Qt::TopRightCorner);
     // Typing or clicking here opens the command palette (the palette does the searching).
-    connect(command_search_, &QLineEdit::textEdited, this, [this] {
+    connect(command_search_, &QLineEdit::textEdited, this, [this](const QString& text) {
         command_search_->clear();
-        show_command_palette();
+        show_command_palette(text);
     });
     connect(command_search_, &QLineEdit::returnPressed, this, [this] { show_command_palette(); });
     refresh_tooltips();
@@ -1282,6 +1282,7 @@ void MainWindow::flush_recovery() {
     if (auto* tab = current_tab(); tab && tab->controller().recovery_journal()) {
         const auto ms = tab->controller().recovery_journal()->last_durable_ms();
         const QString& error = tab->controller().recovery_error();
+        recovery_label_->show();
         recovery_label_->setText(error.isEmpty()
                                      ? tr("Recovery saved %1").arg(QDateTime::fromMSecsSinceEpoch(ms).toString("HH:mm:ss"))
                                      : tr("! Recovery not saved: %1").arg(error));
@@ -1703,13 +1704,15 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
         const auto modifiers = key->modifiers() & ~(Qt::KeypadModifier | Qt::ShiftModifier);
         const int code = key->key();
         const bool plain_key = modifiers == Qt::NoModifier &&
-                               (code == Qt::Key_Space || code == Qt::Key_Up || code == Qt::Key_Down || code == Qt::Key_Left ||
+                               (code == Qt::Key_Up || code == Qt::Key_Down || code == Qt::Key_Left ||
                                 code == Qt::Key_Right || code == Qt::Key_Home || code == Qt::Key_End ||
                                 code == Qt::Key_PageUp || code == Qt::Key_PageDown || // not Delete: it deletes notes everywhere
                                 (code >= Qt::Key_0 && code <= Qt::Key_9) || (code >= Qt::Key_A && code <= Qt::Key_Z));
         const bool control = focus && (qobject_cast<QAbstractButton*>(focus) || qobject_cast<QComboBox*>(focus) ||
                                        qobject_cast<QAbstractItemView*>(focus) || qobject_cast<QAbstractSpinBox*>(focus) ||
                                        qobject_cast<QLineEdit*>(focus));
+        // Space is Play/Pause everywhere except text fields (which keep it themselves): buttons are
+        // pressed with Enter, so pressing Space after Apply listens instead of applying again.
         if (plain_key && control && watched == focus) {
             event->accept();
             return false;
@@ -1777,8 +1780,10 @@ void MainWindow::reset_layout() {
         resizeDocks({library_dock_}, {280}, Qt::Horizontal);
 }
 
-void MainWindow::show_command_palette() {
+void MainWindow::show_command_palette(const QString& query) {
     CommandPalette palette(commands_, this);
+    if (!query.isEmpty())
+        palette.set_query(query); // the characters typed into the search box are kept
     palette.exec();
 }
 

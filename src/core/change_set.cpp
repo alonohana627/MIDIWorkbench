@@ -212,6 +212,8 @@ Status apply_structural(DocumentData& document, const EditOperation& operation) 
                 Sequence* sequence = mutable_sequence(document, move.sequence);
                 if (!sequence || move.from >= sequence->tracks.size() || move.to >= sequence->tracks.size())
                     return make_error(ErrorCode::invalid_data, "track move position is invalid");
+                if (!move.track.is_nil() && sequence->tracks[move.from].id != move.track)
+                    return make_error(ErrorCode::conflict, "track order changed concurrently");
                 Track moved = std::move(sequence->tracks[move.from]);
                 sequence->tracks.erase(sequence->tracks.begin() + static_cast<std::ptrdiff_t>(move.from));
                 sequence->tracks.insert(sequence->tracks.begin() + static_cast<std::ptrdiff_t>(move.to), std::move(moved));
@@ -278,7 +280,7 @@ EditOperation invert_operation(const EditOperation& operation) {
             [](const TrackPropertiesChange& change) -> EditOperation {
                 return TrackPropertiesChange{change.track, change.after, change.before};
             },
-            [](const TrackMove& move) -> EditOperation { return TrackMove{move.sequence, move.to, move.from}; },
+            [](const TrackMove& move) -> EditOperation { return TrackMove{move.sequence, move.to, move.from, move.track}; },
             [](const SequencePropertiesChange& change) -> EditOperation {
                 return SequencePropertiesChange{change.sequence, change.after, change.before};
             },

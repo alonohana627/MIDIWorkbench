@@ -4,8 +4,10 @@
 
 #include <QAbstractTableModel>
 #include <QSortFilterProxyModel>
+#include <QTimer>
 #include <QWidget>
 
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -50,7 +52,7 @@ private:
     };
     DocumentController& controller_;
     std::vector<Row> rows_;
-    std::unordered_map<EventId, int, UuidHash> row_by_event_;    std::size_t built_sequence_ = static_cast<std::size_t>(-1);
+    std::unordered_map<EventId, int, UuidHash> row_by_event_;    std::size_t built_sequence_ = static_cast<std::size_t>(-1);    QTimer rebuild_timer_;
 };
 
 /// Event list panel: filter field plus a table synchronized with the piano roll selection.
@@ -69,7 +71,7 @@ private:
     QSortFilterProxyModel* proxy_ = nullptr;
     QTableView* table_ = nullptr;
     QLineEdit* filter_ = nullptr;
-    bool syncing_ = false;
+    bool syncing_ = false;    std::optional<EventId> current_event_;
 };
 
 /// Human description of an event's data ("C4 vel 100", "CC 7 Volume = 90", "Tempo 120.000 BPM").

@@ -54,6 +54,8 @@ private:
     Tick origin_ = 0;
     /// Keyboard cursor: row index into rows() and visible column.
     int cursor_row_ = 0;
+    /// Document generation right after a click toggled a cell (undone by a double-click).
+    std::optional<std::uint64_t> toggled_generation_;
     std::int64_t cursor_column_ = 0;
     int normal_velocity_ = 90;
     int accent_velocity_ = 120;

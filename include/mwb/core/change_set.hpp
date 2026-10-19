@@ -57,6 +57,8 @@ struct TrackMove {
     SequenceId sequence;
     std::size_t from = 0;
     std::size_t to = 0;
+    /// The track expected at `from` (nil in journals written before it was recorded).
+    TrackId track;
 };
 
 /// Changes sequence properties (division, scale, settings, regions, recipes); `before`/`after`

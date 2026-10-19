@@ -386,6 +386,8 @@ Status RecoveryJournal::flush(bool wait_for_checkpoint) {
             std::lock_guard state_lock(state_mutex_);
             batch.insert(batch.end(), std::make_move_iterator(pending_.begin()), std::make_move_iterator(pending_.end()));
             pending_ = std::move(batch);
+            if (checkpoint && !pending_checkpoint_)
+                pending_checkpoint_ = std::move(checkpoint); // kept for the next flush
             return std::unexpected(std::move(payload).error().with_context("journaling " + kind_label(command.envelope.kind)));
         }
         command.payload = std::move(*payload);

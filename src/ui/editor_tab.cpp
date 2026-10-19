@@ -56,6 +56,7 @@ TrackListWidget::TrackListWidget(DocumentController& controller, QWidget* parent
     make_button(IconId::add, tr("Add track"), &TrackListWidget::add_track);
     make_button(IconId::duplicate, tr("Duplicate active track"), &TrackListWidget::duplicate_active_track);
     make_button(IconId::remove, tr("Delete active track"), &TrackListWidget::delete_active_track);
+    delete_button_ = buttons->itemAt(buttons->count() - 1)->widget();
     make_button(IconId::up, tr("Move track up"), [this] { move_active_track(-1); });
     make_button(IconId::down, tr("Move track down"), [this] { move_active_track(1); });
     buttons->addStretch(1);
@@ -99,6 +100,10 @@ TrackListWidget::TrackListWidget(DocumentController& controller, QWidget* parent
 void TrackListWidget::rebuild() {
     rebuilding_ = true;
     const auto& tracks = controller_.active_sequence().tracks;
+    if (delete_button_) {
+        delete_button_->setEnabled(tracks.size() > 1); // a sequence keeps at least one track
+        delete_button_->setToolTip(tracks.size() > 1 ? tr("Delete active track") : tr("The last track cannot be deleted"));
+    }
     table_->setRowCount(static_cast<int>(tracks.size()));
     const auto active = controller_.active_track_index();
     for (std::size_t index = 0; index < tracks.size(); ++index) {
@@ -188,7 +193,7 @@ void TrackListWidget::move_active_track(int direction) {
     if (target < 0 || target >= static_cast<std::ptrdiff_t>(sequence.tracks.size()))
         return;
     ChangeBuilder builder(controller_.document(), "Move track");
-    builder.append(TrackMove{sequence.id, *index, static_cast<std::size_t>(target)});
+    builder.append(TrackMove{sequence.id, *index, static_cast<std::size_t>(target), sequence.tracks[*index].id});
     controller_.apply(builder.finish());
 }
 
@@ -239,9 +244,19 @@ EditorTab::EditorTab(std::unique_ptr<DocumentController> controller, QWidget* pa
         show_drum_grid(false);
         piano_roll_->view().scroll_to_tick(tick);
     });
-    const auto& sequence = controller_->active_sequence();
-    if (const auto active = controller_->active_track_index(); active && sequence.tracks[*active].is_drum)
-        show_drum_grid(true);
+    // The grid follows the active track: drum tracks open in the grid, others in the piano roll.
+    const auto follow_track = [this] {
+        const auto& sequence = controller_->active_sequence();
+        const auto active = controller_->active_track_index();
+        const bool drum = active && sequence.tracks[*active].is_drum;
+        if (drum != last_track_was_drum_) {
+            last_track_was_drum_ = drum;
+            show_drum_grid(drum);
+        }
+    };
+    connect(controller_.get(), &DocumentController::view_state_changed, this, follow_track);
+    connect(controller_.get(), &DocumentController::document_changed, this, follow_track);
+    follow_track();
 }
 
 EditorTab::~EditorTab() {
@@ -251,7 +266,10 @@ EditorTab::~EditorTab() {
         delete child;
 }
 
-void EditorTab::show_drum_grid(bool show) { center_->setCurrentWidget(show ? static_cast<QWidget*>(drum_grid_) : piano_roll_); }
+void EditorTab::show_drum_grid(bool show) {
+    center_->setCurrentWidget(show ? static_cast<QWidget*>(drum_grid_) : piano_roll_);
+    lanes_container_->setVisible(!show); // lanes follow the piano roll's time axis, not the grid's
+}
 
 bool EditorTab::showing_drum_grid() const { return center_->currentWidget() == drum_grid_; }
 

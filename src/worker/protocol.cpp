@@ -113,10 +113,25 @@ Result<std::optional<std::vector<std::uint8_t>>> ChunkAssembler::add(const nlohm
     const auto invalid = [] { return make_error(ErrorCode::invalid_data, "IPC data chunk is malformed or out of order"); };
     if (!chunk.is_object() || !chunk.contains("bytes") || !chunk["bytes"].is_binary())
         return invalid();
-    const auto transfer = chunk.value("transfer", std::uint64_t{0});
-    const auto index = chunk.value("index", std::uint64_t{UINT64_MAX});
-    const auto total = chunk.value("total", std::uint64_t{0});
-    const auto size = chunk.value("size", std::uint64_t{UINT64_MAX});
+    // Every field is type-checked: a type-confused chunk is rejected, never thrown.
+    const auto unsigned_field = [&](const char* key, std::uint64_t fallback) -> std::optional<std::uint64_t> {
+        const auto found = chunk.find(key);
+        if (found == chunk.end())
+            return fallback;
+        if (!found->is_number_unsigned())
+            return std::nullopt;
+        return found->get<std::uint64_t>();
+    };
+    const auto transfer_field = unsigned_field("transfer", 0);
+    const auto index_field = unsigned_field("index", UINT64_MAX);
+    const auto total_field = unsigned_field("total", 0);
+    const auto size_field = unsigned_field("size", UINT64_MAX);
+    if (!transfer_field || !index_field || !total_field || !size_field)
+        return invalid();
+    const auto transfer = *transfer_field;
+    const auto index = *index_field;
+    const auto total = *total_field;
+    const auto size = *size_field;
     if (size > limit_)
         return make_error(ErrorCode::limit_exceeded, "IPC transfer exceeds the aggregate limit");
     if (!transfer_) {

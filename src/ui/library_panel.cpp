@@ -159,6 +159,30 @@ void LibraryResultModel::set_rows(std::vector<LibraryRow> rows) {
     endResetModel();
 }
 
+void LibraryResultModel::replace_row(std::int64_t asset_id, std::optional<LibraryRow> row) {
+    for (std::size_t index = 0; index < rows_.size(); ++index) {
+        if (rows_[index].asset_id != asset_id)
+            continue;
+        const int position = static_cast<int>(index);
+        if (!row) {
+            beginRemoveRows({}, position, position);
+            rows_.erase(rows_.begin() + static_cast<std::ptrdiff_t>(index));
+            endRemoveRows();
+            return;
+        }
+        const QString status = rows_[index].status; // keep a melody-search description
+        rows_[index] = std::move(*row);
+        if (rows_[index].status.isEmpty())
+            rows_[index].status = status;
+        emit dataChanged(this->index(position, 0), this->index(position, columnCount({}) - 1));
+        return;
+    }
+}
+
+bool LibraryResultModel::contains_asset(std::int64_t asset_id) const {
+    return std::ranges::any_of(rows_, [asset_id](const LibraryRow& row) { return row.asset_id == asset_id; });
+}
+
 void LibraryResultModel::append_rows(std::vector<LibraryRow> rows) {
     if (rows.empty())
         return;
@@ -277,6 +301,8 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
     auto* outer = new QVBoxLayout(this);
     outer->setContentsMargins(0, 0, 0, 0);
     outer->addWidget(pages_);
+    change_poll_.setInterval(2000);
+    connect(&change_poll_, &QTimer::timeout, this, &LibraryPanel::poll_changes);
     debounce_.setSingleShot(true);
     debounce_.setInterval(120); // typing debounce (section 33.3)
     connect(&debounce_, &QTimer::timeout, this, &LibraryPanel::run_search);
@@ -335,7 +361,7 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
                 return;
             run_metadata_task([](library::Library& library, std::int64_t asset) {
                 return library.trash(std::vector<std::int64_t>{asset}); // a metadata state; restorable
-            });
+            }, true);
         });
         auto* rating_menu = menu.addMenu(tr("Rating"));
         const LibraryRow* current = model_->row_at(table_->currentIndex().row());
@@ -398,6 +424,8 @@ void LibraryPanel::open_library(const std::filesystem::path& root, bool create) 
                     return;
                 }
                 guard->library_ = std::shared_ptr<library::Library>(std::move(**opened));
+                guard->change_revision_.reset();
+                guard->change_poll_.start();
                 guard->pages_->setCurrentIndex(1);
                 emit guard->opened(); // after library_ is set, so listeners see the new library
                 QSettings().setValue("library/last", QString::fromStdWString(root.wstring()));
@@ -794,23 +822,23 @@ void LibraryPanel::prepare_drag_file() {
     });
 }
 
-void LibraryPanel::run_metadata_task(std::function<Status(library::Library&, std::int64_t)> task) {
+void LibraryPanel::run_metadata_task(std::function<Status(library::Library&, std::int64_t)> task, bool removes_row) {
     const LibraryRow* row = model_->row_at(table_->currentIndex().row());
     if (!row || !library_)
         return;
     const auto asset_id = row->asset_id;
     auto library = library_;
     QPointer<LibraryPanel> guard(this);
-    write_thread_->post([guard, library, asset_id, task = std::move(task)](std::stop_token) {
+    write_thread_->post([guard, library, asset_id, task = std::move(task), removes_row](std::stop_token) {
         const Status status = task(*library, asset_id);
         QMetaObject::invokeMethod(
             qApp, // context outlives the task; the lambda checks the guard
-            [guard, status] {
+            [guard, status, asset_id, removes_row] {
                 if (!guard)
                     return;
                 if (!status)
                     emit guard->status_message(tr("Not saved: %1").arg(QString::fromStdString(status.error().describe())));
-                guard->run_search();
+                guard->refresh_row(asset_id, removes_row && status);
             },
             Qt::QueuedConnection);
     });
@@ -890,12 +918,76 @@ void LibraryPanel::set_metadata(int action) {
                                           : library->set_rating(asset_id, action - 10);
         QMetaObject::invokeMethod(
             qApp, // context outlives the task; the lambda checks the guard
-            [guard, status] {
+            [guard, status, asset_id] {
                 if (!guard)
                     return;
                 if (!status)
                     emit guard->status_message(tr("Not saved: %1").arg(QString::fromStdString(status.error().describe())));
-                guard->run_search();
+                guard->refresh_row(asset_id, false);
+            },
+            Qt::QueuedConnection);
+    });
+}
+
+void LibraryPanel::poll_changes() {
+    if (!library_ || polling_changes_)
+        return;
+    polling_changes_ = true;
+    QPointer<LibraryPanel> guard(this);
+    auto library = library_;
+    const auto since = change_revision_.value_or(0);
+    const bool first = !change_revision_;
+    browse_thread_->post([guard, library, since, first](std::stop_token) {
+        auto changes = std::make_shared<Result<library::ChangeSet>>(library->changes_since(since));
+        QMetaObject::invokeMethod(
+            qApp,
+            [guard, changes, first] {
+                if (!guard)
+                    return;
+                guard->polling_changes_ = false;
+                if (!*changes)
+                    return;
+                const auto& batch = **changes;
+                guard->change_revision_ = batch.latest_revision;
+                if (first)
+                    return; // the first poll only learns where the outbox stands
+                if (batch.full_reload || batch.structure_changed) {
+                    guard->run_search();
+                    return;
+                }
+                bool unseen = false;
+                for (const auto asset : batch.asset_ids) {
+                    if (guard->model_->contains_asset(asset))
+                        guard->refresh_row(asset, false);
+                    else
+                        unseen = true;
+                }
+                // New items join the list when every result is already loaded (no lost paging).
+                if (unseen && !guard->next_page_ && !guard->fetching_more_)
+                    guard->run_search();
+            },
+            Qt::QueuedConnection);
+    });
+}
+
+void LibraryPanel::refresh_row(std::int64_t asset_id, bool removed) {
+    if (removed || !library_) {
+        model_->replace_row(asset_id, std::nullopt);
+        return;
+    }
+    QPointer<LibraryPanel> guard(this);
+    auto library = library_;
+    browse_thread_->post([guard, library, asset_id](std::stop_token) {
+        std::optional<LibraryRow> row;
+        if (auto browse = library->browse_rows_for({asset_id}); browse && !browse->empty()) {
+            const auto& found = browse->front();
+            row = make_row(found, found.text[0].empty() ? found.sort_title : found.text[0]);
+        }
+        QMetaObject::invokeMethod(
+            qApp,
+            [guard, asset_id, row] {
+                if (guard && row)
+                    guard->model_->replace_row(asset_id, row);
             },
             Qt::QueuedConnection);
     });

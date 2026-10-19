@@ -101,7 +101,11 @@ QString describe_event(const Event& event) {
 
 EventTableModel::EventTableModel(DocumentController& controller, QObject* parent)
     : QAbstractTableModel(parent), controller_(controller) {
-    connect(&controller_, &DocumentController::document_changed, this, &EventTableModel::rebuild);
+    // Edits arrive in bursts (drags, auto-repeat): the table is rebuilt once the burst settles.
+    rebuild_timer_.setSingleShot(true);
+    rebuild_timer_.setInterval(120);
+    connect(&rebuild_timer_, &QTimer::timeout, this, &EventTableModel::rebuild);
+    connect(&controller_, &DocumentController::document_changed, &rebuild_timer_, qOverload<>(&QTimer::start));
     // View state changes (scrubbing, zoom) fire constantly; only a sequence switch changes the rows.
     connect(&controller_, &DocumentController::view_state_changed, this, [this] {
         if (controller_.active_sequence_index() != built_sequence_)
@@ -308,6 +312,21 @@ EventListPanel::EventListPanel(DocumentController& controller, QWidget* parent)
     connect(filter_, &QLineEdit::textChanged, proxy_, &QSortFilterProxyModel::setFilterFixedString);
     connect(table_->selectionModel(), &QItemSelectionModel::selectionChanged, this, &EventListPanel::sync_to_selection);
     connect(&controller_, &DocumentController::selection_changed, this, &EventListPanel::sync_from_selection);
+    // A rebuild keeps the current event and the selection (the row may have moved).
+    connect(model_, &QAbstractItemModel::modelAboutToBeReset, this, [this] {
+        const auto current = proxy_->mapToSource(table_->currentIndex());
+        const Event* event = current.isValid() ? model_->event_at(current.row()) : nullptr;
+        current_event_ = event ? std::optional<EventId>(event->id) : std::nullopt;
+    });
+    connect(model_, &QAbstractItemModel::modelReset, this, [this] {
+        sync_from_selection();
+        if (current_event_)
+            if (const int row = model_->row_of(*current_event_); row >= 0) {
+                const auto index = proxy_->mapFromSource(model_->index(row, 0));
+                table_->selectionModel()->setCurrentIndex(index, QItemSelectionModel::NoUpdate);
+                table_->scrollTo(index);
+            }
+    });
 }
 
 void EventListPanel::sync_to_selection() {

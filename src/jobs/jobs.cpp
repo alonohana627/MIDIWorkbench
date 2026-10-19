@@ -133,6 +133,8 @@ void JobCoordinator::dispatch() {
                     status = pending.body(record);
                 } catch (const std::exception& error) {
                     status = make_error(ErrorCode::internal, std::string("job failed: ") + error.what());
+                } catch (...) {
+                    status = make_error(ErrorCode::internal, "job failed with an unknown error");
                 }
                 if (status)
                     record.set_state(JobState::complete);

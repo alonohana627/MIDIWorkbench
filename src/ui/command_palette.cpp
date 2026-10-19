@@ -32,6 +32,12 @@ CommandPalette::CommandPalette(const std::vector<QAction*>& commands, QWidget* p
     refilter();
 }
 
+void CommandPalette::set_query(const QString& text) {
+    query_->setText(text);
+    query_->setCursorPosition(static_cast<int>(text.size()));
+    refilter();
+}
+
 void CommandPalette::refilter() {
     const std::string query = fold_for_search(query_->text().toStdString());
     std::vector<std::pair<double, QAction*>> scored;

@@ -17,6 +17,8 @@ class CommandPalette : public QDialog {
 
 public:
     CommandPalette(const std::vector<QAction*>& commands, QWidget* parent = nullptr);
+    /// Starts with this query (text typed into the toolbar search before the palette opened).
+    void set_query(const QString& text);
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;

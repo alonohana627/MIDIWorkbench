@@ -205,11 +205,13 @@ const MeterSegment& MeterMap::segment_at(Tick tick) const {
 }
 
 Tick MeterMap::ticks_per_bar(const MeterSegment& segment) const {
-    return mul_div_floor(static_cast<std::int64_t>(segment.numerator) * 4, ppq_, segment.denominator).value_or(0);
+    // At least one tick: low PPQ with a large denominator would otherwise make every bar start at
+    // the same tick and bar loops never advance.
+    return std::max<Tick>(1, mul_div_floor(static_cast<std::int64_t>(segment.numerator) * 4, ppq_, segment.denominator).value_or(1));
 }
 
 Tick MeterMap::ticks_per_beat(const MeterSegment& segment) const {
-    return mul_div_floor(4, ppq_, segment.denominator).value_or(0);
+    return std::max<Tick>(1, mul_div_floor(4, ppq_, segment.denominator).value_or(1));
 }
 
 Tick MeterMap::bar_start(std::int64_t bar) const {

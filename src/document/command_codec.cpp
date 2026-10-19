@@ -183,8 +183,11 @@ json encode_operation(const EditOperation& operation) {
                             {"before", encode_track(change.before)}, {"after", encode_track(change.after)}};
             },
             [](const TrackMove& move) {
-                return json{{"op", "track_move"}, {"sequence", uuid_value(move.sequence.uuid())},
-                            {"from", static_cast<std::uint64_t>(move.from)}, {"to", static_cast<std::uint64_t>(move.to)}};
+                json value{{"op", "track_move"}, {"sequence", uuid_value(move.sequence.uuid())},
+                           {"from", static_cast<std::uint64_t>(move.from)}, {"to", static_cast<std::uint64_t>(move.to)}};
+                if (!move.track.is_nil())
+                    value["track"] = uuid_value(move.track.uuid());
+                return value;
             },
             [](const SequencePropertiesChange& change) {
                 return json{{"op", "sequence_properties"}, {"sequence", uuid_value(change.sequence.uuid())},
@@ -615,8 +618,12 @@ Result<EditOperation> decode_operation(const json& object) {
         MWB_CODEC_ASSIGN(sequence, uuid_field(object, "sequence"));
         MWB_CODEC_ASSIGN(from, unsigned_field(object, "from", max_index));
         MWB_CODEC_ASSIGN(to, unsigned_field(object, "to", max_index));
-        return EditOperation(
-            TrackMove{SequenceId(sequence), static_cast<std::size_t>(from), static_cast<std::size_t>(to)});
+        TrackMove move{SequenceId(sequence), static_cast<std::size_t>(from), static_cast<std::size_t>(to), {}};
+        if (object.contains("track")) {
+            MWB_CODEC_ASSIGN(track, uuid_field(object, "track"));
+            move.track = TrackId(track);
+        }
+        return EditOperation(move);
     }
     if (name == "sequence_properties") {
         MWB_CODEC_ASSIGN(sequence, uuid_field(object, "sequence"));

@@ -59,6 +59,9 @@ public:
     [[nodiscard]] QVariant headerData(int section, Qt::Orientation orientation, int role) const override;
     void set_rows(std::vector<LibraryRow> rows);
     void append_rows(std::vector<LibraryRow> rows);
+    /// Replaces the row of `asset_id` (keeps position, selection and paging), or removes it.
+    void replace_row(std::int64_t asset_id, std::optional<LibraryRow> row);
+    [[nodiscard]] bool contains_asset(std::int64_t asset_id) const;
     [[nodiscard]] const LibraryRow* row_at(int row) const;
     [[nodiscard]] Qt::ItemFlags flags(const QModelIndex& index) const override;
     [[nodiscard]] QStringList mimeTypes() const override;
@@ -127,7 +130,12 @@ private:
     void set_metadata(int column_kind);
     void prepare_drag_file();
     /// Runs one metadata change on the library thread, then refreshes the results.
-    void run_metadata_task(std::function<Status(library::Library&, std::int64_t)> task);
+    void run_metadata_task(std::function<Status(library::Library&, std::int64_t)> task, bool removes_row = false);
+    /// Re-reads one item's display row after a metadata change (no re-search).
+    void refresh_row(std::int64_t asset_id, bool removed);
+    /// Reads the library's change outbox (section 19.4) and refreshes changed rows in place, so
+    /// edits from the command line or another window appear without re-running the search.
+    void poll_changes();
     std::filesystem::path drag_cache_;
 
     std::shared_ptr<library::Library> library_;
@@ -147,6 +155,9 @@ private:
     midi::MidiParser parser_;
     midi::MidiParser import_parser_;
     std::shared_ptr<std::stop_source> search_stop_;
+    QTimer change_poll_;
+    std::optional<std::int64_t> change_revision_;
+    bool polling_changes_ = false;
     std::optional<search::PageCursor> next_page_;
     std::string current_query_;
     bool fetching_more_ = false;

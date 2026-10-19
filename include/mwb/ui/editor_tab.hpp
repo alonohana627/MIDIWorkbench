@@ -39,6 +39,7 @@ private:
     DocumentController& controller_;
     QTableWidget* table_ = nullptr;
     bool rebuilding_ = false;
+    QWidget* delete_button_ = nullptr;
 };
 
 /// One document's center and bottom editor: track list, piano roll or drum grid, controller
@@ -71,6 +72,7 @@ private:
     void sync_lanes();
 
     std::unique_ptr<DocumentController> controller_;
+    bool last_track_was_drum_ = false;
     TrackListWidget* track_list_ = nullptr;
     QStackedWidget* center_ = nullptr;
     PianoRollPanel* piano_roll_ = nullptr;

@@ -706,7 +706,7 @@ TEST_CASE("command codec round-trips every operation kind") {
         TrackInsert{sequence.id, 1, sequence.tracks[1]},
         TrackRemove{sequence.id, 0, track},
         TrackPropertiesChange{track.id, header, renamed},
-        TrackMove{sequence.id, 0, 1},
+        TrackMove{sequence.id, 0, 1, track.id}, // the track identity round-trips too
         SequencePropertiesChange{sequence.id, sequence_header, sequence_after},
         SequenceInsert{1, document.sequences[1]},
         SequenceRemove{0, sequence},

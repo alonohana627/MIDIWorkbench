@@ -174,6 +174,7 @@ void DrumGridView::mousePressEvent(QMouseEvent* event) {
         cursor_row_ = static_cast<int>(found - row_list.begin());
     cursor_column_ = cell->second;
     toggle_cell(cell->first, cell->second, (event->modifiers() & Qt::ShiftModifier) != 0);
+    toggled_generation_ = controller_.generation();
 }
 
 void DrumGridView::toggle_cell(int pitch, std::int64_t column, bool accent) {
@@ -216,7 +217,6 @@ bool DrumGridView::event(QEvent* event) {
         case Qt::Key_Right:
         case Qt::Key_Up:
         case Qt::Key_Down:
-        case Qt::Key_Space:
         case Qt::Key_Return:
         case Qt::Key_Enter:
             event->accept();
@@ -245,8 +245,7 @@ void DrumGridView::keyPressEvent(QKeyEvent* event) {
         else
             set_origin(origin_ + step_ticks()); // scroll right at the edge
         break;
-    case Qt::Key_Space:
-    case Qt::Key_Return:
+    case Qt::Key_Return: // Enter toggles (Space stays Play/Pause)
     case Qt::Key_Enter:
         if (cursor_row_ >= 0 && static_cast<std::size_t>(cursor_row_) < row_list.size())
             toggle_cell(row_list[static_cast<std::size_t>(cursor_row_)], cursor_column_,
@@ -260,6 +259,10 @@ void DrumGridView::keyPressEvent(QKeyEvent* event) {
 }
 
 void DrumGridView::mouseDoubleClickEvent(QMouseEvent* event) {
+    // The first click of a double-click toggled the cell; take that back before opening it.
+    if (toggled_generation_ && *toggled_generation_ == controller_.generation())
+        std::ignore = controller_.undo();
+    toggled_generation_.reset();
     if (const auto cell = cell_at(event->position()))
         emit open_in_piano_roll(origin_ + cell->second * step_ticks(), cell->first);
 }

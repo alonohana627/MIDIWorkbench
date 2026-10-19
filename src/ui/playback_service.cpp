@@ -38,6 +38,10 @@ public:
         thread_ = std::jthread([this](std::stop_token stop) { loop(stop); });
     }
     ~SnapshotCompiler() {
+        {
+            std::lock_guard lock(mutex_);
+            cancel_.request_stop(); // a compile in flight ends at its next check; closing never waits for it
+        }
         thread_.request_stop();
         wake_.notify_all();
     }
@@ -113,25 +117,38 @@ public:
             if (route.output == OutputKind::external_midi && !route.endpoint.empty())
                 wanted[route.key] = route.endpoint;
         QStringList problems;
-        std::lock_guard lock(mutex_);
+        // Devices open on the snapshot compiler's thread and outside the send lock, so neither the
+        // GUI nor the output thread waits for a slow driver (section 19.4).
+        std::lock_guard update_lock(update_mutex_);
         if (!wanted.empty() && !backend_) {
             auto backend = platform::create_midi_backend();
             if (!backend)
                 return QObject::tr("MIDI output unavailable: %1").arg(QString::fromStdString(backend.error().describe()));
             backend_ = std::move(*backend);
         }
-        routes_.clear();
+        std::map<std::string, std::unique_ptr<platform::IMidiOutput>> opened_now;
         for (const auto& [key, endpoint] : wanted) {
-            if (!outputs_.contains(endpoint)) {
-                auto opened = backend_->open_output(endpoint);
-                if (!opened) {
-                    problems << QString::fromStdString(endpoint + ": " + opened.error().describe());
-                    continue;
-                }
-                outputs_[endpoint] = std::move(*opened);
+            bool open = false;
+            {
+                std::lock_guard lock(mutex_);
+                open = outputs_.contains(endpoint);
             }
-            routes_[key] = outputs_[endpoint].get();
+            if (open || opened_now.contains(endpoint))
+                continue;
+            auto opened = backend_->open_output(endpoint);
+            if (!opened) {
+                problems << QString::fromStdString(endpoint + ": " + opened.error().describe());
+                continue;
+            }
+            opened_now[endpoint] = std::move(*opened);
         }
+        std::lock_guard lock(mutex_);
+        for (auto& [endpoint, output] : opened_now)
+            outputs_[endpoint] = std::move(output);
+        routes_.clear();
+        for (const auto& [key, endpoint] : wanted)
+            if (const auto found = outputs_.find(endpoint); found != outputs_.end())
+                routes_[key] = found->second.get();
         return problems.join("; ");
     }
 
@@ -151,7 +168,8 @@ private:
     }
 
     platform::AudioEngine& engine_;
-    std::mutex mutex_;
+    std::mutex update_mutex_; ///< Serializes route updates (device opens).
+    std::mutex mutex_;        ///< Guards routes for the output thread; never held while opening.
     std::unique_ptr<platform::IMidiBackend> backend_;
     std::map<std::string, std::unique_ptr<platform::IMidiOutput>> outputs_;
     std::map<std::uint64_t, platform::IMidiOutput*> routes_;
@@ -164,14 +182,20 @@ class EnginePlaybackService final : public PlaybackService {
 public:
     explicit EnginePlaybackService(QObject* parent) : PlaybackService(parent) {
         compiler_ = std::make_unique<SnapshotCompiler>(
-            [guard = QPointer<EnginePlaybackService>(this)](std::shared_ptr<const playback::PlaybackSnapshot> snapshot,
+            [guard = QPointer<EnginePlaybackService>(this), self = this](std::shared_ptr<const playback::PlaybackSnapshot> snapshot,
                                                            std::uint64_t generation, QString error) {
-                // Delivered on the GUI thread, which owns the engine's publish side.
+                // External MIDI routes (device opens) are updated here, on the compiler thread;
+                // the snapshot is then delivered on the GUI thread, which owns the engine's publish side.
+                QString problems;
+                // `self` is valid here: the service destroys (and joins) the compiler first.
+                if (snapshot)
+                    if (auto router = self->router())
+                        problems = router->update_routes(*snapshot);
                 QMetaObject::invokeMethod(
                     qApp, // context outlives the task; the lambda checks the guard
-                    [guard, snapshot = std::move(snapshot), generation, error]() mutable {
+                    [guard, snapshot = std::move(snapshot), generation, error, problems]() mutable {
                         if (guard)
-                            guard->deliver(std::move(snapshot), generation, error);
+                            guard->deliver(std::move(snapshot), generation, error, problems);
                     },
                     Qt::QueuedConnection);
             });
@@ -194,7 +218,10 @@ public:
             std::ignore = engine_->post({platform::EngineCommandKind::panic, 0}); // no stuck notes on shutdown
             engine_->close();
         }
-        router_.reset();
+        {
+            std::lock_guard lock(router_mutex_);
+            router_.reset();
+        }
     }
 
     void publish_document(const DocumentData& document, std::size_t sequence_index, std::uint64_t generation) override {
@@ -348,7 +375,10 @@ private:
             engine_.reset();
             return;
         }
-        router_ = std::make_unique<ExternalMidiRouter>(*engine_);
+        {
+            std::lock_guard lock(router_mutex_);
+            router_ = std::make_shared<ExternalMidiRouter>(*engine_);
+        }
         // Report what the device actually gave us, never a requested value (section 13.2).
         device_description_ = tr("%1 %2 · %3 Hz · %4 frames (%5 ms)")
                                   .arg(QString::fromStdString(negotiated->backend))
@@ -376,18 +406,21 @@ private:
         emit transport_state_changed();
     }
 
-    void deliver(std::shared_ptr<const playback::PlaybackSnapshot> snapshot, std::uint64_t generation, const QString& error) {
+    [[nodiscard]] std::shared_ptr<ExternalMidiRouter> router() {
+        std::lock_guard lock(router_mutex_);
+        return router_;
+    }
+
+    void deliver(std::shared_ptr<const playback::PlaybackSnapshot> snapshot, std::uint64_t generation, const QString& error,
+                 const QString& problems) {
         if (!engine_)
             return;
         if (!snapshot) {
             device_description_ = tr("Playback refused: %1").arg(error);
             return;
         }
-        if (router_) {
-            const QString problems = router_->update_routes(*snapshot);
-            if (!problems.isEmpty())
-                device_description_ = tr("External MIDI endpoint unavailable: %1").arg(problems);
-        }
+        if (!problems.isEmpty())
+            device_description_ = tr("External MIDI endpoint unavailable: %1").arg(problems);
         if (auto published = engine_->publish(std::move(snapshot)); !published) {
             device_description_ = tr("Playback refused: %1").arg(QString::fromStdString(published.error().describe()));
             return;
@@ -411,7 +444,8 @@ private:
     std::unique_ptr<audio::MetronomeSynth> metronome_;
     std::unique_ptr<platform::AudioEngine> engine_;
     std::unique_ptr<platform::IAudioOutput> output_;
-    std::unique_ptr<ExternalMidiRouter> router_;
+    std::mutex router_mutex_;
+    std::shared_ptr<ExternalMidiRouter> router_;
     playback::Transport transport_;
     QTimer retire_timer_;
     QString device_description_;

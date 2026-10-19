@@ -21,6 +21,7 @@
 #include <QScrollArea>
 #include <QSettings>
 #include <QSpinBox>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 namespace mwb::ui {
@@ -374,19 +375,33 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     connect(cancel_button, &QPushButton::clicked, this, &InspectorPanel::cancel_preview);
     // Tools used on every edit come right after the selection; settings below fold away.
     column->insertWidget(column->indexOf(selection_box) + 1, transform_box);
-    const auto collapsible = [](QGroupBox* box, const QString& key, bool expanded_by_default) {
-        box->setCheckable(true);
+    // Settings sections fold under an arrow header (a button, announced as expandable), not a
+    // checkable group box.
+    const auto collapsible = [column](QGroupBox* box, const QString& key, bool expanded_by_default) {
+        const QString title = box->title();
+        box->setTitle(QString());
+        auto* header = new QToolButton(box->parentWidget());
+        header->setText(title);
+        header->setCheckable(true);
+        header->setObjectName("sectionHeader");
+        header->setAutoRaise(true);
+        header->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        header->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        QFont bold = header->font();
+        bold.setWeight(QFont::DemiBold);
+        header->setFont(bold);
+        header->setAccessibleName(title);
+        header->setAccessibleDescription(QObject::tr("Shows or hides the %1 section").arg(title));
+        column->insertWidget(column->indexOf(box), header);
         const bool expanded = QSettings().value("inspector/expanded/" + key, expanded_by_default).toBool();
-        const auto show_content = [box](bool on) {
-            for (auto* child : box->findChildren<QWidget*>(Qt::FindDirectChildrenOnly))
-                child->setVisible(on);
-            box->setFlat(!on);
+        const auto apply = [box, header](bool on) {
+            header->setArrowType(on ? Qt::DownArrow : Qt::RightArrow);
+            header->setChecked(on);
+            box->setVisible(on);
         };
-        box->setChecked(expanded);
-        show_content(expanded);
-        box->setToolTip(QObject::tr("Click the title to show or hide this section"));
-        QObject::connect(box, &QGroupBox::toggled, box, [key, show_content](bool on) {
-            show_content(on);
+        apply(expanded);
+        QObject::connect(header, &QToolButton::toggled, box, [key, apply](bool on) {
+            apply(on);
             QSettings().setValue("inspector/expanded/" + key, on);
         });
     };

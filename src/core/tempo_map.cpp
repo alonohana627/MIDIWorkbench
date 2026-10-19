@@ -137,13 +137,10 @@ Tick TempoMap::microseconds_to_tick(std::int64_t microseconds) const {
                                  (static_cast<__int128>(seconds_per_tick.numerator) * 1'000'000));
     }
     const __int128 target = static_cast<__int128>(microseconds) * division_.ppq;
-    std::size_t index = 0;
-    for (std::size_t candidate = 1; candidate < segments_.size(); ++candidate) {
-        if (segments_[candidate].elapsed_scaled > target)
-            break;
-        index = candidate;
-    }
-    const auto& segment = segments_[index];
+    // Segments are ordered by elapsed time: binary search (rubato files have thousands).
+    const auto after = std::upper_bound(segments_.begin() + 1, segments_.end(), target,
+                                        [](__int128 value, const Segment& segment) { return value < segment.elapsed_scaled; });
+    const auto& segment = *std::prev(after);
     return segment.tick + static_cast<Tick>((target - segment.elapsed_scaled) / segment.microseconds_per_quarter);
 }
 
@@ -157,12 +154,10 @@ Tick TempoMap::frame_to_tick(std::int64_t frame, std::uint32_t sample_rate) cons
     }
     // elapsed_scaled * sample_rate <= frame * ppq * 1e6
     const __int128 target = static_cast<__int128>(frame) * division_.ppq * 1'000'000;
-    std::size_t index = 0;
-    for (std::size_t candidate = 1; candidate < segments_.size(); ++candidate) {
-        if (segments_[candidate].elapsed_scaled * sample_rate > target)
-            break;
-        index = candidate;
-    }
+    const auto after = std::upper_bound(segments_.begin() + 1, segments_.end(), target, [sample_rate](__int128 value, const Segment& segment) {
+        return value < segment.elapsed_scaled * sample_rate;
+    });
+    const std::size_t index = static_cast<std::size_t>(std::prev(after) - segments_.begin());
     const auto& segment = segments_[index];
     const __int128 remaining = target - segment.elapsed_scaled * sample_rate;
     return segment.tick + static_cast<Tick>(remaining / (static_cast<__int128>(segment.microseconds_per_quarter) * sample_rate));

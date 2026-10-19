@@ -327,7 +327,10 @@ public:
     /// Exact object bytes of a revision (verified against the hash).
     [[nodiscard]] Result<std::vector<std::uint8_t>> revision_bytes(std::int64_t revision_id);
     /// Opens a revision as a document (SMF through the midi adapter, native through the document module).
-    [[nodiscard]] Result<DocumentData> open_revision(std::int64_t revision_id);
+    /// Opens a revision for editing. MIDI bytes go through `parser` when given (the isolated
+    /// worker), with default parse limits; native revisions are validated by the native loader.
+    [[nodiscard]] Result<DocumentData> open_revision(std::int64_t revision_id, const midi::MidiParser& parser = {},
+                                                     std::stop_token stop = {});
 
     // --- Trash and garbage collection ----------------------------------------------------------
     [[nodiscard]] Status trash(const std::vector<std::int64_t>& asset_ids);

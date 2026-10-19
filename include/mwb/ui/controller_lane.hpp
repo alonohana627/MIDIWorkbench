@@ -44,6 +44,8 @@ public:
 
 signals:
     void status_message(const QString& text);
+    /// The user chose "Remove Lane" from the lane's context menu.
+    void remove_requested(mwb::ui::ControllerLane* lane);
 
 protected:
     void paintEvent(QPaintEvent* event) override;
@@ -52,6 +54,7 @@ protected:
     void mouseReleaseEvent(QMouseEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
     void leaveEvent(QEvent* event) override;
+    void contextMenuEvent(QContextMenuEvent* event) override;
 
 private:
     struct Stroke {

@@ -114,10 +114,12 @@ void TrackListWidget::rebuild() {
             item->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled | Qt::ItemIsSelectable);
             item->setCheckState(value ? Qt::Checked : Qt::Unchecked);
             item->setToolTip(tip);
+            item->setData(Qt::AccessibleTextRole, tip); // screen readers say what the box does
             table_->setItem(row, column, item);
         };
-        check(column_mute, track.muted, tr("Mute"));
-        check(column_solo, track.solo, tr("Solo"));
+        const QString track_name = QString::fromStdString(track.name);
+        check(column_mute, track.muted, tr("Mute %1").arg(track_name));
+        check(column_solo, track.solo, tr("Solo %1").arg(track_name));
     }
     if (active)
         table_->setCurrentCell(static_cast<int>(*active), column_name);
@@ -257,11 +259,20 @@ void EditorTab::add_lane(LaneTarget target) {
     lane->setMinimumHeight(60);
     lanes_container_->layout()->addWidget(lane);
     lanes_.push_back(lane);
+    connect(lane, &ControllerLane::remove_requested, this, &EditorTab::remove_lane);
     sync_lanes();
 }
 
+void EditorTab::remove_lane(ControllerLane* lane) {
+    const auto found = std::find(lanes_.begin(), lanes_.end(), lane);
+    if (found == lanes_.end())
+        return;
+    lanes_.erase(found);
+    lane->deleteLater(); // the lane's own context menu is still on the stack
+}
+
 void EditorTab::remove_last_lane() {
-    if (lanes_.size() <= 1)
+    if (lanes_.empty())
         return;
     delete lanes_.back();
     lanes_.pop_back();

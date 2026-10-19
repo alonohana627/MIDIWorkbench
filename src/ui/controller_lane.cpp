@@ -4,7 +4,10 @@
 #include "mwb/ui/document_controller.hpp"
 #include "mwb/ui/theme.hpp"
 
+#include <QContextMenuEvent>
+#include <QInputDialog>
 #include <QKeyEvent>
+#include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
 
@@ -137,7 +140,7 @@ void ControllerLane::paintEvent(QPaintEvent*) {
     painter.fillRect(rect(), palette().color(QPalette::Base));
     painter.fillRect(QRect(0, 0, left_margin_, height()), palette().color(QPalette::Window));
     painter.setPen(palette().color(QPalette::Text));
-    painter.drawText(QRect(4, 2, left_margin_ - 6, height() - 4), Qt::AlignTop | Qt::AlignLeft | Qt::TextWordWrap,
+    painter.drawText(QRect(4, 2, left_margin_ - 6, height() - 4), Qt::AlignVCenter | Qt::AlignLeft | Qt::TextWordWrap,
                      target_.label());
     painter.save();
     painter.setClipRect(QRect(left_margin_, 0, width() - left_margin_, height()));
@@ -241,23 +244,62 @@ void ControllerLane::paintEvent(QPaintEvent*) {
         painter.drawText(anchor, text);
     }
     painter.restore();
-    // Scale in the margin, below the lane name.
+    // Scale at the plot's left edge, clear of the lane name in the margin.
     QFont small = font();
     small.setPointSizeF(std::max(6.0, small.pointSizeF() - 1));
     painter.setFont(small);
     painter.setPen(palette().color(QPalette::PlaceholderText));
     const int maximum = target_.maximum();
-    if (height() >= 56) {
-        painter.drawText(QRectF(0, y_for_value(maximum) - 1, left_margin_ - 4, 14), Qt::AlignRight | Qt::AlignTop,
-                         QString::number(maximum));
-        painter.drawText(QRectF(0, y_for_value(0) - 13, left_margin_ - 4, 14), Qt::AlignRight | Qt::AlignBottom,
-                         QString::number(0));
+    if (height() >= 48) {
+        painter.drawText(QRectF(left_margin_ + 3, 1, 60, 14), Qt::AlignLeft | Qt::AlignTop, QString::number(maximum));
+        painter.drawText(QRectF(left_margin_ + 3, height() - 15, 60, 14), Qt::AlignLeft | Qt::AlignBottom, QString::number(0));
     }
     if (hasFocus()) {
         painter.setPen(QPen(palette().color(QPalette::Highlight), 2));
         painter.setBrush(Qt::NoBrush);
         painter.drawRect(QRectF(rect()).adjusted(1, 1, -1, -1));
     }
+}
+
+void ControllerLane::contextMenuEvent(QContextMenuEvent* event) {
+    // Change what this lane shows, or remove it.
+    QMenu menu(this);
+    auto* show = menu.addMenu(tr("Show"));
+    const std::uint8_t channel = target_.channel;
+    const auto add_target = [&](const QString& text, LaneTarget target) {
+        auto* action = show->addAction(text, this, [this, target] { set_target(target); });
+        action->setCheckable(true);
+        action->setChecked(target.kind == target_.kind && target.controller == target_.controller);
+    };
+    add_target(tr("Velocity"), LaneTarget{LaneTarget::Kind::velocity, 0, channel});
+    add_target(tr("Release Velocity"), LaneTarget{LaneTarget::Kind::release_velocity, 0, channel});
+    show->addSeparator();
+    for (const auto& [number, name] : {std::pair{1, tr("Modulation (CC 1)")}, std::pair{7, tr("Volume (CC 7)")},
+                                       std::pair{10, tr("Pan (CC 10)")}, std::pair{11, tr("Expression (CC 11)")},
+                                       std::pair{64, tr("Sustain Pedal (CC 64)")}})
+        add_target(name, LaneTarget{LaneTarget::Kind::controller, static_cast<std::uint8_t>(number), channel});
+    show->addAction(tr("Other Controller…"), this, [this, channel] {
+        bool accepted = false;
+        const int number = QInputDialog::getInt(this, tr("Controller"), tr("CC number"), target_.controller, 0, 127, 1, &accepted);
+        if (accepted)
+            set_target(LaneTarget{LaneTarget::Kind::controller, static_cast<std::uint8_t>(number), channel});
+    });
+    show->addSeparator();
+    add_target(tr("Pitch Bend"), LaneTarget{LaneTarget::Kind::pitch_bend, 0, channel});
+    add_target(tr("Channel Pressure"), LaneTarget{LaneTarget::Kind::channel_pressure, 0, channel});
+    auto* channels = menu.addMenu(tr("Channel"));
+    for (int index = 0; index < 16; ++index) {
+        auto* action = channels->addAction(tr("Channel %1").arg(index + 1), this, [this, index] {
+            LaneTarget target = target_;
+            target.channel = static_cast<std::uint8_t>(index);
+            set_target(target);
+        });
+        action->setCheckable(true);
+        action->setChecked(index == target_.channel);
+    }
+    menu.addSeparator();
+    menu.addAction(tr("Remove Lane"), this, [this] { emit remove_requested(this); });
+    menu.exec(event->globalPos());
 }
 
 void ControllerLane::leaveEvent(QEvent* event) {

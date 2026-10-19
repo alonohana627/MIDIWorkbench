@@ -1624,12 +1624,15 @@ Result<std::vector<std::uint8_t>> Library::revision_bytes(std::int64_t revision_
     return state_->objects.read(object->first, object->second);
 }
 
-Result<DocumentData> Library::open_revision(std::int64_t revision_id) {
+Result<DocumentData> Library::open_revision(std::int64_t revision_id, const midi::MidiParser& parser,
+                                           std::stop_token stop) {
     auto bytes = revision_bytes(revision_id);
     if (!bytes)
         return std::unexpected(std::move(bytes).error());
     if (midi::detect_container(*bytes) != midi::Container::unknown) {
-        auto imported = midi::import_midi(*bytes, "revision");
+        const midi::ParseLimits limits;
+        auto imported = parser ? parser(*bytes, "revision", limits, std::move(stop))
+                               : midi::import_midi(*bytes, "revision", limits, std::move(stop));
         if (!imported)
             return std::unexpected(std::move(imported).error());
         return std::move(imported->document);

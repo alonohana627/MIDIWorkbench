@@ -122,6 +122,9 @@ public:
 
     /// Marks the session cleanly closed and removes its checkpoints and journal.
     [[nodiscard]] Status mark_cleanly_closed();
+    /// A journal for a document opened from a file that is destroyed before any edit was recorded
+    /// closes cleanly (its content is the file itself), so it is never offered for recovery.
+    void set_discard_if_unused(bool discard);
 
     [[nodiscard]] const Uuid& session_id() const { return session_id_; }
     /// Time of the last committed write, for "last durable recovery" display.
@@ -140,8 +143,11 @@ private:
         Generation base_generation = 0;
         Generation result_generation = 0;
         Sha256Digest checksum{};
-        std::vector<std::uint8_t> payload;
+        std::vector<std::uint8_t> payload; ///< Encoded at flush time (off the recording thread).
         std::int64_t created_ms = 0;
+        CommandEnvelope envelope;          ///< Until encoded; its base hash comes from base_hash.
+        std::shared_future<Sha256Digest> base_hash;
+        bool encoded = false;
     };
     /// A snapshot waiting for flush.
     struct PendingCheckpoint {
@@ -173,6 +179,7 @@ private:
     /// Semantic hash of the last recorded document, computed on a background thread from an
     /// immutable copy; the next record() waits for it (edits are rarely closer than the hash).
     std::shared_future<Sha256Digest> last_hash_;
+    bool discard_if_unused_ = false;
     /// Checkpoint snapshot being serialized on a background thread.
     std::future<Result<PendingCheckpoint>> checkpoint_job_;
     std::size_t commands_since_checkpoint_ = 0;

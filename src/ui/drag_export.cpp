@@ -86,7 +86,11 @@ DragHandle::DragHandle(std::filesystem::path cache, QWidget* parent) : QWidget(p
 
 void DragHandle::set_controller(DocumentController* controller) { controller_ = controller; }
 
-QSize DragHandle::sizeHint() const { return {96, 24}; }
+QSize DragHandle::sizeHint() const {
+    return {fontMetrics().horizontalAdvance(tr("⇲ Drag MIDI")) + 24, std::max(26, fontMetrics().height() + 10)};
+}
+
+QSize DragHandle::minimumSizeHint() const { return sizeHint(); } // never squeezed to unreadable text
 
 void DragHandle::paintEvent(QPaintEvent*) {
     QPainter painter(this);

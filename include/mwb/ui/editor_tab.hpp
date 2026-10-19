@@ -61,6 +61,7 @@ public:
     /// Adds a controller lane (velocity, release velocity, CC, bend, pressure).
     void add_lane(LaneTarget target);
     void remove_last_lane();
+    void remove_lane(ControllerLane* lane);
 
 private:
     void sync_lanes();

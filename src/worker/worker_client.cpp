@@ -179,9 +179,12 @@ Result<std::unique_ptr<WorkerClient>> WorkerClient::start(const std::filesystem:
     SECURITY_ATTRIBUTES inherit{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
     HANDLE child_stdin = nullptr;
     HANDLE child_stdout = nullptr;
-    if (!CreatePipe(&child_stdin, &process->to_child, &inherit, 0) ||
-        !CreatePipe(&process->from_child, &child_stdout, &inherit, 0))
+    if (!CreatePipe(&child_stdin, &process->to_child, &inherit, 0))
         return make_error(ErrorCode::internal, "could not create worker pipes");
+    if (!CreatePipe(&process->from_child, &child_stdout, &inherit, 0)) {
+        CloseHandle(child_stdin); // the parent's ends close with `process`
+        return make_error(ErrorCode::internal, "could not create worker pipes");
+    }
     SetHandleInformation(process->to_child, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(process->from_child, HANDLE_FLAG_INHERIT, 0);
     // Inherit only the two pipe ends; no unrelated handles (section 28.2).

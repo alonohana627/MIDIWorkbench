@@ -2,6 +2,7 @@
 
 #include "mwb/app/document_io.hpp"
 #include "mwb/app/environment.hpp"
+#include "mwb/document/recovery.hpp"
 #include "mwb/ui/task_thread.hpp"
 #include "mwb/core/model.hpp"
 
@@ -71,6 +72,10 @@ public:
     [[nodiscard]] EditorTab* current_tab() const;
     /// Offers recoverable sessions left by a crash (section 5.5).
     void offer_recovery();
+    void present_recovery(std::vector<document::RecoverableSession> sessions);
+    /// Opens an in-memory document in a tab after its recovery journal (whose first checkpoint
+    /// serializes the whole document) was created on the I/O thread; `opened` runs with the tab.
+    void open_prepared(DocumentData document, bool recovered, std::function<void(EditorTab*)> opened = {});
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -163,6 +168,8 @@ private:
     std::map<const EditorTab*, std::pair<std::int64_t, std::int64_t>> library_sources_;
     /// MIDI parsing in the isolated worker process, shared with the library panel.
     std::shared_ptr<app::WorkerParser> parser_;
+    /// A second worker for library imports, so an interactive open never waits behind one.
+    std::shared_ptr<app::WorkerParser> import_parser_;
     /// Files being opened in the background; the screenshot and the startup blank document wait.
     int pending_opens_ = 0;
     /// File open and export run here, off the GUI thread (declared last: joined first).

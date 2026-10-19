@@ -300,9 +300,22 @@ void PianoRollView::paintEvent(QPaintEvent*) {
     paint_grid(painter, local);
     paint_notes(painter, local);
     paint_drag_preview(painter, local);
-    if (controller_.edit_cursor() >= mapping_.origin_tick) {
+    if (hasFocus() && controller_.selection().empty()) {
+        // Keyboard entry position: the edit cursor on the entry pitch row.
+        const double y = row_y(cursor_pitch_);
+        QColor row = palette().color(QPalette::Highlight);
+        row.setAlpha(40);
+        painter.fillRect(QRectF(0, y, local.width(), mapping_.row_height), row);
+    }
+    if (!playhead_ && controller_.edit_cursor() >= mapping_.origin_tick) {
+        // Stopped: the edit cursor is where playback starts, drawn as the red transport line
+        // (Left/Right move it by the grid; a click in the ruler sets it).
         const double x = mapping_.tick_to_x(controller_.edit_cursor());
-        painter.setPen(QPen(colors.cursor, 1, Qt::DashLine));
+        painter.setPen(QPen(colors.playhead, 2));
+        painter.drawLine(QPointF(x, 0), QPointF(x, local.height()));
+    } else if (playhead_ && controller_.edit_cursor() >= mapping_.origin_tick) {
+        const double x = mapping_.tick_to_x(controller_.edit_cursor());
+        painter.setPen(QPen(colors.cursor, 1, Qt::DashLine)); // return point while playing
         painter.drawLine(QPointF(x, 0), QPointF(x, local.height()));
     }
     if (playhead_) {
@@ -569,12 +582,18 @@ void PianoRollView::paint_drag_preview(QPainter& painter, const QRectF&) {
         painter.drawRect(QRectF(left, row_y(pitch) + 1, right - left, mapping_.row_height - 2));
     }
     if (gesture_ == Gesture::move || gesture_ == Gesture::duplicate_move) {
-        const Tick delta = preview_move_.delta_ticks;
-        emit status_message(tr("Move %1 note(s) by %2 ticks, %3 semitones%4")
-                                .arg(snapshot_.notes.size())
-                                .arg(delta)
-                                .arg(preview_move_.delta_pitch)
-                                .arg(preview_move_.constrained ? tr(" (limited at the edge of the range)") : QString()));
+        // Report only when the preview changes, not on every repaint.
+        const std::pair<Tick, int> move{preview_move_.delta_ticks, preview_move_.delta_pitch};
+        if (move != reported_move_) {
+            reported_move_ = move;
+            QMetaObject::invokeMethod(this, [this, count = snapshot_.notes.size(), move, constrained = preview_move_.constrained] {
+                emit status_message(tr("Move %1 note(s) by %2 ticks, %3 semitones%4")
+                                        .arg(count)
+                                        .arg(move.first)
+                                        .arg(move.second)
+                                        .arg(constrained ? tr(" (limited at the edge of the range)") : QString()));
+            }, Qt::QueuedConnection);
+        }
     }
 }
 
@@ -654,9 +673,9 @@ void PianoRollView::paint_ruler(QPainter& painter) {
             last_label_x = x;
         }
     }
-    if (playhead_) {
-        // Playhead marker in the ruler.
-        const double x = mapping_.tick_to_x(*playhead_);
+    {
+        // Transport marker in the ruler: the playhead while playing, else the edit cursor.
+        const double x = mapping_.tick_to_x(playhead_ ? *playhead_ : controller_.edit_cursor());
         QPolygonF marker;
         marker << QPointF(x - 5, 0) << QPointF(x + 5, 0) << QPointF(x, 8);
         painter.setPen(Qt::NoPen);
@@ -790,10 +809,16 @@ void PianoRollView::mouseMoveEvent(QMouseEvent* event) {
         emit hover_changed(mapping_.x_to_tick(local.x()), pitch_at_y(local.y()));
     }
     if (gesture_ == Gesture::none) {
-        if (tool_ == EditTool::select) {
-            const auto hit = hit_test(point);
-            setCursor(hit.zone == HitZone::left_edge || hit.zone == HitZone::right_edge ? Qt::SizeHorCursor
-                                                                                       : Qt::ArrowCursor);
+        const auto hit = hit_test(point);
+        const bool edge = hit.zone == HitZone::left_edge || hit.zone == HitZone::right_edge;
+        switch (tool_) {
+        case EditTool::select: setCursor(edge ? Qt::SizeHorCursor : hit.note ? Qt::SizeAllCursor : Qt::ArrowCursor); break;
+        case EditTool::draw: // Draw on a note moves or resizes it (see mousePressEvent)
+            setCursor(edge ? Qt::SizeHorCursor : hit.note ? Qt::SizeAllCursor : Qt::CrossCursor);
+            break;
+        case EditTool::erase: setCursor(hit.note ? Qt::PointingHandCursor : Qt::ForbiddenCursor); break;
+        case EditTool::split: setCursor(hit.note ? Qt::SplitHCursor : Qt::ArrowCursor); break;
+        case EditTool::audition: setCursor(Qt::PointingHandCursor); break;
         }
         return;
     }
@@ -1123,13 +1148,24 @@ void PianoRollView::wheelEvent(QWheelEvent* event) {
             mapping_.zoom_pitch_around(local.y(), std::pow(1.15, steps)); // Ctrl-Shift-wheel: pitch zoom
         else
             mapping_.zoom_time_around(std::max(0.0, local.x()), std::pow(1.25, steps)); // Ctrl-wheel: time zoom
-    } else if (event->modifiers() & Qt::ShiftModifier) {
-        const double horizontal = steps != 0 ? steps : event->angleDelta().x() / 120.0;
-        mapping_.origin_tick = std::max<Tick>(0, mapping_.origin_tick -
-                                                     static_cast<Tick>(horizontal * 80 * mapping_.ticks_per_pixel));
     } else {
-        mapping_.top_pitch = std::clamp(mapping_.top_pitch + static_cast<int>(std::lround(steps * 3)),
-                                        std::min(127, visible_row_count() - 1), 127);
+        // Shift turns vertical wheel motion into time; touchpads also send horizontal motion.
+        // Fractions accumulate so small precision-touchpad steps still move the view.
+        const bool shift = (event->modifiers() & Qt::ShiftModifier) != 0;
+        const double horizontal = shift ? (steps != 0 ? steps : event->angleDelta().x() / 120.0)
+                                        : event->angleDelta().x() / 120.0;
+        const double vertical = shift ? 0.0 : steps;
+        wheel_columns_ += horizontal * 80;
+        const auto columns = static_cast<Tick>(wheel_columns_);
+        wheel_columns_ -= static_cast<double>(columns);
+        if (columns != 0)
+            mapping_.origin_tick = std::max<Tick>(0, mapping_.origin_tick - static_cast<Tick>(static_cast<double>(columns) *
+                                                                                              mapping_.ticks_per_pixel));
+        wheel_rows_ += vertical * 3;
+        const auto rows = static_cast<int>(wheel_rows_);
+        wheel_rows_ -= rows;
+        if (rows != 0)
+            mapping_.top_pitch = std::clamp(mapping_.top_pitch + rows, std::min(127, visible_row_count() - 1), 127);
     }
     emit mapping_changed();
     update();
@@ -1137,8 +1173,41 @@ void PianoRollView::wheelEvent(QWheelEvent* event) {
 }
 
 void PianoRollView::keyPressEvent(QKeyEvent* event) {
-    if (event->key() == Qt::Key_Escape && gesture_ != Gesture::none) {
-        cancel_gesture();
+    if (event->key() == Qt::Key_Escape) {
+        if (gesture_ != Gesture::none)
+            cancel_gesture();
+        else if (!controller_.selection().empty())
+            controller_.set_selection({}); // Escape clears the selection when nothing is in progress
+        event->accept();
+        return;
+    }
+    // Keyboard note entry (spec 29.3): Left/Right move the red transport line (window command),
+    // Up/Down choose the entry pitch when nothing is selected (Shift: an octave), and Return or
+    // Insert adds a note there and advances.
+    if (controller_.selection().empty() && (event->modifiers() & ~Qt::ShiftModifier) == Qt::NoModifier &&
+        (event->key() == Qt::Key_Up || event->key() == Qt::Key_Down)) {
+        const int step = (event->modifiers() & Qt::ShiftModifier) ? 12 : 1;
+        cursor_pitch_ = std::clamp(cursor_pitch_ + (event->key() == Qt::Key_Up ? step : -step), 0, 127);
+        if (cursor_pitch_ > mapping_.top_pitch || cursor_pitch_ <= mapping_.top_pitch - visible_row_count()) {
+            mapping_.top_pitch = std::clamp(cursor_pitch_ + visible_row_count() / 2, 0, 127);
+            emit mapping_changed();
+        }
+        emit hover_changed(controller_.edit_cursor(), cursor_pitch_);
+        update();
+        event->accept();
+        return;
+    }
+    if ((event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter || event->key() == Qt::Key_Insert) &&
+        controller_.active_track_index()) {
+        const Tick start = controller_.edit_cursor();
+        const NewNote created{controller_.active_track(), start, start + default_note_length(),
+                              static_cast<std::uint8_t>(cursor_pitch_), default_velocity(), default_channel(), 0};
+        if (auto changes = insert_notes(controller_.document(), std::span(&created, 1), "Insert note")) {
+            if (controller_.apply(*changes))
+                controller_.set_edit_cursor(start + default_note_length()); // step entry: advance the cursor
+        }
+        emit audition_note_on(cursor_pitch_, default_velocity());
+        emit audition_note_off(cursor_pitch_);
         event->accept();
         return;
     }
@@ -1164,6 +1233,21 @@ void PianoRollView::contextMenuEvent(QContextMenuEvent* event) {
             controller_.set_selection({note.on_id});
     }
     QMenu menu(this);
+    // The window's commands, so shortcuts, enabled state and undo labels match the menus.
+    bool any_command = false;
+    for (const char* id : std::initializer_list<const char*>{"edit.cut", "edit.copy", "edit.paste", "edit.duplicate", "edit.delete", nullptr,
+                           "edit.quantize_last", "edit.transpose_up", "edit.transpose_down", "edit.octave_up",
+                           "edit.octave_down", nullptr}) {
+        if (!id) {
+            if (any_command)
+                menu.addSeparator();
+            continue;
+        }
+        if (auto* action = window()->findChild<QAction*>(QString::fromLatin1(id))) {
+            menu.addAction(action);
+            any_command = true;
+        }
+    }
     menu.addAction(tr("Select All"), this, &PianoRollView::select_all);
     menu.addAction(tr("Invert Selection"), this, &PianoRollView::invert_selection);
     menu.addAction(tr("Select Same Pitch"), this, &PianoRollView::select_same_pitch);

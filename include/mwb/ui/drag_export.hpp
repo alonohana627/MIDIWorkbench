@@ -35,6 +35,7 @@ public:
     DragHandle(std::filesystem::path cache, QWidget* parent = nullptr);
     void set_controller(DocumentController* controller);
     [[nodiscard]] QSize sizeHint() const override;
+    [[nodiscard]] QSize minimumSizeHint() const override;
 
 signals:
     void status_message(const QString& text);

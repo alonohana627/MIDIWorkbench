@@ -24,6 +24,10 @@ class RecoveryJournal;
 
 namespace mwb::ui {
 
+/// Finishes queued recovery work (flushes, clean closes) and stops the recovery thread; called
+/// once when the main window closes.
+void stop_recovery_thread();
+
 /// GUI-side owner of one open document: the working session (model, history, saves) plus view
 /// state that is not document content (active sequence and track, selection, edit cursor).
 /// Edits are applied on the GUI thread immediately (optimistic, section 19.4); derived caches
@@ -135,7 +139,7 @@ private:
         std::mutex mutex;
         std::optional<Status> outcome;
     };
-    void finish_save(const std::shared_ptr<PendingSave>& pending);
+    void finish_save(std::shared_ptr<PendingSave> pending);
     std::shared_ptr<PendingSave> pending_save_;
     std::jthread save_thread_; // declared last: joined before the members it uses are destroyed
 

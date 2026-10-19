@@ -2,6 +2,7 @@
 
 #include "mwb/core/note_edit.hpp"
 #include "mwb/core/serialization.hpp"
+#include "mwb/document/recovery.hpp"
 #include "mwb/document/session.hpp"
 #include "mwb/ui/clipboard.hpp"
 #include "mwb/ui/document_controller.hpp"
@@ -116,6 +117,52 @@ TEST_SUITE("controller") {
         CHECK_FALSE(controller->is_dirty());
         CHECK(controller->redo());
         CHECK(controller->notes().notes.size() == 1);
+    }
+
+    TEST_CASE("a background save completes, keeps later edits dirty and can be awaited") {
+        test::TemporaryDirectory directory;
+        auto controller = make_controller();
+        const NewNote note{controller->active_track(), 0, 480, 60, 100, 0, 0};
+        REQUIRE(controller->apply(*insert_notes(controller->document(), std::span(&note, 1))));
+        QSignalSpy finished(controller.get(), &DocumentController::save_finished);
+        const auto path = directory.path() / "async.mwb";
+        controller->save_native_async(path);
+        CHECK(controller->saving());
+        // An edit while saving stays dirty after the save of the earlier state lands.
+        const NewNote later{controller->active_track(), 480, 960, 62, 100, 0, 0};
+        REQUIRE(controller->apply(*insert_notes(controller->document(), std::span(&later, 1))));
+        controller->wait_for_save();
+        CHECK_FALSE(controller->saving());
+        REQUIRE(finished.count() == 1);
+        CHECK(finished.at(0).at(0).toString().isEmpty());
+        CHECK(controller->is_dirty());
+        CHECK(controller->file_path() == path);
+        CHECK(std::filesystem::exists(path));
+        // A second wait (or the queued completion) does nothing more.
+        controller->wait_for_save();
+        QCoreApplication::processEvents();
+        CHECK(finished.count() == 1);
+    }
+
+    TEST_CASE("recovery flushes run in the background and report their outcome") {
+        test::TemporaryDirectory directory;
+        auto controller = make_controller();
+        auto journal = document::RecoveryJournal::create(directory.path(), controller->document(), {});
+        REQUIRE(journal);
+        std::shared_ptr<document::RecoveryJournal> shared = std::move(*journal);
+        controller->attach_recovery(shared);
+        const NewNote note{controller->active_track(), 0, 480, 60, 100, 0, 0};
+        REQUIRE(controller->apply(*insert_notes(controller->document(), std::span(&note, 1))));
+        CHECK(shared->pending_commands() == 1);
+        QSignalSpy flushed(controller.get(), &DocumentController::recovery_flushed);
+        controller->flush_recovery_async();
+        controller->flush_recovery_async(); // at most one flush in flight
+        REQUIRE(flushed.wait(10000));
+        CHECK(flushed.count() == 1);
+        CHECK(flushed.at(0).at(0).toString().isEmpty());
+        CHECK(controller->recovery_error().isEmpty());
+        CHECK(shared->pending_commands() == 0);
+        controller->close_recovery();
     }
 
     TEST_CASE("selection drops notes deleted by an edit") {

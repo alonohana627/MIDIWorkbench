@@ -177,12 +177,20 @@ void ShortcutEditor::import_profile() {
         QMessageBox::warning(this, tr("Import shortcuts"), tr("Could not read %1").arg(path));
         return;
     }
+    // The profile fills the table only; OK applies it, Cancel leaves the current bindings.
+    std::vector<QList<QKeySequence>> previous;
+    for (auto* action : commands_)
+        previous.push_back(action->shortcuts());
     QStringList messages;
-    if (!apply_shortcuts_json(commands_, QString::fromUtf8(file.readAll()), &messages)) {
+    const bool read = apply_shortcuts_json(commands_, QString::fromUtf8(file.readAll()), &messages);
+    if (read)
+        populate();
+    for (std::size_t index = 0; index < commands_.size(); ++index)
+        commands_[index]->setShortcuts(previous[index]);
+    if (!read) {
         QMessageBox::warning(this, tr("Import shortcuts"), tr("This is not a MIDI Workbench shortcut profile"));
         return;
     }
-    populate();
     if (!messages.isEmpty())
         QMessageBox::information(this, tr("Import shortcuts"), messages.join('\n'));
 }

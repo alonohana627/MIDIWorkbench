@@ -10,6 +10,7 @@
 
 #include <map>
 
+#include <QCoreApplication>
 #include <QMetaObject>
 #include <QPointer>
 #include <QTimer>
@@ -167,7 +168,7 @@ public:
                                                            std::uint64_t generation, QString error) {
                 // Delivered on the GUI thread, which owns the engine's publish side.
                 QMetaObject::invokeMethod(
-                    guard.data(),
+                    qApp, // context outlives the task; the lambda checks the guard
                     [guard, snapshot = std::move(snapshot), generation, error]() mutable {
                         if (guard)
                             guard->deliver(std::move(snapshot), generation, error);

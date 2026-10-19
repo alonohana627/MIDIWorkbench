@@ -67,6 +67,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "warning: %s\n", logging.error().describe().c_str());
     mwb::app::log_event("app", "start", "MIDI Workbench starting");
 
+    // --workspace isolates preferences too: QSettings go to an INI file in that directory
+    // instead of the user's registry (tests and screenshots never touch real settings).
+    if (!workspace.empty()) {
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, QString::fromStdString(workspace));
+    }
     // Font and theme before any widget exists, so every widget inherits them.
     mwb::ui::apply_base_font(application);
     mwb::ui::apply_theme(mwb::ui::theme_from_name(

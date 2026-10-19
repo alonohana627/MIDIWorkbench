@@ -114,6 +114,7 @@ QString base_stylesheet() {
         "QToolBar::separator { width: 1px; margin: 4px 6px; background: palette(mid); }"
         "QToolButton { padding: 4px; border-radius: 4px; }"
         "QToolButton:checked { background: palette(highlight); color: palette(highlighted-text); }"
+        "QToolButton:checked:disabled { background: palette(midlight); color: palette(placeholder-text); }"
         "QDockWidget::title { padding: 6px 8px; background: palette(window); }"
         "QStatusBar { border-top: 1px solid palette(mid); }"
         "QStatusBar::item { border: 0; }"
@@ -137,7 +138,12 @@ void apply_theme(Theme theme) {
                                               "QCheckBox::indicator, QTableView::indicator { width: 13px; height: 13px;"
                                               " border: 2px solid #FFFFFF; background: #000000; }"
                                               "QCheckBox::indicator:checked, QTableView::indicator:checked { background: #FFD400; }"
-                                              "QLineEdit, QAbstractSpinBox, QComboBox, QPushButton { border: 1px solid #FFFFFF; }")
+                                              "QLineEdit, QAbstractSpinBox, QComboBox, QPushButton { border: 1px solid #FFFFFF; }"
+                                              "QScrollBar::handle { background: #FFFFFF; border: 1px solid #000000;"
+                                              " min-width: 24px; min-height: 24px; }"
+                                              "QScrollBar { background: #000000; border: 1px solid #FFFFFF; }"
+                                              "QSplitter::handle { background: #FFFFFF; }"
+                                              "QMainWindow::separator { background: #FFFFFF; width: 2px; height: 2px; }")
                                         : QString()));
     if (!g_follow_connected) {
         g_follow_connected = true;

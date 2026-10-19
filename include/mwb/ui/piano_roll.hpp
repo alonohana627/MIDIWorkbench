@@ -166,6 +166,13 @@ private:
     MoveResult preview_move_;
     Tick preview_resize_delta_ = 0;
     std::optional<int> audition_pitch_;
+    /// Keyboard note-entry pitch (Up/Down with nothing selected; Return inserts a note there).
+    int cursor_pitch_ = 60;
+    /// Fractional wheel steps from precision touchpads, accumulated until a whole row or column.
+    double wheel_rows_ = 0.0;
+    double wheel_columns_ = 0.0;
+    /// Last move preview reported in the status bar (to report only changes).
+    std::pair<Tick, int> reported_move_{0, 0};
     ViewMapping pan_origin_;
     bool shift_axis_locked_ = false;
     bool lock_to_time_axis_ = false;

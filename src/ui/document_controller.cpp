@@ -6,6 +6,7 @@
 #include "mwb/document/recovery.hpp"
 #include "mwb/document/session.hpp"
 
+#include <QCoreApplication>
 #include <QMetaObject>
 #include <QPointer>
 
@@ -61,10 +62,12 @@ bool DocumentController::flush_recovery(QString* error) {
 namespace {
 /// Recovery journal flushes for every document run here, in order.
 TaskThread& recovery_thread() {
-    static TaskThread thread;
+    static TaskThread thread(true); // drains: closing sessions must reach the database
     return thread;
 }
 } // namespace
+
+void stop_recovery_thread() { recovery_thread().stop(); }
 
 void DocumentController::flush_recovery_async() {
     if (!journal_ || recovery_flush_running_)
@@ -79,7 +82,7 @@ void DocumentController::flush_recovery_async() {
         else if (const auto failure = journal->last_error())
             error = QString::fromStdString(failure->describe());
         QMetaObject::invokeMethod(
-            guard.data(),
+            qApp, // context outlives the task; the lambda checks the guard
             [guard, error] {
                 if (!guard)
                     return;
@@ -94,8 +97,12 @@ void DocumentController::flush_recovery_async() {
 void DocumentController::close_recovery() {
     if (!journal_)
         return;
-    std::ignore = journal_->flush(); // best effort before removing the session data
-    std::ignore = journal_->mark_cleanly_closed(); // a failure only leaves recoverable evidence behind
+    // A clean close deletes the session's journal and checkpoints, so nothing needs flushing first.
+    // It runs on the recovery thread (after any flush in progress); the window drains that thread
+    // before the process ends.
+    recovery_thread().post([journal = std::move(journal_)](std::stop_token) {
+        std::ignore = journal->mark_cleanly_closed(); // a failure only leaves recoverable evidence behind
+    });
     journal_.reset();
 }
 
@@ -205,7 +212,7 @@ void DocumentController::save_native_async(const std::filesystem::path& path) {
             pending->outcome = std::move(outcome);
         }
         QMetaObject::invokeMethod(
-            guard.data(),
+            qApp, // context outlives the task; the lambda checks the guard
             [guard, pending] {
                 if (guard)
                     guard->finish_save(pending);
@@ -221,7 +228,7 @@ void DocumentController::wait_for_save() {
         finish_save(pending_save_);
 }
 
-void DocumentController::finish_save(const std::shared_ptr<PendingSave>& pending) {
+void DocumentController::finish_save(std::shared_ptr<PendingSave> pending) { // by value: it outlives pending_save_.reset()
     if (pending != pending_save_)
         return; // already completed (wait_for_save ran first)
     Status outcome = make_error(ErrorCode::internal, "save did not finish");

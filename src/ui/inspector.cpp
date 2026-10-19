@@ -167,8 +167,12 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     pitch_ = spin(0, 127, 60, selection_box);
     velocity_ = spin(1, 127, 100, selection_box);
     channel_ = spin(1, 16, 1, selection_box); // displayed 1-16
-    selection_form->addRow(tr("Start (ticks)"), start_);
-    selection_form->addRow(tr("Length (ticks)"), length_);
+    selection_form->addRow(tr("Start"), start_);
+    selection_form->addRow(tr("Length"), length_);
+    start_->setToolTip(tr("Start in ticks; bar.beat.tick shown in parentheses"));
+    connect(start_, &QSpinBox::valueChanged, this, &InspectorPanel::update_position_suffixes);
+    connect(length_, &QSpinBox::valueChanged, this, &InspectorPanel::update_position_suffixes);
+    length_->setToolTip(tr("Length in ticks; beats shown in parentheses"));
     selection_form->addRow(tr("Pitch"), pitch_);
     selection_form->addRow(tr("Velocity"), velocity_);
     selection_form->addRow(tr("Channel"), channel_);
@@ -217,9 +221,10 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     track_name_ = new QLineEdit(track_box);
     track_drum_ = new QCheckBox(tr("Drum track (display hint)"), track_box);
     track_channel_override_ = new QComboBox(track_box);
-    track_channel_override_->addItem(tr("Keep event channels"));
+    track_channel_override_->addItem(tr("Keep channels"));
     for (int channel = 1; channel <= 16; ++channel)
-        track_channel_override_->addItem(tr("Play on channel %1").arg(channel));
+        track_channel_override_->addItem(tr("Force channel %1").arg(channel));
+    track_channel_override_->setToolTip(tr("Play the track on its events' own channels, or force one channel"));
     track_transpose_ = spin(-48, 48, 0, track_box);
     track_preset_ = new QComboBox(track_box);
     for (const auto* preset : presets)
@@ -320,6 +325,7 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     // --- Transformations ------------------------------------------------------------------------
     auto* transform_box = new QGroupBox(tr("Transform selection"), content);
     auto* transform_form = new QFormLayout(transform_box);
+    transform_form_ = transform_form;
     tool_ = new QComboBox(transform_box);
     for (const auto& entry : tool_entries)
         tool_->addItem(tr(entry.label), QString::fromLatin1(entry.id));
@@ -349,10 +355,16 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     transform_form->addRow(tr("Strength"), strength_);
     transform_form->addRow(tr("Seed"), seed_);
     transform_form->addRow(tr("Grid / rate"), grid_);
-    transform_form->addRow(tr("All parameters"), parameters_);
+    advanced_ = new QCheckBox(tr("Show all parameters (JSON)"), transform_box);
+    advanced_->setToolTip(tr("Every option of the tool as editable JSON, also used by saved recipes"));
+    transform_form->addRow(advanced_);
+    transform_form->addRow(tr("Parameters"), parameters_);
+    transform_form->setRowVisible(parameters_, false);
+    connect(advanced_, &QCheckBox::toggled, this, [this](bool on) { transform_form_->setRowVisible(parameters_, on); });
     transform_form->addRow(buttons);
     transform_form->addRow(report_);
     connect(tool_, &QComboBox::activated, this, &InspectorPanel::load_tool_defaults);
+    update_tool_rows();
     for (auto* box : {amount_, strength_, seed_})
         connect(box, &QSpinBox::valueChanged, this, &InspectorPanel::update_parameters_from_form);
     connect(grid_, &QComboBox::activated, this, &InspectorPanel::update_parameters_from_form);
@@ -490,6 +502,7 @@ void InspectorPanel::refresh_selection() {
     } else if (!selected.empty()) {
         velocity_->setValue(selected.front().velocity);
     }
+    update_position_suffixes();
     shown_ = {start_->value(), length_->value(), pitch_->value(), velocity_->value(), channel_->value()};
     updating_ = false;
     recognize_selection();
@@ -684,7 +697,56 @@ void InspectorPanel::load_tool_defaults() {
     else
         amount_->setValue(0);
     updating_ = false;
+    update_tool_rows();
     update_parameters_from_form();
+}
+
+void InspectorPanel::update_tool_rows() {
+    // Tool -> label of the Amount field (empty: not used), and whether strength, seed and grid apply.
+    struct Rows {
+        const char* tool;
+        const char* amount;
+        bool strength;
+        bool seed;
+        const char* grid;
+    };
+    static constexpr Rows rows[] = {
+        {"quantize", "", true, false, "Grid"},           {"humanize", "Timing ± (ticks)", false, true, ""},
+        {"transpose", "Semitones", false, false, ""},     {"velocity", "Velocity (1-127)", false, false, ""},
+        {"length", "Length (ticks)", false, false, ""},   {"time_stretch", "", false, false, ""},
+        {"reverse", "", false, false, ""},                {"invert_pitch", "Axis pitch (0-127)", false, false, ""},
+        {"rotate", "Shift (notes)", false, false, ""},    {"repeat", "Copies", false, false, ""},
+        {"strum", "Spread (ticks)", false, true, ""},     {"arpeggiate", "", false, true, "Rate"},
+        {"euclidean", "Pulses", false, false, "Step"},    {"remove_duplicates", "", false, false, ""},
+        {"resolve_overlaps", "", false, false, ""},       {"join", "Max gap (ticks)", false, false, ""},
+        {"conform_to_scale", "", false, false, ""},
+    };
+    const QString tool = tool_->currentData().toString();
+    for (const auto& row : rows) {
+        if (tool != QLatin1String(row.tool))
+            continue;
+        const QString amount = tr(row.amount);
+        transform_form_->setRowVisible(amount_, !amount.isEmpty());
+        if (auto* label = qobject_cast<QLabel*>(transform_form_->labelForField(amount_)))
+            label->setText(amount);
+        transform_form_->setRowVisible(strength_, row.strength);
+        transform_form_->setRowVisible(seed_, row.seed);
+        const QString grid = tr(row.grid);
+        transform_form_->setRowVisible(grid_, !grid.isEmpty());
+        if (auto* label = qobject_cast<QLabel*>(transform_form_->labelForField(grid_)))
+            label->setText(grid);
+    }
+}
+
+void InspectorPanel::update_position_suffixes() {
+    if (!controller_)
+        return;
+    // Musicians read positions as bar.beat.tick; the tick value stays editable.
+    const auto& meter = controller_->meter_map();
+    start_->setSuffix(QStringLiteral("  (%1)").arg(QString::fromStdString(meter.format(start_->value()))));
+    const Tick beat = std::max<Tick>(1, meter.ticks_per_beat(meter.segment_at(start_->value())));
+    const double beats = static_cast<double>(length_->value()) / static_cast<double>(beat);
+    length_->setSuffix(tr("  (%1 beats)").arg(beats, 0, 'g', 3));
 }
 
 void InspectorPanel::update_parameters_from_form() {

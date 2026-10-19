@@ -211,6 +211,12 @@ void paint_icon(QPainter& painter, IconId id, const QColor& ink) {
         painter.drawRoundedRect(QRectF(4, 8, 11, 12), 1.5, 1.5);
         painter.drawRoundedRect(QRectF(9, 4, 11, 12), 1.5, 1.5);
         break;
+    case IconId::close:
+        pen.setWidthF(1.8);
+        painter.setPen(pen);
+        painter.drawLine(QPointF(7, 7), QPointF(17, 17));
+        painter.drawLine(QPointF(17, 7), QPointF(7, 17));
+        break;
     case IconId::up:
     case IconId::down: {
         painter.save();

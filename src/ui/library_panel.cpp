@@ -16,6 +16,7 @@
 #include <QListWidget>
 #include <QMessageBox>
 #include <QHBoxLayout>
+#include <QScrollBar>
 #include <QStackedWidget>
 #include <QInputDialog>
 #include <QHeaderView>
@@ -23,6 +24,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
+#include <QCoreApplication>
 #include <QMetaObject>
 #include <QPointer>
 #include <QPushButton>
@@ -49,11 +51,53 @@ LibraryTaskThread& write_thread() {
     return thread;
 }
 
-/// Reads (search, browse, open, revision lists, drag files) use the library's read-only
-/// connection pool on their own thread, so they never wait behind an import.
+/// Searches use the library's read-only connection pool on their own thread, so they never wait
+/// behind an import; a newer search cancels the running one.
 LibraryTaskThread& read_thread() {
     static LibraryTaskThread thread;
     return thread;
+}
+
+/// Opening items, revision lists and drag files read on a second thread, so they never wait
+/// behind a slow similar-phrase search.
+LibraryTaskThread& browse_thread() {
+    static LibraryTaskThread thread;
+    return thread;
+}
+
+LibraryRow make_row(const search::BrowseRow& browse, const std::string& title);
+
+/// Runs one page of a text search and resolves its display rows.
+struct PageResult {
+    std::vector<LibraryRow> rows;
+    std::optional<search::PageCursor> next;
+    QString error;
+};
+
+PageResult load_page(library::Library& library, const std::string& query, std::optional<search::PageCursor> after,
+                     std::stop_token stop) {
+    PageResult result;
+    library::SearchRequest request;
+    request.query_text = query;
+    request.after = std::move(after);
+    auto page = library.search(request, stop);
+    if (!page) {
+        result.error = QString::fromStdString(page.error().describe());
+        return result;
+    }
+    result.next = page->next;
+    std::vector<std::int64_t> ids;
+    for (const auto& row : page->rows)
+        ids.push_back(row.id);
+    if (auto browse = library.browse_rows_for(ids)) {
+        for (const auto id : ids) // keep the search order
+            for (const auto& browse_row : *browse)
+                if (browse_row.id == id) {
+                    std::string title = browse_row.text[0].empty() ? browse_row.sort_title : browse_row.text[0];
+                    result.rows.push_back(make_row(browse_row, title));
+                }
+    }
+    return result;
 }
 
 LibraryRow make_row(const search::BrowseRow& browse, const std::string& title) {
@@ -190,6 +234,11 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
     model_ = new LibraryResultModel(this);
     table_ = new QTableView(this);
     table_->setModel(model_);
+    // Keyset paging: the next page loads when the list is scrolled near its end.
+    connect(table_->verticalScrollBar(), &QScrollBar::valueChanged, this, [this](int value) {
+        if (value >= table_->verticalScrollBar()->maximum() - 4)
+            fetch_more();
+    });
     table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     table_->verticalHeader()->hide();
     table_->verticalHeader()->setDefaultSectionSize(20);
@@ -295,8 +344,14 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
                 return library.trash(std::vector<std::int64_t>{asset}); // a metadata state; restorable
             });
         });
-        for (int rating = 0; rating <= 5; ++rating)
-            menu.addAction(tr("Rate %1").arg(rating), this, [this, rating] { set_metadata(10 + rating); });
+        auto* rating_menu = menu.addMenu(tr("Rating"));
+        const LibraryRow* current = model_->row_at(table_->currentIndex().row());
+        for (int rating = 0; rating <= 5; ++rating) {
+            auto* action = rating_menu->addAction(rating == 0 ? tr("No rating") : QString(rating, QChar(0x2605)), this,
+                                                  [this, rating] { set_metadata(10 + rating); });
+            action->setCheckable(true);
+            action->setChecked(current && current->rating == rating);
+        }
         menu.exec(table_->viewport()->mapToGlobal(point));
     });
     const QString last = QSettings().value("library/last").toString();
@@ -304,7 +359,15 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
         open_library(std::filesystem::path(last.toStdWString()), false);
 }
 
-LibraryPanel::~LibraryPanel() = default;
+LibraryPanel::~LibraryPanel() {
+    // Background work ends with the panel: a running import sees its stop token, queued work is
+    // dropped, and nothing outlives the window or touches Qt after the application ends.
+    if (search_stop_)
+        search_stop_->request_stop();
+    read_thread().stop();
+    browse_thread().stop();
+    write_thread().stop();
+}
 
 void LibraryPanel::focus_search() {
     search_->setFocus();
@@ -327,7 +390,7 @@ void LibraryPanel::open_library(const std::filesystem::path& root, bool create) 
     write_thread().post([guard, root, create](std::stop_token) {
         auto opened = create ? library::Library::create(root) : library::Library::open(root);
         QMetaObject::invokeMethod(
-            guard.data(),
+            qApp, // context outlives the task; the lambda checks the guard
             [guard, root, opened = std::make_shared<decltype(opened)>(std::move(opened))]() mutable {
                 if (!guard)
                     return;
@@ -359,7 +422,7 @@ void LibraryPanel::import_folder() {
     QPointer<LibraryPanel> guard(this);
     auto library = library_;
     const std::filesystem::path source(directory.toStdWString());
-    write_thread().post([guard, library, source, parser = parser_](std::stop_token stop) {
+    write_thread().post([guard, library, source, parser = import_parser_ ? import_parser_ : parser_](std::stop_token stop) {
         library::ImportOptions options;
         options.parser = parser; // parsing runs in the isolated worker process (section 28.2)
         auto report = library->import_paths({source}, options, stop);
@@ -385,7 +448,7 @@ void LibraryPanel::import_folder() {
                 text += tr("; analyzed %1").arg(analysis->revisions_analyzed);
         }
         QMetaObject::invokeMethod(
-            guard.data(),
+            qApp, // context outlives the task; the lambda checks the guard
             [guard, text] {
                 if (!guard)
                     return;
@@ -397,40 +460,55 @@ void LibraryPanel::import_folder() {
     });
 }
 
+std::stop_token LibraryPanel::restart_search_cancellation() {
+    if (search_stop_)
+        search_stop_->request_stop(); // the running search ends at its next check (section 20.4)
+    search_stop_ = std::make_shared<std::stop_source>();
+    return search_stop_->get_token();
+}
+
 void LibraryPanel::run_search() {
     if (!library_)
         return;
     const std::uint64_t generation = ++*generation_;
+    const auto stop = restart_search_cancellation();
     QPointer<LibraryPanel> guard(this);
     auto library = library_;
-    const std::string query = search_->text().trimmed().toStdString();
-    read_thread().post([guard, library, query, generation, latest = generation_](std::stop_token stop) {
-        if (generation != latest->load())
+    current_query_ = search_->text().trimmed().toStdString();
+    next_page_.reset();
+    fetching_more_ = false;
+    read_thread().post([guard, library, query = current_query_, generation, latest = generation_, stop](std::stop_token) {
+        if (generation != latest->load() || stop.stop_requested())
             return; // a newer search was typed while this one waited in the queue
-        library::SearchRequest request;
-        request.query_text = query;
-        auto page = library->search(request, stop);
-        std::vector<LibraryRow> rows;
-        QString error;
-        if (!page) {
-            error = QString::fromStdString(page.error().describe());
-        } else {
-            std::vector<std::int64_t> ids;
-            for (const auto& row : page->rows)
-                ids.push_back(row.id);
-            auto browse = library->browse_rows_for(ids);
-            if (browse) {
-                for (const auto& browse_row : *browse) {
-                    std::string title = browse_row.text[0].empty() ? browse_row.sort_title : browse_row.text[0];
-                    rows.push_back(make_row(browse_row, title));
-                }
-            }
-        }
+        auto page = std::make_shared<PageResult>(load_page(*library, query, std::nullopt, stop));
         QMetaObject::invokeMethod(
-            guard.data(),
-            [guard, generation, rows = std::move(rows), error]() mutable {
+            qApp, // context outlives the task; the lambda checks the guard
+            [guard, generation, page]() mutable {
                 if (guard)
-                    guard->deliver_results(generation, std::move(rows), error);
+                    guard->deliver_results(generation, std::move(page->rows), page->error, page->next);
+            },
+            Qt::QueuedConnection);
+    });
+}
+
+void LibraryPanel::fetch_more() {
+    if (!library_ || !next_page_ || fetching_more_)
+        return;
+    fetching_more_ = true;
+    const std::uint64_t generation = generation_->load();
+    const auto stop = search_stop_ ? search_stop_->get_token() : std::stop_token{};
+    QPointer<LibraryPanel> guard(this);
+    auto library = library_;
+    read_thread().post([guard, library, query = current_query_, after = *next_page_, generation, latest = generation_,
+                        stop](std::stop_token) {
+        if (generation != latest->load() || stop.stop_requested())
+            return;
+        auto page = std::make_shared<PageResult>(load_page(*library, query, after, stop));
+        QMetaObject::invokeMethod(
+            qApp,
+            [guard, generation, page]() mutable {
+                if (guard)
+                    guard->deliver_results(generation, std::move(page->rows), page->error, page->next, true);
             },
             Qt::QueuedConnection);
     });
@@ -452,12 +530,14 @@ void LibraryPanel::search_melody(std::vector<std::pair<Tick, std::uint8_t>> onse
         notes.push_back(search::QueryNote{onsets_and_pitches[index].first, std::max<Tick>(1, durations[index]),
                                           onsets_and_pitches[index].second, 100});
     const std::uint64_t generation = ++*generation_;
+    const auto search_stop = restart_search_cancellation();
+    next_page_.reset();
     status_->setText(similar ? tr("Searching similar phrases (approximate search)") : tr("Searching the melody"));
     QPointer<LibraryPanel> guard(this);
     auto library = library_;
-    read_thread().post([guard, library, notes = std::move(notes), similar, generation,
-                        latest = generation_](std::stop_token stop) {
-        if (generation != latest->load())
+    read_thread().post([guard, library, notes = std::move(notes), similar, generation, latest = generation_,
+                        stop = search_stop](std::stop_token) {
+        if (generation != latest->load() || stop.stop_requested())
             return;
         std::vector<LibraryRow> rows;
         QString error;
@@ -514,7 +594,7 @@ void LibraryPanel::search_melody(std::vector<std::pair<Tick, std::uint8_t>> onse
             }
         }
         QMetaObject::invokeMethod(
-            guard.data(),
+            qApp, // context outlives the task; the lambda checks the guard
             [guard, generation, rows = std::move(rows), error, label]() mutable {
                 if (!guard)
                     return;
@@ -561,7 +641,7 @@ void LibraryPanel::save_document(std::shared_ptr<const DocumentData> document, s
             }
         }
         QMetaObject::invokeMethod(
-            guard.data(),
+            qApp, // context outlives the task; the lambda checks the guard
             [guard, revision, asset, phrase, origin_guard] {
                 if (!guard)
                     return;
@@ -589,12 +669,12 @@ void LibraryPanel::show_revisions() {
     const QString title = row->title;
     auto library = library_;
     QPointer<LibraryPanel> guard(this);
-    read_thread().post([guard, library, asset_id, title](std::stop_token) {
+    browse_thread().post([guard, library, asset_id, title](std::stop_token) {
         auto revisions = library->revisions(asset_id);
         auto asset = library->asset(asset_id);
         const std::optional<std::int64_t> head = asset && *asset ? (*asset)->current_revision_id : std::nullopt;
         QMetaObject::invokeMethod(
-            guard.data(),
+            qApp, // context outlives the task; the lambda checks the guard
             [guard, asset_id, title, head, revisions = std::make_shared<decltype(revisions)>(std::move(revisions))] {
                 if (guard)
                     guard->present_revisions(asset_id, title, head, *revisions);
@@ -643,7 +723,7 @@ void LibraryPanel::present_revisions(std::int64_t asset_id, const QString& title
         const QString message = restored ? tr("Restored revision as the new head")
                                          : tr("Not restored: %1").arg(QString::fromStdString(restored.error().describe()));
         QMetaObject::invokeMethod(
-            guard.data(),
+            qApp, // context outlives the task; the lambda checks the guard
             [guard, message] {
                 if (!guard)
                     return;
@@ -664,11 +744,11 @@ void LibraryPanel::prepare_drag_file() {
     const std::string title = row->title.toStdString();
     const auto cache = drag_cache_;
     // The file is written and closed in the background before any drag can start.
-    read_thread().post([guard, library, asset_id, title, cache](std::stop_token) {
+    browse_thread().post([guard, library, asset_id, title, cache, parser = parser_](std::stop_token) {
         auto asset = library->asset(asset_id);
         if (!asset || !*asset || !(*asset)->current_revision_id)
             return;
-        auto document = library->open_revision(*(*asset)->current_revision_id);
+        auto document = library->open_revision(*(*asset)->current_revision_id, parser);
         if (!document)
             return;
         midi::ExportOptions options;
@@ -681,7 +761,7 @@ void LibraryPanel::prepare_drag_file() {
             return;
         const QString path = QString::fromStdWString(file->wstring());
         QMetaObject::invokeMethod(
-            guard.data(),
+            qApp, // context outlives the task; the lambda checks the guard
             [guard, asset_id, path] {
                 if (guard)
                     guard->model_->set_drag_file(asset_id, path);
@@ -700,7 +780,7 @@ void LibraryPanel::run_metadata_task(std::function<Status(library::Library&, std
     write_thread().post([guard, library, asset_id, task = std::move(task)](std::stop_token) {
         const Status status = task(*library, asset_id);
         QMetaObject::invokeMethod(
-            guard.data(),
+            qApp, // context outlives the task; the lambda checks the guard
             [guard, status] {
                 if (!guard)
                     return;
@@ -712,18 +792,26 @@ void LibraryPanel::run_metadata_task(std::function<Status(library::Library&, std
     });
 }
 
-void LibraryPanel::deliver_results(std::uint64_t generation, std::vector<LibraryRow> rows, QString error) {
+void LibraryPanel::deliver_results(std::uint64_t generation, std::vector<LibraryRow> rows, QString error,
+                                   std::optional<search::PageCursor> next, bool append) {
     if (generation != generation_->load())
         return; // obsolete generation: dropped (section 20.4)
+    fetching_more_ = false;
     if (!error.isEmpty()) {
         // Previous results stay visible until a valid query is ready (section 25.2).
         status_->setText(tr("Query problem: %1").arg(error));
         return;
     }
-    const auto count = rows.size();
-    model_->set_rows(std::move(rows));
+    if (append)
+        model_->append_rows(std::move(rows));
+    else
+        model_->set_rows(std::move(rows));
+    next_page_ = std::move(next);
+    const int count = model_->rowCount({});
+    // Pages are fetched as the list scrolls; the count says when more exist (no full count query).
     status_->setText(count == 0 ? tr("No match (items still being indexed are not searched musically)")
-                                : tr("%1 result(s)").arg(count));
+                     : next_page_ ? tr("%1+ results (scroll for more)").arg(count)
+                                  : tr("%n result(s)", nullptr, count));
 }
 
 void LibraryPanel::open_selected() {
@@ -734,14 +822,14 @@ void LibraryPanel::open_selected() {
     QPointer<LibraryPanel> guard(this);
     auto library = library_;
     const auto asset_id = row->asset_id;
-    read_thread().post([guard, library, asset_id](std::stop_token) {
+    browse_thread().post([guard, library, asset_id, parser = parser_](std::stop_token) {
         std::optional<DocumentData> document;
         QString error;
         std::int64_t revision_id = 0;
         auto asset = library->asset(asset_id);
         if (asset && *asset && (*asset)->current_revision_id) {
             revision_id = *(*asset)->current_revision_id;
-            auto opened = library->open_revision(revision_id);
+            auto opened = library->open_revision(revision_id, parser);
             if (opened)
                 document = std::move(*opened);
             else
@@ -750,7 +838,7 @@ void LibraryPanel::open_selected() {
             error = tr("This item has no readable revision");
         }
         QMetaObject::invokeMethod(
-            guard.data(),
+            qApp, // context outlives the task; the lambda checks the guard
             [guard, document = std::move(document), error, asset_id, revision_id]() mutable {
                 if (!guard)
                     return;
@@ -775,7 +863,7 @@ void LibraryPanel::set_metadata(int action) {
         const Status status = action == 0 ? library->set_favorite(asset_id, favorite)
                                           : library->set_rating(asset_id, action - 10);
         QMetaObject::invokeMethod(
-            guard.data(),
+            qApp, // context outlives the task; the lambda checks the guard
             [guard, status] {
                 if (!guard)
                     return;

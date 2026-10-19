@@ -43,7 +43,10 @@
 #include <QAbstractButton>
 #include <QAbstractItemView>
 #include <QAbstractSpinBox>
+#include <QAbstractScrollArea>
 #include <QActionGroup>
+#include <QScrollBar>
+#include <QWheelEvent>
 #include <QComboBox>
 #include <QFileInfo>
 #include <QFrame>
@@ -61,6 +64,7 @@
 #include <QScreen>
 #include <QSettings>
 #include <QStatusBar>
+#include <QTabBar>
 #include <QTabWidget>
 #include <QTextBrowser>
 #include <QToolBar>
@@ -155,10 +159,13 @@ MainWindow::MainWindow(StartupOptions options, app::DataDirectories directories,
     library_->set_drag_cache(directories_.drag_cache);
     io_thread_ = std::make_unique<TaskThread>();
     parser_ = std::make_shared<app::WorkerParser>(to_path(QCoreApplication::applicationDirPath()) / "mwb-worker.exe");
-    library_->set_parser([parser = parser_](std::span<const std::uint8_t> bytes, std::string_view name,
-                                            const midi::ParseLimits& limits, std::stop_token stop) {
-        return parser->parse(bytes, name, limits, std::move(stop));
-    });
+    import_parser_ = std::make_shared<app::WorkerParser>(to_path(QCoreApplication::applicationDirPath()) / "mwb-worker.exe");
+    const auto bind = [](std::shared_ptr<app::WorkerParser> parser) {
+        return [parser](std::span<const std::uint8_t> bytes, std::string_view name, const midi::ParseLimits& limits,
+                        std::stop_token stop) { return parser->parse(bytes, name, limits, std::move(stop)); };
+    };
+    library_->set_parser(bind(parser_));
+    library_->set_import_parser(bind(import_parser_));
     build_actions();
     build_toolbar();
     build_menus();
@@ -260,6 +267,8 @@ MainWindow::~MainWindow() {
     transport_timer_.stop();
     recovery_timer_.stop();
     playback_->panic(false);
+    io_thread_.reset(); // joins a pending open or export
+    stop_recovery_thread(); // queued clean closes land before the process ends
 }
 
 EditorTab* MainWindow::current_tab() const { return qobject_cast<EditorTab*>(tabs_->currentWidget()); }
@@ -317,7 +326,8 @@ void MainWindow::build_actions() {
     add_command("edit.paste", tr("&Paste at Edit Cursor"), QKeySequence(Qt::CTRL | Qt::Key_V), [this] { paste_at_cursor(); });
     add_command("edit.duplicate", tr("&Duplicate After Selection"), QKeySequence(Qt::CTRL | Qt::Key_D),
                 [this] { duplicate_selection(); });
-    add_command("edit.delete", tr("De&lete"), QKeySequence(Qt::Key_Delete), [this] { delete_selection(); });
+    add_command("edit.delete", tr("De&lete"), QKeySequence(Qt::Key_Delete), [this] { delete_selection(); })
+        ->setShortcuts({QKeySequence(Qt::Key_Delete), QKeySequence(Qt::Key_Backspace)});
     add_command("edit.select_all", tr("Select &All"), QKeySequence(Qt::CTRL | Qt::Key_A),
                 with_tab([](EditorTab& tab) { tab.piano_roll().select_all(); }));
     add_command("edit.invert_selection", tr("&Invert Selection"), {},
@@ -335,8 +345,12 @@ void MainWindow::build_actions() {
                 [this] { transpose_selection_by_degree(1); });
     add_command("edit.degree_down", tr("Move Down a Scale Degree"), QKeySequence(Qt::CTRL | Qt::Key_Down),
                 [this] { transpose_selection_by_degree(-1); });
-    add_command("edit.move_left", tr("Move Left by Grid"), QKeySequence(Qt::Key_Left), [this] { move_selection_by_grid(-1); });
-    add_command("edit.move_right", tr("Move Right by Grid"), QKeySequence(Qt::Key_Right), [this] { move_selection_by_grid(1); });
+    // Left/Right: with notes selected they move the notes; otherwise they move the red transport
+    // line (the play position) one grid step, also while playing.
+    add_command("edit.move_left", tr("Move Notes or Play Position Left"), QKeySequence(Qt::Key_Left),
+                [this] { move_selection_by_grid(-1); });
+    add_command("edit.move_right", tr("Move Notes or Play Position Right"), QKeySequence(Qt::Key_Right),
+                [this] { move_selection_by_grid(1); });
     add_command("edit.quantize_last", tr("Apply Last &Quantize"), QKeySequence(Qt::Key_Q), [this] { inspector_->apply_last_quantize(); });
     add_command("edit.quantize_panel", tr("Quantize Panel…"), QKeySequence(Qt::CTRL | Qt::Key_Q), [this] {
         inspector_dock_->show();
@@ -649,9 +663,9 @@ void MainWindow::build_docks() {
     library_dock_->setWidget(library_);
     addDockWidget(Qt::LeftDockWidgetArea, library_dock_);
     connect(library_, &LibraryPanel::open_requested, this, [this](DocumentData document, qint64 asset, qint64 revision) {
-        open_document(std::move(document), std::nullopt, false);
-        if (auto* tab = current_tab())
+        open_prepared(std::move(document), false, [this, asset, revision](EditorTab* tab) {
             library_sources_[tab] = {asset, revision};
+        });
     });
     connect(library_, &LibraryPanel::saved, this, [this](qint64 asset, qint64 revision, bool phrase, QObject* origin) {
         // Only a whole-document save maps a tab to a library item, and only the tab that asked.
@@ -780,7 +794,7 @@ void MainWindow::build_toolbar() {
     position->setObjectName("transport.position");
     position->setFont(mono_font());
     // Fixed width: the toolbar never reflows while the readout changes.
-    position->setFixedWidth(QFontMetrics(mono_font()).horizontalAdvance(QStringLiteral("0000.00.000   ♩=000.0  00/00   Recording *")) + 20);
+    position->setFixedWidth(QFontMetrics(mono_font()).horizontalAdvance(QStringLiteral("000.00.000  ♩=000.0  00/00  Pause *")) + 16);
     position->setToolTip(tr("Transport position (bar.beat.tick) and state"));
     transport_bar_->addWidget(position);
     position_label_ = position;
@@ -813,9 +827,9 @@ void MainWindow::build_toolbar() {
     command_search_ = new QLineEdit(this);
     command_search_->setPlaceholderText(tr("Search commands  (Ctrl+Shift+P)"));
     command_search_->setAccessibleName(tr("Search commands"));
-    command_search_->setMaximumWidth(240);
+    command_search_->setFixedWidth(230);
     command_search_->setClearButtonEnabled(false);
-    transport_bar_->addWidget(command_search_);
+    menuBar()->setCornerWidget(command_search_, Qt::TopRightCorner); // keeps the toolbar uncrowded
     // Typing or clicking here opens the command palette (the palette does the searching).
     connect(command_search_, &QLineEdit::textEdited, this, [this] {
         command_search_->clear();
@@ -884,6 +898,18 @@ void MainWindow::open_document(DocumentData document, std::optional<std::filesys
     auto* tab = new EditorTab(std::move(controller));
     connect_tab(tab);
     const int index = tabs_->addTab(tab, title + (recovered ? tr(" (recovered)") : QString()));
+    // A quiet close button in the theme's text color (the style's default is a red square).
+    auto* close = new QToolButton(tabs_);
+    close->setAutoRaise(true);
+    close->setIcon(make_icon(IconId::close));
+    close->setIconSize(QSize(14, 14));
+    close->setToolTip(tr("Close %1").arg(title));
+    close->setAccessibleName(tr("Close %1").arg(title));
+    connect(close, &QToolButton::clicked, this, [this, guard = QPointer<EditorTab>(tab)] {
+        if (guard)
+            close_tab(tabs_->indexOf(guard));
+    });
+    tabs_->tabBar()->setTabButton(index, QTabBar::RightSide, close);
     tabs_->setCurrentIndex(index);
     tab->set_keyboard_visible(keyboard_action_ && keyboard_action_->isChecked());
     tab->piano_roll().fit_all();
@@ -915,11 +941,13 @@ bool MainWindow::open_path(const std::filesystem::path& path) {
                 const auto utf8 = path.u8string();
                 source.file_path_utf8 = std::string(utf8.begin(), utf8.end());
             }
-            if (auto created = document::RecoveryJournal::create(recovery_directory, (*opened)->document, source))
+            if (auto created = document::RecoveryJournal::create(recovery_directory, (*opened)->document, source)) {
                 journal = std::move(*created);
+                journal->set_discard_if_unused(true); // an untouched opened file needs no recovery
+            }
         }
         QMetaObject::invokeMethod(
-            guard.data(),
+            qApp, // context outlives the task; the lambda checks the guard
             [guard, path, opened, journal] {
                 if (guard)
                     guard->finish_open(path, std::move(*opened), journal);
@@ -1070,7 +1098,7 @@ void MainWindow::update_command_state() {
     for (auto* action : commands_) {
         const QString id = action->data().toString();
         const bool needs_selection = id.startsWith("edit.transpose") || id.startsWith("edit.octave") ||
-                                     id.startsWith("edit.degree") || id.startsWith("edit.move") || id == "edit.cut" ||
+                                     id.startsWith("edit.degree") || id == "edit.cut" ||
                                      id == "edit.copy" || id == "edit.duplicate" || id == "edit.delete";
         if (needs_selection) {
             const bool enabled = has_tab && !tab->controller().selection().empty();
@@ -1142,7 +1170,7 @@ void MainWindow::export_current_midi() {
         else if (auto written = app::write_file_atomically(target, *bytes, true); !written)
             error = QString::fromStdString(written.error().describe());
         QMetaObject::invokeMethod(
-            guard.data(),
+            qApp, // context outlives the task; the lambda checks the guard
             [guard, report, error] {
                 if (!guard)
                     return;
@@ -1239,15 +1267,61 @@ void MainWindow::flush_recovery() {
     }
 }
 
+void MainWindow::open_prepared(DocumentData document, bool recovered, std::function<void(EditorTab*)> opened) {
+    ++pending_opens_;
+    QPointer<MainWindow> guard(this);
+    const auto recovery_directory = directories_.recovery;
+    auto shared = std::make_shared<DocumentData>(std::move(document));
+    io_thread_->post([guard, shared, recovered, recovery_directory, opened = std::move(opened)](std::stop_token) {
+        document::SourceReference source;
+        source.document_name = shared->title;
+        std::shared_ptr<document::RecoveryJournal> journal;
+        if (auto created = document::RecoveryJournal::create(recovery_directory, *shared, source)) {
+            journal = std::move(*created);
+            journal->set_discard_if_unused(!recovered);
+        }
+        QMetaObject::invokeMethod(
+            qApp,
+            [guard, shared, recovered, journal, opened] {
+                if (!guard)
+                    return;
+                --guard->pending_opens_;
+                guard->open_document(std::move(*shared), std::nullopt, recovered, journal);
+                if (opened)
+                    if (auto* tab = guard->current_tab())
+                        opened(tab);
+            },
+            Qt::QueuedConnection);
+    });
+}
+
 void MainWindow::offer_recovery() {
-    auto sessions = document::list_recoverable_sessions(directories_.recovery);
-    if (!sessions) {
-        statusBar()->showMessage(tr("Could not read recovery data: %1").arg(QString::fromStdString(sessions.error().describe())), 8000);
-        return;
-    }
+    // Listing reads SQLite: done on the I/O thread; the dialog appears when the list arrives.
+    QPointer<MainWindow> guard(this);
+    const auto recovery_directory = directories_.recovery;
+    io_thread_->post([guard, recovery_directory](std::stop_token) {
+        auto sessions = std::make_shared<Result<std::vector<document::RecoverableSession>>>(
+            document::list_recoverable_sessions(recovery_directory));
+        QMetaObject::invokeMethod(
+            qApp,
+            [guard, sessions] {
+                if (!guard)
+                    return;
+                if (!*sessions) {
+                    guard->statusBar()->showMessage(
+                        tr("Could not read recovery data: %1").arg(QString::fromStdString(sessions->error().describe())), 8000);
+                    return;
+                }
+                guard->present_recovery(std::move(**sessions));
+            },
+            Qt::QueuedConnection);
+    });
+}
+
+void MainWindow::present_recovery(std::vector<document::RecoverableSession> sessions) {
     // Exclude sessions this process owns.
     std::vector<document::RecoverableSession> candidates;
-    for (const auto& session : *sessions) {
+    for (const auto& session : sessions) {
         bool own = false;
         for (int index = 0; index < tabs_->count(); ++index)
             if (auto* tab = qobject_cast<EditorTab*>(tabs_->widget(index)); tab && tab->controller().recovery_journal() &&
@@ -1294,24 +1368,50 @@ void MainWindow::offer_recovery() {
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
     if (dialog.exec() != QDialog::Accepted)
         return;
-    for (int row = 0; row < list->count(); ++row) {
-        if (list->item(row)->checkState() != Qt::Checked)
-            continue;
-        const auto& session = candidates[static_cast<std::size_t>(row)];
-        if (!discard_chosen) {
-            auto recovered = document::recover_session(directories_.recovery, session.session_id);
-            if (!recovered) {
-                QMessageBox::warning(this, tr("Recovery"), QString::fromStdString(recovered.error().describe()));
-                continue;
+    std::vector<Uuid> chosen;
+    for (int row = 0; row < list->count(); ++row)
+        if (list->item(row)->checkState() == Qt::Checked)
+            chosen.push_back(candidates[static_cast<std::size_t>(row)].session_id);
+    // Replay and discard read and write SQLite: the I/O thread does them, then tabs open here.
+    QPointer<MainWindow> guard(this);
+    const auto recovery_directory = directories_.recovery;
+    io_thread_->post([guard, recovery_directory, chosen, discard_chosen](std::stop_token) {
+        for (const auto& session_id : chosen) {
+            if (!discard_chosen) {
+                auto recovered = std::make_shared<Result<document::RecoveredDocument>>(
+                    document::recover_session(recovery_directory, session_id));
+                std::shared_ptr<document::RecoveryJournal> journal;
+                if (*recovered) {
+                    document::SourceReference source;
+                    source.document_name = (*recovered)->document.title;
+                    if (auto created = document::RecoveryJournal::create(recovery_directory, (*recovered)->document, source))
+                        journal = std::move(*created);
+                }
+                QMetaObject::invokeMethod(
+                    qApp,
+                    [guard, recovered, journal] {
+                        if (!guard)
+                            return;
+                        if (!*recovered) {
+                            QMessageBox::warning(guard, tr("Recovery"), QString::fromStdString(recovered->error().describe()));
+                            return;
+                        }
+                        const auto report = (*recovered)->report;
+                        guard->open_document(std::move((*recovered)->document), std::nullopt, true, journal);
+                        guard->statusBar()->showMessage(
+                            tr("Recovered %1 edit(s)%2")
+                                .arg(report.applied_commands)
+                                .arg(report.stop_reason ? tr("; stopped: %1").arg(QString::fromStdString(*report.stop_reason))
+                                                        : QString()),
+                            10000);
+                    },
+                    Qt::QueuedConnection);
+                if (!*recovered)
+                    continue; // keep the evidence of a session that could not be recovered
             }
-            const auto report = recovered->report;
-            open_document(std::move(recovered->document), std::nullopt, true);
-            statusBar()->showMessage(tr("Recovered %1 edit(s)%2").arg(report.applied_commands)
-                                         .arg(report.stop_reason ? tr("; stopped: %1").arg(QString::fromStdString(*report.stop_reason)) : QString()),
-                                     10000);
+            std::ignore = document::discard_recovery_session(recovery_directory, session_id); // evidence no longer needed
         }
-        std::ignore = document::discard_recovery_session(directories_.recovery, session.session_id); // evidence no longer needed
-    }
+    });
 }
 
 // --- Editing commands ----------------------------------------------------------------------------
@@ -1365,9 +1465,21 @@ void MainWindow::transpose_selection_by_degree(int degrees) {
 
 void MainWindow::move_selection_by_grid(int direction) {
     auto* tab = current_tab();
-    if (!tab || tab->controller().selection().empty())
+    if (!tab)
         return;
     auto& controller = tab->controller();
+    if (controller.selection().empty()) {
+        const auto grid = tab->piano_roll().grid();
+        const auto display = playback_->display();
+        const bool rolling = !transport_display_is_stopped(display) && transport_owner_ == &controller;
+        const Tick from = rolling ? display.position : controller.edit_cursor();
+        const Tick to = direction < 0 ? std::max<Tick>(0, grid.floor(from > 0 ? from - 1 : 0)) : grid.next(from);
+        if (rolling)
+            playback_->seek(to); // the playhead jumps; playback continues from there
+        controller.set_edit_cursor(to);
+        tab->piano_roll().scroll_to_tick(to);
+        return;
+    }
     music::TargetSelection selection{controller.active_sequence().id, {controller.active_track()},
                                      std::vector<EventId>(controller.selection().begin(), controller.selection().end()), {}};
     music::MoveParameters parameters;
@@ -1486,17 +1598,17 @@ void MainWindow::update_status_from_transport() {
     const auto display = playback_->display();
     QString state;
     switch (display.state) {
-    case TransportDisplay::State::stopped: state = tr("Stopped"); break;
-    case TransportDisplay::State::playing: state = tr("Playing"); break;
-    case TransportDisplay::State::paused: state = tr("Paused"); break;
-    case TransportDisplay::State::counting_in: state = tr("Count-in"); break;
-    case TransportDisplay::State::recording: state = tr("● Recording"); break;
-    case TransportDisplay::State::device_lost: state = tr("Audio device lost"); break;
+    case TransportDisplay::State::stopped: state = tr("Stop"); break;
+    case TransportDisplay::State::playing: state = tr("Play"); break;
+    case TransportDisplay::State::paused: state = tr("Pause"); break;
+    case TransportDisplay::State::counting_in: state = tr("Count"); break;
+    case TransportDisplay::State::recording: state = tr("● Rec"); break;
+    case TransportDisplay::State::device_lost: state = tr("! No audio"); break;
     }
     if (transport_owner_) {
         const auto& meter = transport_owner_->meter_map().segment_at(display.position);
         const double bpm = 60'000'000.0 / static_cast<double>(transport_owner_->tempo_map().tempo_at(display.position));
-        position_label_->setText(QString("%1   %2  %3/%4   %5%6")
+        position_label_->setText(QString("%1  %2  %3/%4  %5%6")
                                      .arg(QString::fromStdString(transport_owner_->meter_map().format(display.position)))
                                      .arg(tr("♩=%1").arg(QString::number(bpm, 'f', bpm == std::floor(bpm) ? 0 : 1)))
                                      .arg(meter.numerator)
@@ -1526,6 +1638,19 @@ void MainWindow::update_status_from_transport() {
 // --- Keyboard playing mode -----------------------------------------------------------------------
 
 bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
+    // The mouse wheel over a spin box or combo box that is not being edited scrolls the panel
+    // instead of silently changing the value (each change would be a document edit).
+    if (event->type() == QEvent::Wheel) {
+        auto* widget = qobject_cast<QWidget*>(watched);
+        if (widget && !widget->hasFocus() && (qobject_cast<QAbstractSpinBox*>(widget) || qobject_cast<QComboBox*>(widget))) {
+            for (QWidget* parent = widget->parentWidget(); parent; parent = parent->parentWidget())
+                if (auto* area = qobject_cast<QAbstractScrollArea*>(parent)) {
+                    QCoreApplication::sendEvent(area->verticalScrollBar(), event);
+                    break;
+                }
+            return true;
+        }
+    }
     // Single-key window shortcuts (Space, arrows, letters, digits) must not take keys from a
     // focused button, check box, combo box, list, table or spin box: accepting ShortcutOverride
     // hands the key to the control. Modified shortcuts, F-keys and Escape still work everywhere,
@@ -1698,6 +1823,7 @@ void MainWindow::write_screenshot_and_exit() {
     if (!options_.screenshot.empty()) {
         if (auto* tab = current_tab())
             tab->piano_roll().fit_all();
+        update_status_from_transport();
         // Let queued layout requests settle (text set after a file opened changes size hints).
         for (int pass = 0; pass < 3; ++pass)
             QApplication::processEvents();

@@ -10,7 +10,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <condition_variable>
+#include <deque>
 #include <future>
+#include <thread>
 #include <memory>
 #include <limits>
 #include <system_error>
@@ -115,6 +118,53 @@ std::string kind_label(CommandKind kind) {
 
 constexpr auto generation_limit = static_cast<Generation>(std::numeric_limits<std::int64_t>::max());
 
+/// One background thread that computes semantic hashes for every journal in order, so recording
+/// an edit never waits for an O(document) hash and never starts a thread per edit. Queued work
+/// runs before the thread exits (a future must never be abandoned).
+class HashExecutor {
+public:
+    HashExecutor()
+        : thread_([this](std::stop_token stop) {
+              while (true) {
+                  std::packaged_task<Sha256Digest()> task;
+                  {
+                      std::unique_lock lock(mutex_);
+                      wake_.wait(lock, stop, [this] { return !tasks_.empty(); });
+                      if (tasks_.empty())
+                          return; // stop requested and nothing left
+                      task = std::move(tasks_.front());
+                      tasks_.pop_front();
+                  }
+                  task();
+              }
+          }) {}
+    ~HashExecutor() {
+        thread_.request_stop();
+        wake_.notify_all();
+    }
+    std::shared_future<Sha256Digest> submit(std::shared_ptr<const DocumentData> snapshot) {
+        std::packaged_task<Sha256Digest()> task([snapshot = std::move(snapshot)] { return semantic_hash(*snapshot); });
+        auto future = task.get_future().share();
+        {
+            std::lock_guard lock(mutex_);
+            tasks_.push_back(std::move(task));
+        }
+        wake_.notify_all();
+        return future;
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable_any wake_;
+    std::deque<std::packaged_task<Sha256Digest()>> tasks_;
+    std::jthread thread_;
+};
+
+HashExecutor& hash_executor() {
+    static HashExecutor executor;
+    return executor;
+}
+
 } // namespace
 
 // --- RecoveryJournal ----------------------------------------------------------------------------
@@ -127,7 +177,20 @@ RecoveryJournal::RecoveryJournal(std::unique_ptr<SQLite::Database> database, Uui
       policy_(policy),
       clock_(std::move(clock)) {}
 
-RecoveryJournal::~RecoveryJournal() = default;
+RecoveryJournal::~RecoveryJournal() {
+    bool unused = false;
+    {
+        std::lock_guard state_lock(state_mutex_);
+        unused = discard_if_unused_ && last_command_no_ == 0;
+    }
+    if (unused)
+        std::ignore = mark_cleanly_closed(); // nothing beyond the opened file to recover
+}
+
+void RecoveryJournal::set_discard_if_unused(bool discard) {
+    std::lock_guard state_lock(state_mutex_);
+    discard_if_unused_ = discard;
+}
 
 Result<std::unique_ptr<RecoveryJournal>> RecoveryJournal::create(const std::filesystem::path& directory,
                                                                  const DocumentData& document, SourceReference source,
@@ -195,25 +258,20 @@ Status RecoveryJournal::record(CommandKind kind, const ChangeSet& applied, Gener
     if (result_generation <= base_generation || result_generation > generation_limit)
         return make_error(ErrorCode::invalid_argument, "recovery journal generation must increase");
 
-    CommandEnvelope envelope;
-    envelope.command_id = Uuid::generate();
-    envelope.kind = kind;
-    envelope.base_semantic_hash = last_hash_.get();
-    envelope.base_generation = base_generation;
-    envelope.result_generation = result_generation;
-    envelope.changes = applied;
-    auto payload = encode_command(envelope);
-    if (!payload)
-        return std::unexpected(std::move(payload).error().with_context("journaling " + kind_label(kind)));
-
+    // Recording is O(change): the envelope is encoded at flush time on the recovery thread, once
+    // the base document's hash (computed in the background) is available.
     PendingCommand command;
     command.command_no = last_command_no_ + 1;
     command.base_generation = base_generation;
     command.result_generation = result_generation;
-    command.checksum = sha256(*payload);
     command.created_ms = clock_();
-    command.payload = std::move(*payload);
-    const std::size_t payload_size = command.payload.size();
+    command.envelope.command_id = Uuid::generate();
+    command.envelope.kind = kind;
+    command.envelope.base_generation = base_generation;
+    command.envelope.result_generation = result_generation;
+    command.envelope.changes = applied;
+    command.base_hash = last_hash_;
+    const std::size_t payload_size = applied.memory_estimate();
     pending_.push_back(std::move(command));
 
     last_command_no_ += 1;
@@ -221,7 +279,7 @@ Status RecoveryJournal::record(CommandKind kind, const ChangeSet& applied, Gener
     // Hashing and checkpoint serialization are O(document) (about 40 ms and 1.4 s at 100k events):
     // both run on background threads from one immutable copy (a few ms), never on the GUI thread.
     auto snapshot = std::make_shared<const DocumentData>(result_document);
-    last_hash_ = std::async(std::launch::async, [snapshot] { return semantic_hash(*snapshot); }).share();
+    last_hash_ = hash_executor().submit(snapshot);
     commands_since_checkpoint_ += 1;
     bytes_since_checkpoint_ += payload_size;
 
@@ -286,6 +344,23 @@ Status RecoveryJournal::flush(bool wait_for_checkpoint) {
     }
     if (batch.empty() && !checkpoint && !source_changed)
         return ok();
+    // Encode deferred envelopes now (waits only for background hashes, on this thread).
+    for (auto& command : batch) {
+        if (command.encoded)
+            continue;
+        command.envelope.base_semantic_hash = command.base_hash.get();
+        auto payload = encode_command(command.envelope);
+        if (!payload) {
+            std::lock_guard state_lock(state_mutex_);
+            batch.insert(batch.end(), std::make_move_iterator(pending_.begin()), std::make_move_iterator(pending_.end()));
+            pending_ = std::move(batch);
+            return std::unexpected(std::move(payload).error().with_context("journaling " + kind_label(command.envelope.kind)));
+        }
+        command.payload = std::move(*payload);
+        command.checksum = sha256(command.payload);
+        command.encoded = true;
+        command.envelope.changes = {}; // the payload now carries it
+    }
     const auto restore = [&] {
         // On failure the buffer is kept: put the batch back in front of newer commands.
         std::lock_guard state_lock(state_mutex_);

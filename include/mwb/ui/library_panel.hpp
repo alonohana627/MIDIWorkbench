@@ -4,6 +4,7 @@
 #include "mwb/core/model.hpp"
 #include "mwb/library/library.hpp"
 #include "mwb/midi/codec.hpp"
+#include "mwb/search/sql.hpp"
 
 #include <QAbstractTableModel>
 #include <QTimer>
@@ -15,6 +16,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <stop_token>
 #include <thread>
 #include <vector>
 
@@ -82,8 +84,10 @@ public:
     void focus_search();
     /// Directory for temporary .mid files dragged out to DAWs.
     void set_drag_cache(std::filesystem::path cache) { drag_cache_ = std::move(cache); }
-    /// Parser used for imports (the application passes the isolated worker).
+    /// Parser for opening items, and a separate one for imports, so an import never delays an open
+    /// (the application passes two isolated worker processes).
     void set_parser(midi::MidiParser parser) { parser_ = std::move(parser); }
+    void set_import_parser(midi::MidiParser parser) { import_parser_ = std::move(parser); }
     /// Musical content search with notes taken from the editor selection (section 5.3):
     /// transposition-invariant exact matches, or similar phrases with explained scores.
     void search_melody(std::vector<std::pair<Tick, std::uint8_t>> onsets_and_pitches, std::vector<Tick> durations,
@@ -113,7 +117,12 @@ private:
     void import_folder();
     void run_search();
     void open_selected();
-    void deliver_results(std::uint64_t generation, std::vector<LibraryRow> rows, QString error);
+    void deliver_results(std::uint64_t generation, std::vector<LibraryRow> rows, QString error,
+                         std::optional<search::PageCursor> next = std::nullopt, bool append = false);
+    /// Loads the next page of the current text search (keyset cursor) when scrolled to the end.
+    void fetch_more();
+    /// Cancels in-flight searches (a newer one replaces them) and returns the new request's token.
+    std::stop_token restart_search_cancellation();
     void set_metadata(int column_kind);
     void prepare_drag_file();
     /// Runs one metadata change on the library thread, then refreshes the results.
@@ -133,6 +142,11 @@ private:
     QStackedWidget* pages_ = nullptr;
     QLabel* empty_status_ = nullptr;
     midi::MidiParser parser_;
+    midi::MidiParser import_parser_;
+    std::shared_ptr<std::stop_source> search_stop_;
+    std::optional<search::PageCursor> next_page_;
+    std::string current_query_;
+    bool fetching_more_ = false;
 };
 
 } // namespace mwb::ui

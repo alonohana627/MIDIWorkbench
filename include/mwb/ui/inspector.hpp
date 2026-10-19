@@ -54,6 +54,10 @@ private:
     /// Chooses a transform tool without moving keyboard focus.
     void select_tool(const QString& tool_id);
     void load_tool_defaults();
+    /// Shows only the fields the chosen tool uses, with tool-specific labels.
+    void update_tool_rows();
+    /// Start and length readouts in bar.beat.tick next to the tick values.
+    void update_position_suffixes();
     void update_parameters_from_form();
     void preview();
     void apply_preview();
@@ -104,6 +108,8 @@ private:
     QSpinBox* seed_ = nullptr;
     QComboBox* grid_ = nullptr;
     QPlainTextEdit* parameters_ = nullptr;
+    QFormLayout* transform_form_ = nullptr;
+    QCheckBox* advanced_ = nullptr;
     QLabel* report_ = nullptr;
     std::unique_ptr<music::TransformPreview> pending_;
     std::uint64_t pending_generation_ = 0;

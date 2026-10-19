@@ -1192,3 +1192,24 @@ TEST_SUITE("transform") {
         }
     }
 }
+
+TEST_SUITE("transform") {
+    // code-core-1 through the NoteEditor path used by arrow-key nudge and transpose.
+    TEST_CASE("move and transpose keep a zero-length note terminated") {
+        DocumentData document = make_document({{0, 480, 48}});
+        const TrackId track = document.sequences.front().tracks.front().id;
+        ChangeBuilder add(document, "add");
+        std::ignore = add.add_note(track, 960, 960, 0, 60, 100);
+        document = applied(document, add.finish());
+        CHECK(notes_of(document) == std::vector<SimpleNote>{{0, 480, 48, 100}, {960, 960, 60, 100}});
+        MoveParameters move;
+        move.ticks = 240;
+        document = run(document, move_notes(document, select_all(document), move));
+        CHECK(notes_of(document) == std::vector<SimpleNote>{{240, 720, 48, 100}, {1200, 1200, 60, 100}});
+        TransposeParameters up;
+        up.amount = 2;
+        document = run(document, transpose(document, select_all(document), up));
+        CHECK(notes_of(document) == std::vector<SimpleNote>{{240, 720, 50, 100}, {1200, 1200, 62, 100}});
+        CHECK(pair_notes(document.sequences.front()).orphan_ends.empty());
+    }
+}

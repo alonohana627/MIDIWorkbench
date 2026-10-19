@@ -15,6 +15,8 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 
+#include <algorithm>
+
 namespace mwb::ui {
 
 namespace {
@@ -39,6 +41,9 @@ TrackListWidget::TrackListWidget(DocumentController& controller, QWidget* parent
     table_->verticalHeader()->hide();
     table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     table_->setSelectionMode(QAbstractItemView::SingleSelection);
+    // Typing never renames a track (letters and digits are editor commands); F2 or a
+    // double-click does.
+    table_->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed);
     table_->setAccessibleName(tr("Tracks"));
     table_->setToolTip(tr("M mute, S solo. Recording goes to the selected track. Double-click a name to rename."));
     auto* buttons = new QHBoxLayout;
@@ -104,6 +109,7 @@ void TrackListWidget::rebuild() {
         delete_button_->setEnabled(tracks.size() > 1); // a sequence keeps at least one track
         delete_button_->setToolTip(tracks.size() > 1 ? tr("Delete active track") : tr("The last track cannot be deleted"));
     }
+    const int current_column = table_->currentColumn();
     table_->setRowCount(static_cast<int>(tracks.size()));
     const auto active = controller_.active_track_index();
     for (std::size_t index = 0; index < tracks.size(); ++index) {
@@ -126,8 +132,9 @@ void TrackListWidget::rebuild() {
         check(column_mute, track.muted, tr("Mute %1").arg(track_name));
         check(column_solo, track.solo, tr("Solo %1").arg(track_name));
     }
+    // Keep the focused column (Mute or Solo stays current after it was toggled from the keyboard).
     if (active)
-        table_->setCurrentCell(static_cast<int>(*active), column_name);
+        table_->setCurrentCell(static_cast<int>(*active), std::max(current_column, 0));
     rebuilding_ = false;
 }
 

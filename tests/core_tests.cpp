@@ -456,3 +456,53 @@ TEST_SUITE("core") {
         CHECK_FALSE(has_errors(validate_document(document)));
     }
 }
+
+TEST_SUITE("changes") {
+    // code-core-1: the end of an edited zero-length note must stay after its own start, or the
+    // note-on becomes unterminated and the note-off an orphan.
+    TEST_CASE("zero-length notes keep their note-off after the note-on through every edit") {
+        DocumentData document = make_blank_document();
+        const SequenceId sequence = document.sequences.front().id;
+        const TrackId track = document.sequences.front().tracks.front().id;
+        ChangeBuilder add(document, "add");
+        const EventId note = add.add_note(track, 500, 500, 0, 60, 100);
+        REQUIRE(apply_change_set(document, add.finish()));
+        const auto check_single_zero_length = [&](const DocumentData& doc, Tick at, int pitch, std::size_t count) {
+            const auto pairing = pair_notes(doc.sequences.front());
+            CHECK(pairing.orphan_ends.empty());
+            REQUIRE(pairing.notes.size() == count);
+            bool found = false;
+            for (const auto& span : pairing.notes)
+                if (span.start == at && span.pitch == pitch) {
+                    found = true;
+                    CHECK(span.off_id.has_value());
+                    CHECK(span.end == at);
+                }
+            CHECK(found);
+        };
+        check_single_zero_length(document, 500, 60, 1);
+
+        // Move, transpose and velocity edit in one update.
+        const NoteUpdate update{note, 900, 900, 64, 80, 0, 0};
+        auto moved = update_notes(document, sequence, std::span(&update, 1));
+        REQUIRE(moved);
+        REQUIRE(apply_change_set(document, *moved));
+        check_single_zero_length(document, 900, 64, 1);
+
+        // Moving it onto a tick that already holds another note's events.
+        ChangeBuilder other(document, "other");
+        std::ignore = other.add_note(track, 100, 300, 0, 64, 90);
+        REQUIRE(apply_change_set(document, other.finish()));
+        const NoteUpdate onto{note, 300, 300, 64, 80, 0, 0};
+        auto onto_changes = update_notes(document, sequence, std::span(&onto, 1));
+        REQUIRE(onto_changes);
+        REQUIRE(apply_change_set(document, *onto_changes));
+        check_single_zero_length(document, 300, 64, 2);
+
+        // Duplicating it keeps the copy's end after its start too.
+        auto copy = duplicate_notes(document, sequence, std::span(&note, 1), 960);
+        REQUIRE(copy);
+        REQUIRE(apply_change_set(document, copy->changes));
+        check_single_zero_length(document, 1260, 64, 3);
+    }
+}

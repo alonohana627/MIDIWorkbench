@@ -531,6 +531,13 @@ struct NullHub {
     std::vector<NullInput*> inputs;
 };
 
+/// One loopback port pair per process, like a real loopback device: the playback router, the
+/// recording input and tests each create their own backend and still see each other's messages.
+std::shared_ptr<NullHub> process_hub() {
+    static const auto hub = std::make_shared<NullHub>();
+    return hub;
+}
+
 class NullInput final : public IMidiInput {
 public:
     NullInput(MidiPortInfo info, const MidiInputOptions& options, std::shared_ptr<NullHub> hub)
@@ -618,7 +625,7 @@ public:
     }
 
 private:
-    std::shared_ptr<NullHub> hub_ = std::make_shared<NullHub>();
+    std::shared_ptr<NullHub> hub_ = process_hub();
 };
 
 } // namespace

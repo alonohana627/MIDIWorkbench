@@ -1,15 +1,20 @@
 #include "test_support.hpp"
 
 #include "mwb/core/note_edit.hpp"
+#include "mwb/app/environment.hpp"
 #include "mwb/core/serialization.hpp"
 #include "mwb/document/recovery.hpp"
 #include "mwb/document/session.hpp"
+#include "mwb/platform/midi_backend.hpp"
 #include "mwb/ui/clipboard.hpp"
 #include "mwb/ui/document_controller.hpp"
 #include "mwb/ui/drag_export.hpp"
 #include "mwb/ui/editor_math.hpp"
 #include "mwb/ui/keyboard_widget.hpp"
 #include "mwb/ui/controller_lane.hpp"
+#include "mwb/ui/editor_tab.hpp"
+#include "mwb/ui/event_list.hpp"
+#include "mwb/ui/main_window.hpp"
 #include "mwb/ui/piano_roll.hpp"
 #include "mwb/ui/playback_service.hpp"
 #include "mwb/ui/recording_controller.hpp"
@@ -18,7 +23,15 @@
 #include <QApplication>
 
 #include <chrono>
+#include <QCheckBox>
+#include <QComboBox>
 #include <QKeyEvent>
+#include <QLabel>
+#include <QPushButton>
+#include <QSettings>
+#include <QTableView>
+#include <QTableWidget>
+#include <QToolButton>
 #include <QLineEdit>
 #include <QMimeData>
 #include <QSignalSpy>
@@ -704,5 +717,265 @@ TEST_SUITE("tempo") {
         QTest::keyClick(text, Qt::Key_Return);
         REQUIRE(committed.size() == 4);
         CHECK(committed[3] == doctest::Approx(90.0));
+    }
+}
+
+namespace {
+
+/// A real MainWindow in a fresh workspace (offscreen, null audio and MIDI backends).
+struct WindowFixture {
+    test::TemporaryDirectory directory;
+    std::unique_ptr<MainWindow> window;
+
+    WindowFixture() {
+        application();
+        // Settings (layout, expanded sections, shortcuts) stay in the temporary workspace.
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope,
+                           QString::fromStdWString(directory.path().wstring()));
+        StartupOptions options;
+        options.workspace = directory.path();
+        options.skip_recovery_prompt = true;
+        const auto directories = app::resolve_data_directories(options.workspace);
+        REQUIRE(app::ensure_data_directories(directories));
+        window = std::make_unique<MainWindow>(options, directories);
+        window->resize(1400, 860);
+        window->show();
+        window->activateWindow();
+        std::ignore = QTest::qWaitForWindowActive(window.get(), 2000); // focus events need an active window
+        QTest::qWait(300);
+        REQUIRE(window->current_tab());
+        for (auto* header : window->findChildren<QToolButton*>("sectionHeader"))
+            if (header->text() != "Track")
+                header->setChecked(true); // every Inspector section visible (Track is toggled below)
+        QTest::qWait(50);
+    }
+
+    /// Sends a key through the window, so shortcuts and the focus routing apply as for a user.
+    void key(Qt::Key code, Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+        QTest::keyClick(window->windowHandle(), code, modifiers);
+        QTest::qWait(20);
+    }
+
+    [[nodiscard]] TransportDisplay::State transport() const {
+        // The readout names the state; "Stop" is the stopped state.
+        auto* label = window->findChild<QLabel*>("transport.position");
+        return label && label->text().contains("Stop") ? TransportDisplay::State::stopped : TransportDisplay::State::playing;
+    }
+
+    template <typename Widget>
+    Widget* find(const std::function<bool(Widget*)>& match) {
+        for (auto* widget : window->findChildren<Widget*>())
+            if (match(widget))
+                return widget;
+        return nullptr;
+    }
+};
+
+} // namespace
+
+TEST_SUITE("window") {
+    TEST_CASE("Return and keyboard-focused Space press buttons, check boxes, headers and Mute; a click leaves Space to Play") {
+        WindowFixture fixture;
+        auto* advanced = fixture.find<QCheckBox>([](QCheckBox* box) { return box->text().startsWith("Show all parameters"); });
+        auto* preview = fixture.find<QPushButton>([](QPushButton* button) { return button->text() == "Preview"; });
+        auto* track_header = fixture.find<QToolButton>(
+            [](QToolButton* button) { return button->objectName() == "sectionHeader" && button->text() == "Track"; });
+        REQUIRE(advanced);
+        REQUIRE(preview);
+        REQUIRE(track_header);
+        CHECK(preview->focusPolicy() == Qt::TabFocus); // a click does not steal the focus
+
+        // Tab to the check box: Space toggles it and does not start playback.
+        const bool advanced_before = advanced->isChecked();
+        advanced->setFocus(Qt::TabFocusReason);
+        fixture.key(Qt::Key_Space);
+        CHECK(advanced->isChecked() != advanced_before);
+        CHECK(fixture.transport() == TransportDisplay::State::stopped);
+        // Return toggles it back.
+        fixture.key(Qt::Key_Return);
+        CHECK(advanced->isChecked() == advanced_before);
+
+        // Return presses a push button (Qt does not, outside a dialog).
+        QSignalSpy clicked(preview, &QPushButton::clicked);
+        preview->setFocus(Qt::TabFocusReason);
+        fixture.key(Qt::Key_Return);
+        QTest::qWait(250); // animateClick
+        CHECK(clicked.count() == 1);
+
+        // Section headers expand with Return.
+        const bool expanded = track_header->isChecked();
+        track_header->setFocus(Qt::TabFocusReason);
+        fixture.key(Qt::Key_Return);
+        CHECK(track_header->isChecked() != expanded);
+
+        // After a mouse click on a control, Space is Play/Stop again.
+        advanced->setFocus(Qt::MouseFocusReason);
+        const bool advanced_now = advanced->isChecked();
+        fixture.key(Qt::Key_Space);
+        QTest::qWait(200);
+        CHECK(advanced->isChecked() == advanced_now);
+        CHECK(fixture.transport() != TransportDisplay::State::stopped);
+        fixture.key(Qt::Key_Space); // stop
+        QTest::qWait(100);
+        CHECK(fixture.transport() == TransportDisplay::State::stopped);
+    }
+
+    TEST_CASE("track Mute toggles from the keyboard; tool keys in the track list never rename the track") {
+        WindowFixture fixture;
+        auto* tab = fixture.window->current_tab();
+        auto* table = tab->track_list().findChild<QTableWidget*>();
+        REQUIRE(table);
+        auto& controller = tab->controller();
+        const std::string name = controller.active_sequence().tracks.front().name;
+
+        table->setCurrentCell(0, 1); // the M cell
+        table->setFocus(Qt::TabFocusReason);
+        fixture.key(Qt::Key_Space);
+        CHECK(controller.active_sequence().tracks.front().muted);
+        fixture.key(Qt::Key_Return);
+        CHECK_FALSE(controller.active_sequence().tracks.front().muted);
+
+        table->setCurrentCell(0, 0);
+        table->setFocus(Qt::MouseFocusReason);
+        fixture.key(Qt::Key_2); // Draw tool, not a rename seeded with "2"
+        CHECK(tab->piano_roll().tool() == EditTool::draw);
+        CHECK(QApplication::focusWidget() == table); // no editor opened
+        tab->piano_roll().setFocus();
+        QTest::qWait(20);
+        CHECK(controller.active_sequence().tracks.front().name == name);
+    }
+
+    TEST_CASE("letters reach the commands while a closed combo box has focus") {
+        WindowFixture fixture;
+        auto* root = fixture.find<QComboBox>([](QComboBox* combo) { return combo->count() == 12 && combo->itemText(0) == "C"; });
+        REQUIRE(root);
+        const int before = root->currentIndex();
+        const std::uint64_t generation = fixture.window->current_tab()->controller().generation();
+        root->setFocus(Qt::MouseFocusReason);
+        fixture.key(Qt::Key_F); // Fit, not "jump to F"
+        CHECK(root->currentIndex() == before);
+        CHECK(fixture.window->current_tab()->controller().generation() == generation); // no edit
+    }
+}
+
+TEST_SUITE("event_list") {
+    TEST_CASE("the filter matches cached type, data and track text after typing pauses") {
+        auto controller = make_controller();
+        std::vector<NewNote> notes;
+        for (int index = 0; index < 3000; ++index)
+            notes.push_back(NewNote{controller->active_track(), index * 120, index * 120 + 60,
+                                    static_cast<std::uint8_t>(index % 2 == 0 ? 60 : 62), 100, 0, 0});
+        auto changes = insert_notes(controller->document(), notes);
+        REQUIRE(changes);
+        REQUIRE(controller->apply(*changes));
+        EventListPanel panel(*controller);
+        panel.resize(800, 400);
+        panel.show();
+        QTest::qWait(200); // the model rebuilds after the edit burst settles
+        auto* filter = panel.findChild<QLineEdit*>();
+        auto* table = panel.findChild<QTableView*>();
+        REQUIRE(filter);
+        REQUIRE(table);
+        const int all = table->model()->rowCount();
+        CHECK(all >= 6000);
+
+        const auto started = std::chrono::steady_clock::now();
+        QTest::keyClicks(filter, "d4  vel"); // pitch 62 is D4 ("D4  vel 100")
+        CHECK(table->model()->rowCount() == all); // nothing filtered while typing
+        QTest::qWait(250);
+        CHECK(table->model()->rowCount() == 3000); // 1500 note-ons and 1500 note-offs of D4
+        filter->clear();
+        QTest::keyClicks(filter, "NOTE OFF");
+        QTest::qWait(250);
+        CHECK(table->model()->rowCount() == 3000); // case-insensitive type match
+        filter->clear();
+        QTest::keyClicks(filter, "1 track"); // the track column ("1 <name>")
+        QTest::qWait(250);
+        CHECK(table->model()->rowCount() > 0);
+        filter->clear();
+        QTest::keyClicks(filter, "no such event");
+        QTest::qWait(250);
+        CHECK(table->model()->rowCount() == 0);
+        filter->clear();
+        QTest::qWait(250);
+        CHECK(table->model()->rowCount() == all);
+        // Generous bound for a debug build; re-formatting all 9 columns per keystroke took far longer.
+        CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(10));
+    }
+}
+
+namespace {
+
+/// Waits until the loopback input received a message matching `match` (event loop running).
+template <typename Match>
+bool wait_for_message(platform::IMidiInput& input, Match match, int milliseconds) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+    std::array<platform::MidiInputMessage, 64> buffer{};
+    while (std::chrono::steady_clock::now() < deadline) {
+        const std::size_t count = input.drain(buffer);
+        for (std::size_t index = 0; index < count; ++index)
+            if (match(buffer[index]))
+                return true;
+        QTest::qWait(10);
+    }
+    return false;
+}
+
+bool is_note_on(const platform::MidiInputMessage& message, int pitch) {
+    return message.size == 3 && (message.bytes[0] & 0xF0) == 0x90 && message.bytes[1] == pitch && message.bytes[2] > 0;
+}
+
+bool is_note_off(const platform::MidiInputMessage& message, int pitch) {
+    return message.size == 3 && message.bytes[1] == pitch &&
+           ((message.bytes[0] & 0xF0) == 0x80 || ((message.bytes[0] & 0xF0) == 0x90 && message.bytes[2] == 0));
+}
+
+DocumentData external_document() {
+    DocumentData document = make_blank_document("External");
+    auto& track = document.sequences.front().tracks.front();
+    track.routing.output = OutputKind::external_midi;
+    track.routing.endpoint_id = "null:out:loopback";
+    ChangeBuilder builder(document, "long note");
+    builder.add_note(track.id, 0, 960 * 400, 0, 60, 100);
+    REQUIRE(apply_change_set(document, builder.finish()));
+    return document;
+}
+
+} // namespace
+
+TEST_SUITE("external_midi") {
+    TEST_CASE("a note sounding on an external route is released when the route disappears (mute)") {
+        application();
+        auto backend = platform::create_null_midi_backend();
+        auto input = backend->open_input("null:in:loopback");
+        REQUIRE(input);
+        auto playback = create_playback_service();
+        if (!playback->has_device())
+            return; // no audio clock in this environment
+        DocumentData document = external_document();
+        playback->publish_document(document, 0, 1);
+        playback->play(0);
+        REQUIRE(wait_for_message(**input, [](const auto& message) { return is_note_on(message, 60); }, 3000));
+        document.sequences.front().tracks.front().muted = true; // the only track on that route
+        playback->publish_document(document, 0, 2);
+        CHECK(wait_for_message(**input, [](const auto& message) { return is_note_off(message, 60); }, 3000));
+        playback->stop(0);
+    }
+
+    TEST_CASE("quitting while an external note sounds still sends its note-off") {
+        application();
+        auto backend = platform::create_null_midi_backend();
+        auto input = backend->open_input("null:in:loopback");
+        REQUIRE(input);
+        auto playback = create_playback_service();
+        if (!playback->has_device())
+            return;
+        const DocumentData document = external_document();
+        playback->publish_document(document, 0, 1);
+        playback->play(0);
+        REQUIRE(wait_for_message(**input, [](const auto& message) { return is_note_on(message, 60); }, 3000));
+        playback.reset(); // the application quits mid-note
+        CHECK(wait_for_message(**input, [](const auto& message) { return is_note_off(message, 60); }, 2000));
     }
 }

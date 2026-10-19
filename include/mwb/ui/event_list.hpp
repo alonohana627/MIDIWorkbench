@@ -42,6 +42,9 @@ public:
     [[nodiscard]] TrackId track_at(int row) const;
     /// Row of an event identity, or -1.
     [[nodiscard]] int row_of(EventId id) const;
+    /// Lower-case text the filter matches for a row (type, data and track). Built once per
+    /// rebuild, the first time a filter asks, so typing in the filter never re-formats cells.
+    [[nodiscard]] const QString& search_key(int row) const;
 
 private:
     void rebuild();
@@ -52,7 +55,26 @@ private:
     };
     DocumentController& controller_;
     std::vector<Row> rows_;
-    std::unordered_map<EventId, int, UuidHash> row_by_event_;    std::size_t built_sequence_ = static_cast<std::size_t>(-1);    QTimer rebuild_timer_;
+    std::unordered_map<EventId, int, UuidHash> row_by_event_;
+    mutable std::vector<QString> search_keys_; ///< Empty until a filter needs them (see search_key).
+    std::size_t built_sequence_ = static_cast<std::size_t>(-1);
+    QTimer rebuild_timer_;
+};
+
+/// Filters event rows by EventTableModel::search_key (a substring, case-insensitive).
+class EventFilterProxy : public QSortFilterProxyModel {
+    Q_OBJECT
+
+public:
+    using QSortFilterProxyModel::QSortFilterProxyModel;
+    void set_needle(const QString& text);
+    [[nodiscard]] const QString& needle() const { return needle_; }
+
+protected:
+    [[nodiscard]] bool filterAcceptsRow(int source_row, const QModelIndex& source_parent) const override;
+
+private:
+    QString needle_;
 };
 
 /// Event list panel: filter field plus a table synchronized with the piano roll selection.
@@ -68,10 +90,12 @@ private:
 
     DocumentController& controller_;
     EventTableModel* model_ = nullptr;
-    QSortFilterProxyModel* proxy_ = nullptr;
+    EventFilterProxy* proxy_ = nullptr;
     QTableView* table_ = nullptr;
     QLineEdit* filter_ = nullptr;
-    bool syncing_ = false;    std::optional<EventId> current_event_;
+    QTimer filter_timer_; ///< Typing settles before the rows are filtered again.
+    bool syncing_ = false;
+    std::optional<EventId> current_event_;
 };
 
 /// Human description of an event's data ("C4 vel 100", "CC 7 Volume = 90", "Tempo 120.000 BPM").

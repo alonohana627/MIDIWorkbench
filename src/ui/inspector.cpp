@@ -8,6 +8,7 @@
 #include "mwb/platform/midi_backend.hpp"
 #include "mwb/ui/document_controller.hpp"
 
+#include <QAbstractButton>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QFormLayout>
@@ -427,6 +428,11 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->addWidget(scroll);
+    // Buttons, check boxes and section headers are reached with Tab and pressed with Return or
+    // Space (MainWindow routes the keys); a mouse click does not take the focus, so the editor's
+    // single-key commands keep working after clicking Apply or a check box (round 5 UI).
+    for (auto* button : content->findChildren<QAbstractButton*>())
+        button->setFocusPolicy(Qt::TabFocus);
     setEnabled(false);
 }
 

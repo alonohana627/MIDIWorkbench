@@ -145,7 +145,7 @@ public:
 /// libremidi backend (WinMM API on Windows, the platform default elsewhere).
 [[nodiscard]] Result<std::unique_ptr<IMidiBackend>> create_libremidi_backend();
 /// In-process loopback backend: one input and one output port; output messages arrive at every
-/// open loopback input.
+/// open loopback input in the process (all null backends share one loopback port pair).
 [[nodiscard]] std::unique_ptr<IMidiBackend> create_null_midi_backend();
 /// Chooses the null backend when MWB_MIDI_BACKEND=null, otherwise libremidi.
 [[nodiscard]] Result<std::unique_ptr<IMidiBackend>> create_midi_backend();

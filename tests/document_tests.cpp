@@ -965,4 +965,39 @@ TEST_CASE("the journal refuses non-contiguous generations") {
     CHECK(status.error().code == ErrorCode::invalid_argument);
 }
 
+TEST_CASE("create() leaves the first checkpoint to the background; flush(true) makes the session recoverable") {
+    // code-document-1 / C4: opening a document must not serialize it on the caller's thread, and a
+    // session whose first checkpoint never committed is never offered (nor half-recovered).
+    test::TemporaryDirectory directory;
+    const DocumentData document = rich_document("Quick open", false);
+    {
+        auto created = RecoveryJournal::create(directory.path(), document, SourceReference{"Quick open", {}, {}, {}});
+        REQUIRE(created);
+        // Simulated crash right after opening: the checkpoint may or may not have committed.
+    }
+    const auto early = list_recoverable_sessions(directory.path());
+    REQUIRE(early);
+    for (const auto& session : *early) {
+        const auto recovered = recover_session(directory.path(), session.session_id);
+        REQUIRE_MESSAGE(recovered, (recovered ? "" : recovered.error().describe()));
+        CHECK(semantic_hash(recovered->document) == semantic_hash(document));
+        REQUIRE(discard_recovery_session(directory.path(), session.session_id));
+    }
+
+    auto created = RecoveryJournal::create(directory.path(), document, SourceReference{"Quick open", {}, {}, {}});
+    REQUIRE(created);
+    std::shared_ptr<RecoveryJournal> journal = std::move(*created);
+    REQUIRE(journal->flush(true)); // what the recovery path waits for before discarding old evidence
+    CHECK(journal->checkpoint_committed());
+    const Uuid session_id = journal->session_id();
+    journal.reset(); // crash after the checkpoint
+    const auto sessions = list_recoverable_sessions(directory.path());
+    REQUIRE(sessions);
+    REQUIRE(sessions->size() == 1);
+    CHECK(sessions->at(0).session_id == session_id);
+    const auto recovered = recover_session(directory.path(), session_id);
+    REQUIRE(recovered);
+    CHECK(semantic_hash(recovered->document) == semantic_hash(document));
+}
+
 } // TEST_SUITE recovery

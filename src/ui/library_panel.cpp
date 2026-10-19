@@ -373,6 +373,9 @@ LibraryPanel::LibraryPanel(QWidget* parent) : QWidget(parent) {
         }
         menu.exec(table_->viewport()->mapToGlobal(point));
     });
+    // Reached with Tab, pressed with Return or Space; a click leaves the focus in the editor.
+    for (auto* button : findChildren<QPushButton*>())
+        button->setFocusPolicy(Qt::TabFocus);
     const QString last = QSettings().value("library/last").toString();
     if (!last.isEmpty())
         open_library(std::filesystem::path(last.toStdWString()), false);
@@ -474,7 +477,11 @@ void LibraryPanel::import_folder() {
         // Analysis and motif indexing follow automatically in the desktop app (section 26.6).
         std::optional<library::AnalyzeReport> analysis;
         if (report) {
-            if (auto analyzed = library->analyze({}, stop))
+            // Analysis re-reads the same untrusted bytes: it goes through the same isolated parser
+            // as the import, never this process (section 28.2).
+            library::AnalyzeOptions analyze;
+            analyze.parser = parser;
+            if (auto analyzed = library->analyze(analyze, stop))
                 analysis = *analyzed;
         }
         QString text;

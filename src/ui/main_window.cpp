@@ -1440,11 +1440,17 @@ void MainWindow::present_recovery(std::vector<document::RecoverableSession> sess
                 auto recovered = std::make_shared<Result<document::RecoveredDocument>>(
                     document::recover_session(recovery_directory, session_id));
                 std::shared_ptr<document::RecoveryJournal> journal;
+                bool protected_again = false;
                 if (*recovered) {
                     document::SourceReference source;
                     source.document_name = (*recovered)->document.title;
-                    if (auto created = document::RecoveryJournal::create(recovery_directory, (*recovered)->document, source))
+                    if (auto created = document::RecoveryJournal::create(recovery_directory, (*recovered)->document, source)) {
                         journal = std::move(*created);
+                        // create() only queues the first checkpoint. The old session is the only
+                        // durable copy until that checkpoint has committed, so wait for it here
+                        // (this is the I/O thread) before the old evidence may be deleted.
+                        protected_again = journal->flush(true).has_value() && journal->checkpoint_committed();
+                    }
                 }
                 QMetaObject::invokeMethod(
                     qApp,
@@ -1465,7 +1471,7 @@ void MainWindow::present_recovery(std::vector<document::RecoverableSession> sess
                             10000);
                     },
                     Qt::QueuedConnection);
-                if (!*recovered || !journal)
+                if (!*recovered || !protected_again)
                     continue; // keep the old evidence until the recovered document is protected again
             }
             std::ignore = document::discard_recovery_session(recovery_directory, session_id); // evidence no longer needed
@@ -1932,31 +1938,86 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
             return true;
         }
     }
-    // Single-key window shortcuts (Space, arrows, letters, digits) must not take keys from a
-    // focused button, check box, combo box, list, table or spin box: accepting ShortcutOverride
-    // hands the key to the control. Modified shortcuts, F-keys and Escape still work everywhere,
-    // so Stop (Ctrl+Space) and Panic (F12) are always available.
-    if (event->type() == QEvent::ShortcutOverride) {
+    // Which control got focus from the keyboard: Space activates a button or check cell reached
+    // with Tab, while after a mouse click Space stays Play/Stop (a click on Apply followed by
+    // Space listens instead of applying again).
+    if (event->type() == QEvent::FocusIn && watched->isWidgetType()) {
+        const auto reason = static_cast<QFocusEvent*>(event)->reason();
+        if (reason == Qt::TabFocusReason || reason == Qt::BacktabFocusReason || reason == Qt::ShortcutFocusReason)
+            keyboard_focus_ = qobject_cast<QWidget*>(watched);
+        else if (reason == Qt::MouseFocusReason || reason == Qt::OtherFocusReason)
+            keyboard_focus_ = nullptr; // window activation and popups keep the previous state
+    }
+    if (event->type() == QEvent::ShortcutOverride || event->type() == QEvent::KeyPress) {
         auto* key = static_cast<QKeyEvent*>(event);
         QWidget* focus = QApplication::focusWidget();
-        const auto modifiers = key->modifiers() & ~(Qt::KeypadModifier | Qt::ShiftModifier);
-        const int code = key->key();
-        const bool plain_key = modifiers == Qt::NoModifier &&
-                               (code == Qt::Key_Up || code == Qt::Key_Down || code == Qt::Key_Left ||
-                                code == Qt::Key_Right || code == Qt::Key_Home || code == Qt::Key_End ||
-                                code == Qt::Key_PageUp || code == Qt::Key_PageDown || // not Delete: it deletes notes everywhere
-                                (code >= Qt::Key_0 && code <= Qt::Key_9) || (code >= Qt::Key_A && code <= Qt::Key_Z));
-        const bool control = focus && (qobject_cast<QAbstractButton*>(focus) || qobject_cast<QComboBox*>(focus) ||
-                                       qobject_cast<QAbstractItemView*>(focus) || qobject_cast<QAbstractSpinBox*>(focus) ||
-                                       qobject_cast<QLineEdit*>(focus));
-        // Space is Play/Pause everywhere except text fields (which keep it themselves): buttons are
-        // pressed with Enter, so pressing Space after Apply listens instead of applying again.
-        if (plain_key && control && watched == focus) {
-            event->accept();
-            return false;
-        }
+        // This window and its docks (also floating ones), never dialogs or popups.
+        const bool ours = focus && (isAncestorOf(focus) || (qobject_cast<QDockWidget*>(focus->window()) &&
+                                                            focus->window()->parentWidget() == this));
+        if (ours && watched == focus)
+            if (const auto handled = route_control_key(*key, *focus, event->type() == QEvent::ShortcutOverride))
+                return *handled;
     }
     return QMainWindow::eventFilter(watched, event);
+}
+
+std::optional<bool> MainWindow::route_control_key(QKeyEvent& key, QWidget& focus, bool override) {
+    const auto modifiers = key.modifiers() & ~(Qt::KeypadModifier | Qt::ShiftModifier);
+    const int code = key.key();
+    if (modifiers != Qt::NoModifier)
+        return std::nullopt; // modified shortcuts (Ctrl+Space, Ctrl+Z, ...) work everywhere
+    auto* button = qobject_cast<QAbstractButton*>(&focus);
+    auto* view = qobject_cast<QAbstractItemView*>(&focus);
+    auto* combo = qobject_cast<QComboBox*>(&focus);
+    const bool text_input = qobject_cast<QLineEdit*>(&focus) || qobject_cast<QAbstractSpinBox*>(&focus) ||
+                            focus.inherits("QPlainTextEdit") || focus.inherits("QTextEdit") ||
+                            (combo && combo->view() && combo->view()->isVisible()); // (an item view's editor is a QLineEdit)
+    const QModelIndex current = view ? view->currentIndex() : QModelIndex();
+    const bool check_cell = current.isValid() && (current.flags() & Qt::ItemIsUserCheckable) &&
+                            (current.flags() & Qt::ItemIsEnabled);
+    const bool by_keyboard = keyboard_focus_ == &focus;
+    const bool enter = code == Qt::Key_Return || code == Qt::Key_Enter;
+    const bool space = code == Qt::Key_Space;
+
+    // Return/Enter press the focused button (check boxes and section headers toggle) and toggle a
+    // focused check cell (track Mute/Solo); outside a QDialog Qt itself does neither.
+    // Space does the same for a control reached with the keyboard; otherwise it plays.
+    if ((button || check_cell) && (enter || (space && by_keyboard)) && !text_input) {
+        if (override) {
+            key.accept(); // the key goes to the control, not to a window shortcut
+            return false;
+        }
+        if (key.isAutoRepeat())
+            return true;
+        if (button) {
+            if (button->isEnabled())
+                button->click(); // immediate: the key press is the feedback
+        } else {
+            const auto state = current.data(Qt::CheckStateRole).value<Qt::CheckState>();
+            view->model()->setData(current, state == Qt::Checked ? Qt::Unchecked : Qt::Checked, Qt::CheckStateRole);
+        }
+        return true;
+    }
+    if (!override)
+        return std::nullopt;
+    // Navigation keys stay with every control that uses them (lists, combos, fields); buttons do
+    // not, so the arrow commands still move notes after a click on a panel button.
+    const bool navigation = code == Qt::Key_Up || code == Qt::Key_Down || code == Qt::Key_Left || code == Qt::Key_Right ||
+                            code == Qt::Key_Home || code == Qt::Key_End || code == Qt::Key_PageUp ||
+                            code == Qt::Key_PageDown;
+    if (navigation && (text_input || view || combo)) {
+        key.accept();
+        return false;
+    }
+    // Letters and digits are the tool and transport commands: only real text input keeps them.
+    // A closed combo would jump to a matching item (a document edit), a table would start renaming.
+    const bool character = (code >= Qt::Key_0 && code <= Qt::Key_9) || (code >= Qt::Key_A && code <= Qt::Key_Z) || space;
+    if (character && text_input && !(space && !focus.inherits("QLineEdit") && !focus.inherits("QPlainTextEdit") &&
+                                      !focus.inherits("QTextEdit"))) {
+        key.accept();
+        return false;
+    }
+    return std::nullopt;
 }
 
 void MainWindow::keyPressEvent(QKeyEvent* event) {

@@ -91,6 +91,12 @@ protected:
 private:
     QAction* add_command(const QString& id, const QString& text, const QKeySequence& shortcut,
                          std::function<void()> handler, Qt::ShortcutContext context = Qt::WindowShortcut);
+    /// Keyboard contract for focused controls in this window (C2): Return/Enter press a focused
+    /// button or toggle a check cell, Space does so for a control reached with the keyboard,
+    /// navigation keys stay with lists, combos and fields, letters and digits stay only with text
+    /// input. `override`: the event is the ShortcutOverride, else the KeyPress. Returns the
+    /// eventFilter result when the key was routed, nullopt to continue normally.
+    std::optional<bool> route_control_key(QKeyEvent& key, QWidget& focus, bool override);
     void build_actions();
     void build_menus();
     void build_docks();
@@ -194,6 +200,9 @@ private:
     /// Left/Right (with or without Ctrl) held down: the key and when it was first pressed, so
     /// auto-repeat accelerates the play-position step (reset on release).
     int held_position_key_ = 0;
+    /// Widget that last received focus from the keyboard (Tab, Backtab, a shortcut); Space
+    /// activates it when it is a button or a check cell, a mouse-focused control leaves Space to Play.
+    QPointer<QWidget> keyboard_focus_;
     std::chrono::steady_clock::time_point position_key_down_{};
     /// Library item and revision each tab was opened from (for saving new revisions).
     std::map<const EditorTab*, std::pair<std::int64_t, std::int64_t>> library_sources_;

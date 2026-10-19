@@ -132,6 +132,7 @@ void EventTableModel::rebuild() {
         const auto& right = sequence.tracks[b.track].events[b.event];
         return std::tie(left.tick, a.track, left.order_key) < std::tie(right.tick, b.track, right.order_key);
     });
+    search_keys_.clear();
     row_by_event_.clear();
     row_by_event_.reserve(rows_.size());
     for (std::size_t row = 0; row < rows_.size(); ++row)
@@ -164,6 +165,49 @@ TrackId EventTableModel::track_at(int row) const {
 int EventTableModel::row_of(EventId id) const {
     const auto found = row_by_event_.find(id);
     return found == row_by_event_.end() ? -1 : found->second;
+}
+
+const QString& EventTableModel::search_key(int row) const {
+    static const QString none;
+    if (row < 0 || static_cast<std::size_t>(row) >= rows_.size())
+        return none;
+    if (search_keys_.size() != rows_.size()) {
+        // One pass over the rows per rebuild: type, decoded data and track, the columns the
+        // filter promises ("type, data, track"); the raw and position columns are not searched.
+        search_keys_.assign(rows_.size(), QString());
+        const auto& sequence = controller_.active_sequence();
+        std::vector<QString> track_labels;
+        track_labels.reserve(sequence.tracks.size());
+        for (std::size_t track = 0; track < sequence.tracks.size(); ++track)
+            track_labels.push_back(QString("%1 %2").arg(track + 1).arg(QString::fromStdString(sequence.tracks[track].name)));
+        for (std::size_t index = 0; index < rows_.size(); ++index) {
+            const Event* event = event_at(static_cast<int>(index));
+            if (!event)
+                continue;
+            // Fields are joined by a line break, which a typed filter cannot contain, so a match
+            // never spans two fields.
+            search_keys_[index] = (event_type_name(*event) + QChar(u'\n') + describe_event(*event) + QChar(u'\n') +
+                                   track_labels[rows_[index].track])
+                                      .toLower();
+        }
+    }
+    return search_keys_[static_cast<std::size_t>(row)];
+}
+
+void EventFilterProxy::set_needle(const QString& text) {
+    const QString needle = text.trimmed().toLower();
+    if (needle == needle_)
+        return;
+    beginFilterChange();
+    needle_ = needle;
+    endFilterChange(Direction::Rows);
+}
+
+bool EventFilterProxy::filterAcceptsRow(int source_row, const QModelIndex& source_parent) const {
+    if (needle_.isEmpty() || source_parent.isValid())
+        return true;
+    const auto* model = qobject_cast<const EventTableModel*>(sourceModel());
+    return model && model->search_key(source_row).contains(needle_);
 }
 
 QVariant EventTableModel::data(const QModelIndex& index, int role) const {
@@ -288,10 +332,8 @@ bool EventTableModel::setData(const QModelIndex& index, const QVariant& value, i
 EventListPanel::EventListPanel(DocumentController& controller, QWidget* parent)
     : QWidget(parent), controller_(controller) {
     model_ = new EventTableModel(controller, this);
-    proxy_ = new QSortFilterProxyModel(this);
+    proxy_ = new EventFilterProxy(this);
     proxy_->setSourceModel(model_);
-    proxy_->setFilterKeyColumn(-1);
-    proxy_->setFilterCaseSensitivity(Qt::CaseInsensitive);
     filter_ = new QLineEdit(this);
     filter_->setPlaceholderText(tr("Filter events (type, data, track)…"));
     filter_->setClearButtonEnabled(true);
@@ -309,7 +351,16 @@ EventListPanel::EventListPanel(DocumentController& controller, QWidget* parent)
     layout->setContentsMargins(2, 2, 2, 2);
     layout->addWidget(filter_);
     layout->addWidget(table_, 1);
-    connect(filter_, &QLineEdit::textChanged, proxy_, &QSortFilterProxyModel::setFilterFixedString);
+    // Filtered against cached per-row keys, after typing pauses (uiB-3): a keystroke never
+    // re-formats every cell of every row.
+    filter_timer_.setSingleShot(true);
+    filter_timer_.setInterval(120); // search typing debounce (section 33.3)
+    connect(filter_, &QLineEdit::textChanged, &filter_timer_, qOverload<>(&QTimer::start));
+    connect(&filter_timer_, &QTimer::timeout, this, [this] { proxy_->set_needle(filter_->text()); });
+    connect(filter_, &QLineEdit::returnPressed, this, [this] {
+        filter_timer_.stop();
+        proxy_->set_needle(filter_->text());
+    });
     connect(table_->selectionModel(), &QItemSelectionModel::selectionChanged, this, &EventListPanel::sync_to_selection);
     connect(&controller_, &DocumentController::selection_changed, this, &EventListPanel::sync_from_selection);
     // A rebuild keeps the current event and the selection (the row may have moved).

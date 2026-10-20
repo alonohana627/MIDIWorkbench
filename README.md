@@ -45,10 +45,18 @@ recording, organizing and searching MIDI. It needs no account and never goes onl
    **Fold** shows only the scale's rows and **Select outside** selects the notes outside it.
    Pick a track's color with the swatch button under the track list (or right-click a track).
    **View > Font Size** makes all text smaller or larger.
-5. **File > Save** writes a `.mwb` document; **File > Export MIDI** writes a `.mid` for your DAW.
-6. To build a library, open the Library panel (books icon or **Ctrl+1**), click **Create or Open
+5. **Choose an instrument** for a track: click its name in the **Instrument** column of the track
+   list (or select the cell and press **Enter** or **F2**, or right-click the track and choose
+   **Instrument**). The menu lists the 128 General MIDI instruments in 16 families (Piano, Organ,
+   Guitar, Bass, Strings, Brass, ...) and **Drums (channel 10)**. The built-in synth switches to a
+   matching sound at once, and the choice is saved as a Program Change at the start of the track,
+   so exported `.mid` files open with the same instrument in your DAW. One **Ctrl+Z** undoes it.
+   The same picker is in the Inspector's **Track** section. Imported files show the instrument
+   their first Program Change names.
+6. **File > Save** writes a `.mwb` document; **File > Export MIDI** writes a `.mid` for your DAW.
+7. To build a library, open the Library panel (books icon or **Ctrl+1**), click **Create or Open
    Library…**, choose an empty folder, then **Add Folder…** to import your MIDI files.
-7. **View > Theme** switches between Follow Windows, Dark, Light and High Contrast. **View > Note
+8. **View > Theme** switches between Follow Windows, Dark, Light and High Contrast. **View > Note
    Colors** colors notes by track, channel, velocity or scale degree; note brightness follows
    velocity.
 

@@ -4,6 +4,7 @@
 
 #include "mwb/ui/document_controller.hpp"
 #include "mwb/ui/drum_grid.hpp"
+#include "mwb/ui/instrument_menu.hpp"
 
 #include <QCheckBox>
 #include <QColorDialog>
@@ -19,6 +20,8 @@
 #include <QPushButton>
 #include <QSplitter>
 #include <QStackedWidget>
+#include <QStyle>
+#include <QStyledItemDelegate>
 #include <QTableWidget>
 #include <QToolButton>
 #include <QVBoxLayout>
@@ -29,7 +32,49 @@ namespace mwb::ui {
 
 namespace {
 
-enum TrackColumn { column_name = 0, column_mute, column_solo, column_count };
+// The Instrument column comes last so the M and S cells keep their places (and shortcuts).
+enum TrackColumn { column_name = 0, column_mute, column_solo, column_instrument, column_count };
+
+/// Draws a menu cell: its text (elided) and a "\u25BE" at the right edge, so the Instrument
+/// cell reads as something that opens a menu (review_10). The arrow is never elided away and
+/// uses the cell's text color, so every theme draws it as readable as the text.
+class MenuCellDelegate : public QStyledItemDelegate {
+public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+
+    void paint(QPainter* painter, const QStyleOptionViewItem& option, const QModelIndex& index) const override {
+        QStyleOptionViewItem item(option);
+        initStyleOption(&item, index);
+        const QString text = item.text;
+        item.text.clear(); // background, selection and focus only; the text is drawn below
+        const QWidget* widget = item.widget;
+        QStyle* style = widget ? widget->style() : QApplication::style();
+        style->drawControl(QStyle::CE_ItemViewItem, &item, painter, widget);
+        QRect text_rect = style->subElementRect(QStyle::SE_ItemViewItemText, &item, widget);
+        const int arrow_width = arrow_space(item.fontMetrics);
+        text_rect.setRight(text_rect.right() - arrow_width);
+        text_rect.setLeft(std::max(text_rect.left(), item.rect.left() + 4)); // the padding of a text cell
+        const bool selected = item.state.testFlag(QStyle::State_Selected);
+        painter->save();
+        painter->setFont(item.font);
+        painter->setPen(item.palette.color(selected ? QPalette::HighlightedText : QPalette::Text));
+        painter->drawText(text_rect, Qt::AlignVCenter | Qt::AlignLeft,
+                          item.fontMetrics.elidedText(text, Qt::ElideRight, std::max(0, text_rect.width())));
+        painter->drawText(QRect(text_rect.right() + 1, item.rect.top(), arrow_width, item.rect.height()), Qt::AlignCenter,
+                          QStringLiteral("\u25BE"));
+        painter->restore();
+    }
+
+    [[nodiscard]] QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex& index) const override {
+        QSize size = QStyledItemDelegate::sizeHint(option, index);
+        size.rwidth() += arrow_space(option.fontMetrics);
+        return size;
+    }
+
+    [[nodiscard]] static int arrow_space(const QFontMetrics& metrics) {
+        return metrics.horizontalAdvance(QStringLiteral("\u25BE")) + 12; // the arrow, its gaps and the left padding
+    }
+};
 
 QColor color_from_rgba(std::uint32_t rgba) {
     return QColor(static_cast<int>((rgba >> 24) & 0xFF), static_cast<int>((rgba >> 16) & 0xFF),
@@ -52,10 +97,14 @@ TrackListWidget::TrackListWidget(DocumentController& controller, QWidget* parent
     table_ = new QTableWidget(this);
     table_->installEventFilter(this);
     table_->setColumnCount(column_count);
-    table_->setHorizontalHeaderLabels({tr("Track"), tr("M"), tr("S")});
+    table_->setHorizontalHeaderLabels({tr("Track"), tr("M"), tr("S"), tr("Instrument")});
+    // Name and instrument share the width; a narrow list elides both (the tooltip has the rest).
     table_->horizontalHeader()->setSectionResizeMode(column_name, QHeaderView::Stretch);
-    for (int column = column_mute; column < column_count; ++column)
+    table_->horizontalHeader()->setSectionResizeMode(column_instrument, QHeaderView::Stretch);
+    for (int column = column_mute; column <= column_solo; ++column)
         table_->horizontalHeader()->setSectionResizeMode(column, QHeaderView::ResizeToContents);
+    table_->setTextElideMode(Qt::ElideRight);
+    table_->setItemDelegateForColumn(column_instrument, new MenuCellDelegate(table_));
     table_->verticalHeader()->hide();
     table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     table_->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -63,7 +112,8 @@ TrackListWidget::TrackListWidget(DocumentController& controller, QWidget* parent
     // double-click does.
     table_->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed);
     table_->setAccessibleName(tr("Tracks"));
-    table_->setToolTip(tr("M mute, S solo. Recording goes to the selected track. Double-click a name to rename."));
+    table_->setToolTip(tr("M mute, S solo. Recording goes to the selected track. Double-click a name to rename; "
+                          "click an instrument (or press Enter on it) to choose another."));
     auto* buttons = new QHBoxLayout;
     table_->verticalHeader()->setDefaultSectionSize(28);
     const auto make_button = [&](IconId icon, const QString& tip, auto slot) {
@@ -101,9 +151,28 @@ TrackListWidget::TrackListWidget(DocumentController& controller, QWidget* parent
         QMenu menu(this);
         menu.addAction(tr("Track Color..."), this, &TrackListWidget::choose_active_track_color);
         menu.addAction(tr("Rename"), this, [this, row] { table_->editItem(table_->item(row, column_name)); });
+        const auto& tracks = controller_.active_sequence().tracks;
+        if (static_cast<std::size_t>(row) < tracks.size()) {
+            const TrackId id = tracks[static_cast<std::size_t>(row)].id;
+            auto* instruments = menu.addMenu(tr("Instrument"));
+            populate_instrument_menu(*instruments, music::effective_instrument(tracks[static_cast<std::size_t>(row)]),
+                                     [this, id](std::optional<std::uint8_t> program) {
+                                         emit status_message(choose_track_instrument(controller_, id, program));
+                                     });
+        }
         menu.exec(table_->viewport()->mapToGlobal(point));
     });
+    // Return, Enter and keyboard Space on the Instrument cell arrive as activated() (see
+    // pressable_cell_role and the window's key routing); F2 is handled in eventFilter.
+    connect(table_, &QAbstractItemView::activated, this, [this](const QModelIndex& index) {
+        if (index.column() == column_instrument)
+            open_instrument_menu(index.row());
+    });
     connect(table_, &QTableWidget::cellClicked, this, [this](int row, int column) {
+        if (column == column_instrument) {
+            open_instrument_menu(row);
+            return;
+        }
         if (column != column_name)
             return;
         // The swatch sits at the start of the name cell; a click on it picks the color.
@@ -163,6 +232,11 @@ TrackListWidget::TrackListWidget(DocumentController& controller, QWidget* parent
 bool TrackListWidget::eventFilter(QObject* watched, QEvent* event) {
     if (watched == table_ && event->type() == QEvent::KeyPress) {
         const auto* key = static_cast<QKeyEvent*>(event);
+        const bool press = key->key() == Qt::Key_F2 || key->key() == Qt::Key_Return || key->key() == Qt::Key_Enter;
+        if (press && key->modifiers() == Qt::NoModifier && table_->currentColumn() == column_instrument) {
+            open_instrument_menu(table_->currentRow()); // F2 means "change this", as it renames a name
+            return true;
+        }
         if ((key->key() == Qt::Key_Delete || key->key() == Qt::Key_Backspace) && key->modifiers() == Qt::NoModifier) {
             // The highlighted row is what Delete means (it may differ from the edited track after
             // an M/S click): make it the active track first (review_4).
@@ -239,6 +313,10 @@ void TrackListWidget::rebuild() {
             if (!item) {
                 item = new QTableWidgetItem;
                 item->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+                // Always set, also when unchecked: an item without check-state data draws no box
+                // and ignores clicks (review_10 I2). checkState() reads Unchecked either way, so the
+                // compare below cannot catch it.
+                item->setCheckState(value ? Qt::Checked : Qt::Unchecked);
                 table_->setItem(row, column, item);
             }
             const auto state = value ? Qt::Checked : Qt::Unchecked;
@@ -251,6 +329,25 @@ void TrackListWidget::rebuild() {
         };
         check(column_mute, track.muted, tr("Mute %1").arg(track_name));
         check(column_solo, track.solo, tr("Solo %1").arg(track_name));
+        auto* instrument = table_->item(row, column_instrument);
+        if (!instrument) {
+            instrument = new QTableWidgetItem;
+            instrument->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable); // chosen from a menu, never typed
+            instrument->setData(pressable_cell_role, true);
+            table_->setItem(row, column_instrument, instrument);
+        }
+        const auto effective = music::effective_instrument(track);
+        const QString label = QString::fromStdString(music::instrument_label(track));
+        if (instrument->text() != label)
+            instrument->setText(label);
+        const QString instrument_tip =
+            (effective.drums ? tr("%1 plays drums (channel 10)").arg(track_name)
+                             : tr("%1 plays %2 (General MIDI program %3)").arg(track_name, label).arg(effective.program + 1)) +
+            tr(". Click or press Enter to choose another instrument.");
+        if (instrument->toolTip() != instrument_tip) {
+            instrument->setToolTip(instrument_tip);
+            instrument->setData(Qt::AccessibleTextRole, tr("Instrument of %1: %2").arg(track_name, label));
+        }
     }
     if (color_button_) {
         // The color button shows the active track's color as a swatch.
@@ -270,6 +367,25 @@ void TrackListWidget::rebuild() {
     if (active)
         table_->setCurrentCell(static_cast<int>(*active), std::max(current_column, 0));
     rebuilding_ = false;
+}
+
+void TrackListWidget::open_instrument_menu(int row) {
+    const auto& tracks = controller_.active_sequence().tracks;
+    if (row < 0 || static_cast<std::size_t>(row) >= tracks.size())
+        return;
+    const Track& track = tracks[static_cast<std::size_t>(row)];
+    const TrackId id = track.id;
+    QMenu menu(this);
+    menu.setObjectName(QStringLiteral("instrumentMenu"));
+    menu.setTitle(tr("Instrument of %1").arg(QString::fromStdString(track.name)));
+    populate_instrument_menu(menu, music::effective_instrument(track), [this, id](std::optional<std::uint8_t> program) {
+        emit status_message(choose_track_instrument(controller_, id, program));
+    });
+    table_->setCurrentCell(row, column_instrument);
+    QRect cell = table_->visualRect(table_->model()->index(row, column_instrument));
+    if (cell.isEmpty())
+        cell = QRect(table_->viewport()->rect().topLeft(), QSize(1, 1));
+    menu.exec(table_->viewport()->mapToGlobal(cell.bottomLeft()));
 }
 
 void TrackListWidget::set_track_flag(TrackId track_id, int column, bool value) {
@@ -397,7 +513,8 @@ EditorTab::EditorTab(std::unique_ptr<DocumentController> controller, QWidget* pa
     horizontal->addWidget(vertical);
     horizontal->setStretchFactor(0, 0);
     horizontal->setStretchFactor(1, 1);
-    horizontal->setSizes({140, 1000});
+    // Wide enough for a name, M, S and an instrument name ("Acoustic Grand Piano") side by side.
+    horizontal->setSizes({std::max(340, track_list_->sizeHint().width()), 1000});
     horizontal->setCollapsible(0, true); // drag the divider left to hide the track list
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);

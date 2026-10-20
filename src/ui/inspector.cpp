@@ -8,8 +8,10 @@
 #include "mwb/platform/midi_backend.hpp"
 #include "mwb/ui/document_controller.hpp"
 #include "mwb/ui/editor_math.hpp"
+#include "mwb/ui/instrument_menu.hpp"
 
 #include <QAbstractButton>
+#include <QActionGroup>
 #include <QCoreApplication>
 #include <QMetaObject>
 #include <QCheckBox>
@@ -21,6 +23,7 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScrollArea>
@@ -287,8 +290,33 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     track_preset_ = new QComboBox(track_box);
     for (const auto* preset : presets)
         track_preset_->addItem(QString::fromLatin1(preset));
-    track_program_ = spin(1, 128, 1, track_box);
+    // A button with the instrument's name and a menu indicator; the menu is rebuilt each time it
+    // opens, so it always checks the active track's current instrument.
+    track_instrument_ = new QPushButton(track_box);
+    track_instrument_->setObjectName(QStringLiteral("trackInstrument"));
+    track_instrument_->setToolTip(tr("What the track plays: a General MIDI instrument (saved in the file as a "
+                                     "Program Change) or drums on channel 10"));
+    track_instrument_->setAccessibleName(tr("Instrument"));
+    auto* instrument_menu = new QMenu(track_instrument_);
+    instrument_menu->setObjectName(QStringLiteral("instrumentMenu"));
+    track_instrument_->setMenu(instrument_menu);
+    connect(instrument_menu, &QMenu::aboutToShow, this, [this, instrument_menu] {
+        qDeleteAll(instrument_menu->findChildren<QMenu*>(Qt::FindDirectChildrenOnly));
+        qDeleteAll(instrument_menu->findChildren<QActionGroup*>(Qt::FindDirectChildrenOnly));
+        instrument_menu->clear();
+        const auto active = controller_ ? controller_->active_track_index() : std::nullopt;
+        if (!active)
+            return;
+        const Track& track = controller_->active_sequence().tracks[*active];
+        const TrackId id = track.id;
+        populate_instrument_menu(*instrument_menu, music::effective_instrument(track),
+                                 [this, id](std::optional<std::uint8_t> program) {
+                                     if (controller_)
+                                         emit status_message(choose_track_instrument(*controller_, id, program));
+                                 });
+    });
     track_form->addRow(tr("Name"), track_name_);
+    track_form->addRow(tr("Instrument"), track_instrument_);
     track_form->addRow(track_drum_);
     track_output_ = new QComboBox(track_box);
     track_output_->setToolTip(tr("Internal synth, or an external MIDI port chosen explicitly (nothing is sent by default)"));
@@ -317,13 +345,11 @@ InspectorPanel::InspectorPanel(QWidget* parent) : QWidget(parent) {
     track_form->addRow(tr("Routing"), track_channel_override_);
     track_form->addRow(tr("Playback transpose"), track_transpose_);
     track_form->addRow(tr("Built-in sound"), track_preset_);
-    track_form->addRow(tr("Program (1-128)"), track_program_);
     connect(track_name_, &QLineEdit::editingFinished, this, &InspectorPanel::apply_track_fields);
     connect(track_drum_, &QCheckBox::toggled, this, &InspectorPanel::apply_track_fields);
     connect(track_channel_override_, &QComboBox::activated, this, &InspectorPanel::apply_track_fields);
     connect(track_transpose_, &QSpinBox::editingFinished, this, &InspectorPanel::apply_track_fields);
     connect(track_preset_, &QComboBox::activated, this, &InspectorPanel::apply_track_fields);
-    connect(track_program_, &QSpinBox::editingFinished, this, &InspectorPanel::apply_track_fields);
     column->addWidget(track_box);
 
     // --- Scale ----------------------------------------------------------------------------------
@@ -616,7 +642,8 @@ void InspectorPanel::refresh() {
             track_preset_->addItem(stored);
         const int preset = track_preset_->findText(stored);
         track_preset_->setCurrentIndex(std::max(0, preset));
-        track_program_->setValue(track.instrument.program + 1);
+        // The name with a menu arrow; the same effective instrument the track list shows.
+        track_instrument_->setText(QString::fromStdString(music::instrument_label(track)));
         const QString endpoint = track.routing.output == OutputKind::external_midi && track.routing.endpoint_id
                                      ? QString::fromStdString(*track.routing.endpoint_id)
                                      : QString();
@@ -742,7 +769,6 @@ void InspectorPanel::apply_track_fields() {
         override_index > 0 ? std::optional<std::uint8_t>(static_cast<std::uint8_t>(override_index - 1)) : std::nullopt;
     updated.routing.transpose = track_transpose_->value();
     updated.instrument.synth_preset = track_preset_->currentText().toStdString();
-    updated.instrument.program = static_cast<std::uint8_t>(track_program_->value() - 1);
     const QString endpoint = track_output_->currentData().toString();
     updated.routing.output = endpoint.isEmpty() ? OutputKind::internal_synth : OutputKind::external_midi;
     updated.routing.endpoint_id = endpoint.isEmpty() ? std::nullopt : std::optional<std::string>(endpoint.toStdString());

@@ -21,8 +21,8 @@ class DocumentController;
 class DrumGridView;
 class DrumGridPanel;
 
-/// Track list beside the editor: name, mute, solo and color per track (section 12). All are
-/// document edits (undoable); recording goes to the selected (active) track.
+/// Track list beside the editor: name, mute, solo, instrument and color per track (section 12).
+/// All are document edits (undoable); recording goes to the selected (active) track.
 class TrackListWidget : public QWidget {
     Q_OBJECT
 
@@ -34,6 +34,8 @@ public:
     /// Opens a color picker for the active track.
     void choose_active_track_color();
     [[nodiscard]] QToolButton* color_button() const { return color_button_; }
+    /// Opens the instrument menu for the track in `row`, below its Instrument cell.
+    void open_instrument_menu(int row);
 
 signals:
     void status_message(const QString& text);

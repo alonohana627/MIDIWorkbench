@@ -25,6 +25,7 @@
 #include "mwb/ui/editor_tab.hpp"
 #include "mwb/ui/event_list.hpp"
 #include "mwb/ui/inspector.hpp"
+#include "mwb/ui/instrument_menu.hpp"
 #include "mwb/ui/library_panel.hpp"
 #include "mwb/ui/playback_service.hpp"
 #include "mwb/ui/recording_controller.hpp"
@@ -2655,6 +2656,9 @@ std::optional<bool> MainWindow::route_control_key(QKeyEvent& key, QWidget& focus
     const QModelIndex current = view ? view->currentIndex() : QModelIndex();
     const bool check_cell = current.isValid() && (current.flags() & Qt::ItemIsUserCheckable) &&
                             (current.flags() & Qt::ItemIsEnabled);
+    // A cell that opens something (the track list's Instrument) is pressed like a button.
+    const bool pressable_cell = current.isValid() && current.data(pressable_cell_role).toBool() &&
+                                (current.flags() & Qt::ItemIsEnabled);
     const bool by_keyboard = keyboard_focus_ == &focus;
     const bool enter = code == Qt::Key_Return || code == Qt::Key_Enter;
     const bool space = code == Qt::Key_Space;
@@ -2662,7 +2666,7 @@ std::optional<bool> MainWindow::route_control_key(QKeyEvent& key, QWidget& focus
     // Return/Enter press the focused button (check boxes and section headers toggle) and toggle a
     // focused check cell (track Mute/Solo); outside a QDialog Qt itself does neither.
     // Space does the same for a control reached with the keyboard; otherwise it plays.
-    if ((button || check_cell) && (enter || (space && by_keyboard)) && !text_input) {
+    if ((button || check_cell || pressable_cell) && (enter || (space && by_keyboard)) && !text_input) {
         if (override) {
             key.accept(); // the key goes to the control, not to a window shortcut
             return false;
@@ -2672,6 +2676,8 @@ std::optional<bool> MainWindow::route_control_key(QKeyEvent& key, QWidget& focus
         if (button) {
             if (button->isEnabled())
                 button->click(); // immediate: the key press is the feedback
+        } else if (pressable_cell) {
+            emit view->activated(current);
         } else {
             const auto state = current.data(Qt::CheckStateRole).value<Qt::CheckState>();
             view->model()->setData(current, state == Qt::Checked ? Qt::Unchecked : Qt::Checked, Qt::CheckStateRole);

@@ -957,10 +957,25 @@ void LibraryPanel::start_watching() {
                 const auto library = weak.lock();
                 if (!guard || !library || guard->library_ != library)
                     return; // closed, or another library was opened meanwhile
+                // The same folders are already watched (an import finished in a folder that was
+                // watched from its start): keep that watcher. Replacing it would drop the changes
+                // it is still batching, an edit made right after the import (seen as a flaky
+                // watched-folder test in batch 10).
+                if (guard->watcher_ && guard->watched_roots_ == watched)
+                    return;
+                const bool replacing = guard->watcher_ != nullptr && !guard->watched_roots_.empty();
                 guard->watcher_.reset();
                 guard->watched_roots_.clear();
                 if (watched.empty())
                     return;
+                if (replacing) {
+                    // Changes the old watcher had not reported yet are lost with it: reconcile the
+                    // folders once (unchanged files are skipped by their content hash).
+                    platform::FileChangeHint rescan;
+                    rescan.kind = platform::FileChangeKind::rescan_required;
+                    guard->pending_hints_.push_back(std::move(rescan));
+                    guard->watch_flush_.start();
+                }
                 auto created = platform::DirectoryWatcher::create(
                     platform::FileWatcherSettings{}, [guard](std::vector<platform::FileChangeHint> hints) {
                         // On the watcher's thread: hand the batch to the GUI thread.

@@ -17,6 +17,7 @@ class QLineEdit;
 class QPlainTextEdit;
 class QSpinBox;
 class QTimer;
+class QPushButton;
 
 class QFormLayout;
 class QDoubleSpinBox;
@@ -113,7 +114,8 @@ private:
     QComboBox* track_output_ = nullptr;
     QSpinBox* track_transpose_ = nullptr;
     QComboBox* track_preset_ = nullptr;
-    QSpinBox* track_program_ = nullptr;
+    /// The track's instrument by name; opens the grouped General MIDI menu (same as the track list).
+    QPushButton* track_instrument_ = nullptr;
     // Scale
     QComboBox* scale_root_ = nullptr;
     QComboBox* scale_type_ = nullptr;

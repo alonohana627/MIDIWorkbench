@@ -6,6 +6,7 @@
 #include "mwb/music/analysis.hpp"
 #include "mwb/music/chord.hpp"
 #include "mwb/music/fingerprint.hpp"
+#include "mwb/music/general_midi.hpp"
 #include "mwb/music/grid.hpp"
 #include "mwb/music/json_fields.hpp"
 #include "mwb/music/motif.hpp"
@@ -1229,5 +1230,179 @@ TEST_SUITE("transform") {
         document = run(document, transpose(document, select_all(document), up));
         CHECK(notes_of(document) == std::vector<SimpleNote>{{240, 720, 50, 100}, {1200, 1200, 62, 100}});
         CHECK(pair_notes(document.sequences.front()).orphan_ends.empty());
+    }
+}
+
+TEST_SUITE("general_midi") {
+    TEST_CASE("the GM table has 128 distinct names in 16 families of 8") {
+        std::set<std::string_view> names;
+        for (int program = 0; program < music::gm_program_count; ++program) {
+            const auto name = music::gm_program_name(static_cast<std::uint8_t>(program));
+            CHECK_FALSE(name.empty());
+            names.insert(name);
+            CHECK(music::gm_program_named(name) == static_cast<std::uint8_t>(program));
+        }
+        CHECK(names.size() == 128);
+        CHECK(music::gm_program_name(0) == "Acoustic Grand Piano");
+        CHECK(music::gm_program_name(24) == "Acoustic Guitar (nylon)");
+        CHECK(music::gm_program_name(33) == "Electric Bass (finger)");
+        CHECK(music::gm_program_name(40) == "Violin");
+        CHECK(music::gm_program_name(127) == "Gunshot");
+        CHECK(music::gm_program_name(128) == "Acoustic Grand Piano"); // masked to 7 bits
+        CHECK(music::gm_family_name(0) == "Piano");
+        CHECK(music::gm_family_name(4) == "Bass");
+        CHECK(music::gm_family_name(15) == "Sound Effects");
+        CHECK(music::gm_family_name(16).empty());
+        CHECK(music::gm_family_name(-1).empty());
+        CHECK(music::gm_family_of(7) == 0);
+        CHECK(music::gm_family_of(8) == 1);
+        CHECK(music::gm_family_of(127) == 15);
+        CHECK_FALSE(music::gm_program_named("Kazoo"));
+    }
+
+    TEST_CASE("the effective instrument is the first program change before the first note, else the setting") {
+        Track track;
+        track.id = TrackId::generate();
+        track.instrument.program = 40;
+        CHECK(music::effective_instrument(track) == music::TrackInstrument{false, 40, false});
+        CHECK(music::instrument_label(track) == "Violin");
+        track.events.push_back(events::program_change(0, 0, 33));
+        track.events.push_back(events::note_on(0, 0, 40, 100));
+        track.events.push_back(events::program_change(480, 0, 56)); // after the first note: a later change
+        CHECK(music::effective_instrument(track) == music::TrackInstrument{false, 33, true});
+        CHECK(music::instrument_label(track) == "Electric Bass (finger)");
+        track.events.erase(track.events.begin());
+        CHECK(music::effective_instrument(track).program == 40); // the setting again
+        track.is_drum = true;
+        CHECK(music::instrument_label(track) == "Drums");
+    }
+
+    TEST_CASE("choosing an instrument writes the setting, the timbre and a tick-0 program change; undo restores") {
+        auto document = make_blank_document("gm");
+        auto& track = document.sequences[0].tracks[0];
+        const TrackId id = track.id;
+        ChangeBuilder notes(document, "notes");
+        notes.add_note(id, 480, 960, 2, 60, 100); // channel 3
+        REQUIRE(apply_change_set(document, notes.finish()));
+        const auto before = document;
+
+        auto changes = music::set_track_instrument(document, id, 24, "electric-piano");
+        REQUIRE(changes);
+        CHECK(changes->changes.label == "Set instrument");
+        REQUIRE(apply_change_set(document, changes->changes));
+        const auto& changed = document.sequences[0].tracks[0];
+        CHECK(changed.instrument.program == 24);
+        CHECK(changed.instrument.synth_preset == "electric-piano");
+        const auto program_change = std::ranges::find_if(changed.events, [](const Event& event) {
+            return event.is_channel() && event.message() == ChannelMessage::program_change;
+        });
+        REQUIRE(program_change != changed.events.end());
+        const Event& first = *program_change;
+        CHECK(first.tick == 0);
+        CHECK(program_change < std::ranges::find_if(changed.events, [](const Event& event) { return event.is_note_start(); }));
+        CHECK(first.message() == ChannelMessage::program_change);
+        CHECK(first.channel() == 2); // the notes' channel
+        CHECK(first.data1() == 24);
+        CHECK(music::effective_instrument(changed) == music::TrackInstrument{false, 24, true});
+
+        // Choosing again updates that program change; it does not add a second one.
+        changes = music::set_track_instrument(document, id, 40, "saw-pad");
+        REQUIRE(changes);
+        REQUIRE(apply_change_set(document, changes->changes));
+        std::size_t programs = 0;
+        for (const auto& event : document.sequences[0].tracks[0].events)
+            programs += event.is_channel() && event.message() == ChannelMessage::program_change;
+        CHECK(programs == 1);
+        CHECK(music::instrument_label(document.sequences[0].tracks[0]) == "Violin");
+        // The same choice again is no edit at all.
+        changes = music::set_track_instrument(document, id, 40, "saw-pad");
+        REQUIRE(changes);
+        CHECK(changes->changes.empty());
+
+        // Undo (the inverse change sets) restores the document exactly.
+        auto again = before;
+        auto first_change = music::set_track_instrument(again, id, 24, "electric-piano");
+        REQUIRE(first_change);
+        REQUIRE(apply_change_set(again, first_change->changes));
+        REQUIRE(apply_change_set(again, invert(first_change->changes)));
+        CHECK(again == before);
+    }
+
+    TEST_CASE("drums set the drum flag and channel 10 without a program change; an instrument undoes both") {
+        auto document = make_blank_document("gm");
+        const TrackId id = document.sequences[0].tracks[0].id;
+        auto changes = music::set_track_instrument(document, id, std::nullopt, "");
+        REQUIRE(changes);
+        REQUIRE(apply_change_set(document, changes->changes));
+        const auto& drums = document.sequences[0].tracks[0];
+        CHECK(drums.is_drum);
+        CHECK(drums.routing.channel_override == music::gm_drum_channel);
+        CHECK(drums.events.size() == 2); // the tempo and meter only: no program change
+        CHECK(music::instrument_label(drums) == "Drums");
+        changes = music::set_track_instrument(document, id, 0, "classic");
+        REQUIRE(changes);
+        REQUIRE(apply_change_set(document, changes->changes));
+        const auto& piano = document.sequences[0].tracks[0];
+        CHECK_FALSE(piano.is_drum);
+        CHECK_FALSE(piano.routing.channel_override);
+        REQUIRE(piano.events.size() == 3); // no notes yet: channel 1 gets the program change
+        CHECK(piano.events.back().message() == ChannelMessage::program_change);
+        CHECK(piano.events.back().channel() == 0);
+        CHECK(music::set_track_instrument(document, TrackId::generate(), 0, "classic").error().code == ErrorCode::not_found);
+        CHECK_FALSE(music::set_track_instrument(document, id, 128, "classic"));
+    }
+
+    TEST_CASE("a melodic pick moves the track's channel-10 events to a free channel; never a program change on 10") {
+        auto document = make_blank_document("gm");
+        auto& sequence = document.sequences[0];
+        const TrackId melody = sequence.tracks[0].id;
+        Track beat;
+        beat.id = TrackId::generate();
+        beat.name = "Beat";
+        beat.is_drum = true;
+        beat.routing.channel_override = music::gm_drum_channel;
+        ChangeBuilder add(document, "add");
+        add.append(TrackInsert{sequence.id, 1, beat});
+        REQUIRE(apply_change_set(document, add.finish()));
+        ChangeBuilder notes(document, "notes");
+        notes.add_note(melody, 0, 480, 0, 60, 100);  // channel 1: taken
+        notes.add_note(melody, 0, 480, 2, 64, 100);  // channel 3: taken
+        notes.add_note(beat.id, 0, 120, 9, 36, 100); // kick on channel 10
+        notes.add_note(beat.id, 480, 600, 9, 38, 100);
+        notes.insert(beat.id, events::control_change(0, 9, 7, 90), OrderPlacement::before_note_starts);
+        notes.insert(beat.id, events::program_change(0, 9, 0), OrderPlacement::before_note_starts); // a kit select
+        REQUIRE(apply_change_set(document, notes.finish()));
+        const auto before = document;
+
+        auto edit = music::set_track_instrument(document, beat.id, 33, "bass");
+        REQUIRE(edit);
+        REQUIRE(edit->moved_to);
+        CHECK(*edit->moved_to == 1);       // channel 2: the lowest one the melody does not use
+        CHECK(edit->moved_events == 6);    // 2 notes (on and off), the CC and the program change
+        REQUIRE(apply_change_set(document, edit->changes));
+        const Track& moved = document.sequences[0].tracks[1];
+        CHECK_FALSE(moved.is_drum);
+        CHECK_FALSE(moved.routing.channel_override);
+        std::size_t programs = 0;
+        for (const auto& event : moved.events) {
+            if (!event.is_channel())
+                continue;
+            CHECK(event.channel() != music::gm_drum_channel); // nothing is left on channel 10
+            CHECK(event.channel() == 1);
+            if (event.message() == ChannelMessage::program_change) {
+                ++programs;
+                CHECK(event.data1() == 33); // the kit select became the bass program, not a second one
+            }
+        }
+        CHECK(programs == 1);
+        CHECK(music::instrument_label(moved) == "Electric Bass (finger)");
+        REQUIRE(apply_change_set(document, invert(edit->changes))); // one undo restores the drums
+        CHECK(document == before);
+
+        // A track whose events are not on channel 10 moves nothing.
+        auto plain = music::set_track_instrument(before, melody, 40, "saw-pad");
+        REQUIRE(plain);
+        CHECK_FALSE(plain->moved_to);
+        CHECK(plain->moved_events == 0);
     }
 }

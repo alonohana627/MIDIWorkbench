@@ -18,6 +18,7 @@
 #include "mwb/ui/editor_tab.hpp"
 #include "mwb/ui/event_list.hpp"
 #include "mwb/ui/inspector.hpp"
+#include "mwb/ui/instrument_menu.hpp"
 #include "mwb/ui/library_panel.hpp"
 #include "mwb/ui/main_window.hpp"
 #include "mwb/ui/piano_roll.hpp"
@@ -47,6 +48,10 @@
 #include <QMessageBox>
 #include <QSettings>
 #include <QTimer>
+#include <QImage>
+#include <QPainter>
+#include <QDir>
+#include <QMenu>
 #include <QHeaderView>
 #include <QSpinBox>
 #include <QStyleOption>
@@ -3566,5 +3571,465 @@ TEST_SUITE("window") {
             CHECK(still_open_inside); // the second request did nothing
             CHECK(window_still_open); // nor did closing the window
         }
+    }
+}
+
+// --- Instruments (owner request, batch 10) ---------------------------------------------------------
+
+namespace {
+
+/// Runs `step` on the menu that opens next (QMenu::exec blocks until it closes). A fallback
+/// closes any popup still open after 5 s, so a failed step fails the test instead of hanging it.
+void on_next_popup(std::function<void(QMenu&)> step) {
+    auto opened = std::make_shared<QPointer<QMenu>>();
+    QTimer::singleShot(0, [step = std::move(step), opened] {
+        if (auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget())) {
+            *opened = menu;
+            step(*menu);
+        }
+    });
+    // Closes only that menu, if the step left it open: never a later test's popup.
+    QTimer::singleShot(5000, [opened] {
+        if (*opened && (*opened)->isVisible())
+            (*opened)->close();
+    });
+}
+
+/// The action named `name` in the menu's family submenu `family`.
+QAction* instrument_action(QMenu& menu, int family, const QString& name) {
+    auto* submenu = menu.findChild<QMenu*>(QStringLiteral("instrumentFamily%1").arg(family));
+    if (!submenu)
+        return nullptr;
+    for (auto* action : submenu->actions())
+        if (action->text() == name)
+            return action;
+    return nullptr;
+}
+
+QTableWidget* track_table(TrackListWidget& list) { return list.findChild<QTableWidget*>(); }
+
+std::vector<const Event*> program_changes(const Track& track) {
+    std::vector<const Event*> found;
+    for (const auto& event : track.events)
+        if (event.is_channel() && event.message() == ChannelMessage::program_change)
+            found.push_back(&event);
+    return found;
+}
+
+/// Picks `name` from family `family` in the track list's menu for `row`.
+void pick_in_track_list(TrackListWidget& list, int row, int family, const QString& name) {
+    bool picked = false;
+    on_next_popup([&](QMenu& menu) {
+        if (auto* action = instrument_action(menu, family, name)) {
+            action->trigger();
+            picked = true;
+        }
+        menu.close();
+    });
+    list.open_instrument_menu(row);
+    CHECK(picked);
+}
+
+} // namespace
+
+TEST_SUITE("instrument") {
+    TEST_CASE("the track list shows each track's instrument by name in its own column") {
+        auto controller = make_controller();
+        TrackListWidget list(*controller);
+        auto* table = track_table(list);
+        REQUIRE(table);
+        REQUIRE(table->columnCount() == 4);
+        CHECK(table->horizontalHeaderItem(1)->text() == "M"); // M and S keep their places
+        CHECK(table->horizontalHeaderItem(2)->text() == "S");
+        CHECK(table->horizontalHeaderItem(3)->text() == "Instrument");
+        REQUIRE(table->item(0, 3));
+        CHECK(table->item(0, 3)->text() == "Acoustic Grand Piano");
+        CHECK(table->item(0, 3)->toolTip().contains("General MIDI program 1"));
+        CHECK_FALSE(table->item(0, 3)->flags().testFlag(Qt::ItemIsEditable)); // chosen from the menu, not typed
+    }
+
+    TEST_CASE("picking an instrument sets the program, the timbre and a tick-0 program change; export keeps it; undo restores") {
+        auto controller = make_controller();
+        const NewNote note{controller->active_track(), 480, 960, 60, 100, 0, 0};
+        auto notes = insert_notes(controller->document(), std::span(&note, 1));
+        REQUIRE(notes);
+        REQUIRE(controller->apply(*notes));
+        const Track before = controller->active_sequence().tracks.front();
+        TrackListWidget list(*controller);
+        QSignalSpy messages(&list, &TrackListWidget::status_message);
+
+        pick_in_track_list(list, 0, 5, "Violin"); // Strings
+        const Track& track = controller->active_sequence().tracks.front();
+        CHECK(track.instrument.program == 40);
+        CHECK(track.instrument.synth_preset == "saw-pad"); // the built-in synth's string timbre
+        const auto programs = program_changes(track);
+        REQUIRE(programs.size() == 1);
+        CHECK(programs[0]->tick == 0);
+        CHECK(programs[0]->data1() == 40);
+        CHECK(programs[0]->channel() == 0);
+        CHECK(track_table(list)->item(0, 3)->text() == "Violin");
+        REQUIRE_FALSE(messages.isEmpty());
+        CHECK(messages.last().at(0).toString().contains("now plays Violin"));
+        CHECK(controller->can_undo());
+
+        // The exported file carries the Program Change, and opens as a violin again.
+        auto bytes = midi::export_midi(controller->document(), {});
+        REQUIRE(bytes);
+        auto imported = midi::import_midi(*bytes, "violin.mid", {}, {});
+        REQUIRE(imported);
+        bool found = false;
+        for (const auto& sequence : imported->document.sequences)
+            for (const auto& imported_track : sequence.tracks)
+                if (const auto changes = program_changes(imported_track); !changes.empty()) {
+                    found = found || changes.front()->data1() == 40;
+                    CHECK(music::instrument_label(imported_track) == "Violin");
+                }
+        CHECK(found);
+
+        // One undo step restores the track exactly (setting, timbre and events).
+        REQUIRE(controller->undo());
+        CHECK(controller->active_sequence().tracks.front() == before);
+        CHECK(track_table(list)->item(0, 3)->text() == "Acoustic Grand Piano");
+    }
+
+    TEST_CASE("an imported file's program change names the instrument in the column") {
+        auto document = make_blank_document("bass");
+        const TrackId id = document.sequences[0].tracks[0].id;
+        ChangeBuilder builder(document, "content");
+        builder.insert(id, events::program_change(0, 0, 33), OrderPlacement::before_note_starts);
+        builder.add_note(id, 0, 480, 0, 40, 100);
+        REQUIRE(apply_change_set(document, builder.finish()));
+        auto bytes = midi::export_midi(document, {});
+        REQUIRE(bytes);
+        auto imported = midi::import_midi(*bytes, "bass.mid", {}, {});
+        REQUIRE(imported);
+        application();
+        auto session = std::make_unique<document::WorkingSession>(std::move(imported->document),
+                                                                  document::SessionOrigin::opened_file);
+        DocumentController controller(std::move(session));
+        TrackListWidget list(controller);
+        auto* table = track_table(list);
+        bool shown = false;
+        for (int row = 0; row < table->rowCount(); ++row)
+            shown = shown || table->item(row, 3)->text() == "Electric Bass (finger)";
+        CHECK(shown);
+    }
+
+    TEST_CASE("Drums makes a drum track on channel 10 without a program change") {
+        auto controller = make_controller();
+        TrackListWidget list(*controller);
+        bool picked = false;
+        on_next_popup([&](QMenu& menu) {
+            auto* drums = menu.findChild<QAction*>("instrumentDrums");
+            if (drums) {
+                CHECK(drums->text() == "Drums (channel 10)");
+                drums->trigger();
+                picked = true;
+            }
+            menu.close();
+        });
+        list.open_instrument_menu(0);
+        REQUIRE(picked);
+        const Track& track = controller->active_sequence().tracks.front();
+        CHECK(track.is_drum);
+        CHECK(track.routing.channel_override == music::gm_drum_channel);
+        CHECK(program_changes(track).empty());
+        CHECK(track_table(list)->item(0, 3)->text() == "Drums");
+        // Back to an instrument: the drum flag and the channel-10 override go again.
+        pick_in_track_list(list, 0, 0, "Electric Piano 1");
+        CHECK_FALSE(controller->active_sequence().tracks.front().is_drum);
+        CHECK_FALSE(controller->active_sequence().tracks.front().routing.channel_override);
+        CHECK(controller->active_sequence().tracks.front().instrument.synth_preset == "electric-piano");
+    }
+
+    TEST_CASE("the menu has 16 families of 8 with the current instrument checked and its family active") {
+        auto controller = make_controller();
+        TrackListWidget list(*controller);
+        pick_in_track_list(list, 0, 4, "Fretless Bass");
+        int families = 0;
+        int instruments = 0;
+        QString checked;
+        QString active;
+        on_next_popup([&](QMenu& menu) {
+            for (auto* action : menu.actions())
+                if (auto* submenu = action->menu()) {
+                    ++families;
+                    for (auto* item : submenu->actions()) {
+                        ++instruments;
+                        if (item->isChecked())
+                            checked = item->text();
+                    }
+                }
+            active = menu.activeAction() ? menu.activeAction()->text() : QString();
+            menu.close();
+        });
+        list.open_instrument_menu(0);
+        CHECK(families == 16);
+        CHECK(instruments == 128);
+        CHECK(checked == "Fretless Bass");
+        CHECK(active == "Bass");
+    }
+
+    TEST_CASE("keyboard: Enter or F2 on the Instrument cell opens the menu; arrows and Enter pick") {
+        WindowFixture fixture;
+        auto& controller = fixture.window->current_tab()->controller();
+        auto& list = fixture.window->current_tab()->track_list();
+        auto* table = track_table(list);
+        REQUIRE(table);
+        table->setCurrentCell(0, 3);
+        table->setFocus(Qt::TabFocusReason);
+        QTest::qWait(20);
+
+        // Enter through the window's key routing (not a window shortcut): the menu opens with the
+        // Piano family active; Right opens it, Down moves to the second piano, Enter picks it.
+        QString opened;
+        on_next_popup([&](QMenu& menu) {
+            opened = menu.objectName();
+            QTest::keyClick(&menu, Qt::Key_Right); // opens the active family (Piano)
+            auto* piano = menu.findChild<QMenu*>("instrumentFamily0");
+            const bool shown = piano && QTest::qWaitFor([&] { return piano->isVisible(); }, 2000);
+            if (shown) {
+                QTest::keyClick(piano, Qt::Key_Down);
+                QTest::keyClick(piano, Qt::Key_Return);
+            }
+        });
+        fixture.key(Qt::Key_Return);
+        QTest::qWait(100);
+        CHECK(opened == "instrumentMenu");
+        CHECK(controller.active_sequence().tracks.front().instrument.program == 1); // Bright Acoustic Piano
+        CHECK(table->item(0, 3)->text() == "Bright Acoustic Piano");
+
+        // F2 opens it too; Escape leaves everything as it was.
+        const auto generation = controller.generation();
+        opened.clear();
+        on_next_popup([&](QMenu& menu) {
+            opened = menu.objectName();
+            QTest::keyClick(&menu, Qt::Key_Escape);
+        });
+        fixture.key(Qt::Key_F2);
+        QTest::qWait(50);
+        CHECK(opened == "instrumentMenu");
+        CHECK(controller.generation() == generation);
+
+        // The M cell still toggles with Return (the existing keyboard behaviour).
+        // (Offscreen, the window is not re-activated after a popup closes with Escape; on a desktop
+        // it stays active. Activate it again, as a user's next click would.)
+        fixture.window->activateWindow();
+        std::ignore = QTest::qWaitForWindowActive(fixture.window.get(), 2000);
+        table->setFocus(Qt::TabFocusReason);
+        table->setCurrentCell(0, 1);
+        fixture.key(Qt::Key_Return);
+        CHECK(controller.active_sequence().tracks.front().muted);
+    }
+
+    TEST_CASE("the Inspector's instrument picker shows the track's instrument and stays in sync") {
+        WindowFixture fixture;
+        auto& controller = fixture.window->current_tab()->controller();
+        auto* button = fixture.find<QPushButton>([](QPushButton* tool) { return tool->objectName() == "trackInstrument"; });
+        REQUIRE(button);
+        CHECK(button->text().contains("Acoustic Grand Piano"));
+        // No "Program (1-128)" spin box any more.
+        for (auto* label : fixture.window->findChildren<QLabel*>())
+            CHECK_FALSE(label->text().contains("Program (1-128)"));
+
+        pick_in_track_list(fixture.window->current_tab()->track_list(), 0, 7, "Trumpet");
+        QTest::qWait(50);
+        CHECK(button->text().contains("Trumpet"));
+
+        // Picking in the Inspector changes the track list too.
+        for (auto* header : fixture.window->findChildren<QToolButton*>("sectionHeader"))
+            if (header->text() == "Track")
+                header->setChecked(true); // the Inspector's Track section, folded by default
+        QTest::qWait(50);
+        REQUIRE(button->isVisible());
+        fixture.window->activateWindow(); // offscreen: active again after the earlier popup
+        std::ignore = QTest::qWaitForWindowActive(fixture.window.get(), 2000);
+        button->setFocus(Qt::TabFocusReason);
+        bool picked = false;
+        on_next_popup([&](QMenu& menu) {
+            if (auto* action = instrument_action(menu, 9, "Flute")) {
+                action->trigger();
+                picked = true;
+            }
+            menu.close();
+        });
+        fixture.key(Qt::Key_Return); // the keyboard presses it like any button
+        QTest::qWait(50);
+        CHECK(picked);
+        CHECK(controller.active_sequence().tracks.front().instrument.program == 73);
+        CHECK(button->text().contains("Flute"));
+        CHECK(track_table(fixture.window->current_tab()->track_list())->item(0, 3)->text() == "Flute");
+    }
+
+    TEST_CASE("the default track list is wide enough to read instrument names") {
+        WindowFixture fixture;
+        auto& list = fixture.window->current_tab()->track_list();
+        auto* table = track_table(list);
+        REQUIRE(table);
+        // The name, the menu arrow and the cell margins.
+        const int needed = table->fontMetrics().horizontalAdvance("Acoustic Grand Piano") +
+                           table->fontMetrics().horizontalAdvance(QStringLiteral("\u25BE")) + 8;
+        CHECK(table->columnWidth(3) >= needed + 8);
+    }
+
+    TEST_CASE("instrument screenshots (dark, light, high contrast)") {
+        // Written only when MWB_SHOT_DIR names a folder (review screenshots), else to the temp dir.
+        WindowFixture fixture;
+        auto& controller = fixture.window->current_tab()->controller();
+        auto& list = fixture.window->current_tab()->track_list();
+        auto* table = track_table(list);
+        REQUIRE(table);
+        const auto add_track = [&](const char* name) {
+            const auto& sequence = controller.active_sequence();
+            Track track;
+            track.id = TrackId::generate();
+            track.name = name;
+            track.end_tick = sequence.end_tick;
+            ChangeBuilder builder(controller.document(), "Add track");
+            builder.append(TrackInsert{sequence.id, sequence.tracks.size(), track});
+            REQUIRE(controller.apply(builder.finish()));
+        };
+        add_track("Bass");
+        add_track("Beat");
+        auto rename = [&](std::size_t index, const char* name) {
+            Track updated = track_header(controller.active_sequence().tracks[index]);
+            updated.name = name;
+            ChangeBuilder builder(controller.document(), "Rename");
+            builder.set_track_properties(updated.id, updated);
+            REQUIRE(controller.apply(builder.finish()));
+        };
+        rename(0, "Melody");
+        pick_in_track_list(list, 0, 7, "Trumpet");
+        pick_in_track_list(list, 1, 4, "Electric Bass (finger)");
+        bool drums = false;
+        on_next_popup([&](QMenu& menu) {
+            if (auto* action = menu.findChild<QAction*>("instrumentDrums")) {
+                action->trigger();
+                drums = true;
+            }
+            menu.close();
+        });
+        list.open_instrument_menu(2);
+        REQUIRE(drums);
+        CHECK(table->item(0, 3)->text() == "Trumpet");
+        CHECK(table->item(1, 3)->text() == "Electric Bass (finger)");
+        CHECK(table->item(2, 3)->text() == "Drums");
+        for (auto* header : fixture.window->findChildren<QToolButton*>("sectionHeader"))
+            if (header->text() == "Track")
+                header->setChecked(true); // the Inspector's Track section with its picker
+        controller.set_active_track(controller.active_sequence().tracks[0].id);
+
+        const QString folder = qEnvironmentVariable("MWB_SHOT_DIR", QString::fromStdWString(fixture.directory.path().wstring()));
+        QDir().mkpath(folder);
+        for (const auto& [theme, name] : {std::pair{Theme::dark, "dark"}, std::pair{Theme::light, "light"},
+                                          std::pair{Theme::high_contrast, "high_contrast"}}) {
+            apply_theme(theme);
+            QTest::qWait(100);
+            CHECK(fixture.window->grab().save(folder + QStringLiteral("/%1_window.png").arg(name)));
+            CHECK(list.grab().save(folder + QStringLiteral("/%1_track_list.png").arg(name)));
+            if (auto* picker = fixture.find<QPushButton>([](QPushButton* tool) { return tool->objectName() == "trackInstrument"; }))
+                CHECK(picker->parentWidget()->grab().save(folder + QStringLiteral("/%1_inspector_track.png").arg(name)));
+            // The open menu with the Brass family expanded, drawn over the window where it opens.
+            bool shot = false;
+            on_next_popup([&](QMenu& menu) {
+                QTest::qWait(50);
+                QImage image = fixture.window->grab().toImage();
+                QPainter painter(&image);
+                const QPoint origin = fixture.window->mapFromGlobal(menu.pos());
+                painter.drawPixmap(origin, menu.grab());
+                if (auto* brass = menu.findChild<QMenu*>("instrumentFamily7")) {
+                    menu.setActiveAction(brass->menuAction());
+                    brass->popup(menu.mapToGlobal(menu.actionGeometry(brass->menuAction()).topRight()));
+                    QTest::qWait(50);
+                    painter.drawPixmap(fixture.window->mapFromGlobal(brass->pos()), brass->grab());
+                    brass->close();
+                }
+                painter.end();
+                shot = image.save(folder + QStringLiteral("/%1_instrument_menu.png").arg(name));
+                menu.close();
+            });
+            list.open_instrument_menu(0);
+            CHECK(shot);
+        }
+        apply_theme(Theme::dark);
+    }
+}
+
+TEST_SUITE("instrument") {
+    TEST_CASE("a mouse click on M and S toggles them on fresh tracks, and their boxes are drawn (review_10 I2)") {
+        WindowFixture fixture;
+        auto* tab = fixture.window->current_tab();
+        auto& controller = tab->controller();
+        auto* table = tab->track_list().findChild<QTableWidget*>();
+        REQUIRE(table);
+        // A second, fresh track as well: boxes are created for every new row.
+        Track extra;
+        extra.id = TrackId::generate();
+        extra.name = "Second";
+        ChangeBuilder builder(controller.document(), "Add track");
+        builder.append(TrackInsert{controller.active_sequence().id, 1, extra});
+        REQUIRE(controller.apply(builder.finish()));
+        QTest::qWait(50);
+        for (int row = 0; row < 2; ++row)
+            for (int column = 1; column <= 2; ++column) {
+                auto* item = table->item(row, column);
+                REQUIRE(item);
+                // Without check-state data an item draws no box and ignores clicks.
+                CHECK(item->data(Qt::CheckStateRole).isValid());
+                CHECK(item->checkState() == Qt::Unchecked);
+            }
+        const auto click = [&](int row, int column) {
+            const QRect cell = table->visualItemRect(table->item(row, column));
+            QTest::mouseClick(table->viewport(), Qt::LeftButton, Qt::NoModifier, cell.center());
+            QTest::qWait(50);
+        };
+        click(1, 1);
+        CHECK(controller.active_sequence().tracks[1].muted);
+        CHECK(table->item(1, 1)->checkState() == Qt::Checked);
+        click(1, 2);
+        CHECK(controller.active_sequence().tracks[1].solo);
+        click(0, 1);
+        CHECK(controller.active_sequence().tracks[0].muted);
+        click(1, 1); // and off again
+        CHECK_FALSE(controller.active_sequence().tracks[1].muted);
+        CHECK(table->item(1, 1)->checkState() == Qt::Unchecked);
+    }
+
+    TEST_CASE("a melodic pick on a channel-10 track moves its notes and says so (review_10 I1)") {
+        auto controller = make_controller();
+        const TrackId id = controller->active_track();
+        ChangeBuilder builder(controller->document(), "drums");
+        builder.add_note(id, 0, 120, 9, 36, 100);
+        REQUIRE(controller->apply(builder.finish()));
+        TrackListWidget list(*controller);
+        QSignalSpy messages(&list, &TrackListWidget::status_message);
+        pick_in_track_list(list, 0, 0, "Acoustic Grand Piano");
+        const Track& track = controller->active_sequence().tracks.front();
+        for (const auto& event : track.events)
+            if (event.is_channel())
+                CHECK(event.channel() == 0); // channel 1: no other track uses it
+        REQUIRE_FALSE(messages.isEmpty());
+        CHECK(messages.last().at(0).toString().contains("moved from channel 10 (drums) to channel 1"));
+        REQUIRE(controller->undo()); // one step puts the notes back on channel 10
+        for (const auto& event : controller->active_sequence().tracks.front().events)
+            if (event.is_note_start())
+                CHECK(event.channel() == 9);
+    }
+}
+
+TEST_SUITE("reviewer_probe10") {
+    TEST_CASE("probe10: a mouse click on M mutes a fresh track and the box is drawn") {
+        WindowFixture fixture;
+        auto* tab = fixture.window->current_tab();
+        auto* table = tab->track_list().findChild<QTableWidget*>();
+        REQUIRE(table);
+        auto* m = table->item(0, 1);
+        REQUIRE(m);
+        MESSAGE("CheckStateRole valid: " << m->data(Qt::CheckStateRole).isValid());
+        const QRect cell = table->visualItemRect(m);
+        QTest::mouseClick(table->viewport(), Qt::LeftButton, Qt::NoModifier, cell.center());
+        QTest::qWait(100);
+        MESSAGE("muted after click: " << tab->controller().active_sequence().tracks.front().muted);
+        CHECK(tab->controller().active_sequence().tracks.front().muted);
     }
 }
